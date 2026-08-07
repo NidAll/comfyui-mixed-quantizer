@@ -5,9 +5,9 @@ format            : asym_w4a8_int8 (asym-w4a8-int8-r1)
 architecture      : wan (confidence medium)
 unet prefix       : model.diffusion_model.
 input             : safetensors (testdata/wan_fixture.safetensors)
-output            : testdata/wan_w4a8.safetensors (5.91 MiB)
-elapsed           : 5.763 s
-peak RSS          : 324.73 MiB
+output            : testdata/wan_fixture_w4a8_chunked.safetensors (5.91 MiB)
+elapsed           : 5.85 s
+peak RSS          : 314.32 MiB
 
 -- detection evidence --
   + head.modulation
@@ -55,7 +55,7 @@ peak RSS          : 324.73 MiB
   [passed                ] extension-metadata-present -- present
   [passed                ] extension-metadata-schema -- required fields, revision and architecture
   [passed                ] metadata-source-hash -- source content hashes match
-  [passed                ] tensor-payload-hash -- sha256=d57bcc87b050656f55de9e157e24e91bb1359c80a0d4004012776e6fcf691e64
+  [passed                ] tensor-payload-hash -- sha256=babe58c4c20650466454df27a505eab65b6034ee643de93423ee119d667d923a
   [passed                ] metadata-layer-inventory -- 20 layers match
   [passed                ] metadata-layer-conf -- format/group/ConvRot fields valid
   [passed                ] recon-model.diffusion_model.blocks.0.cross_attn.k -- relL2=0.0727 snr=22.8dB cos=0.9974
@@ -67,9 +67,9 @@ peak RSS          : 324.73 MiB
   [passed                ] recon-model.diffusion_model.blocks.0.cross_attn.v -- relL2=0.0725 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-model.diffusion_model.blocks.0.cross_attn.v -- pack/unpack round trip
   [passed                ] recon-model.diffusion_model.blocks.0.ffn.0 -- relL2=0.0724 snr=22.8dB cos=0.9974
-  [passed                ] pack-rt-model.diffusion_model.blocks.0.ffn.0 -- pack/unpack round trip
-  [passed                ] recon-model.diffusion_model.blocks.0.ffn.2 -- relL2=0.0727 snr=22.8dB cos=0.9974
-  [passed                ] pack-rt-model.diffusion_model.blocks.0.ffn.2 -- pack/unpack round trip
+  [passed                ] pack-rt-model.diffusion_model.blocks.0.ffn.0 -- pack/unpack round trip (bounded row chunks)
+  [passed                ] recon-model.diffusion_model.blocks.0.ffn.2 -- relL2=0.0728 snr=22.8dB cos=0.9973
+  [passed                ] pack-rt-model.diffusion_model.blocks.0.ffn.2 -- pack/unpack round trip (bounded row chunks)
   [passed                ] recon-model.diffusion_model.blocks.0.self_attn.k -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-model.diffusion_model.blocks.0.self_attn.k -- pack/unpack round trip
   [passed                ] recon-model.diffusion_model.blocks.0.self_attn.o -- relL2=0.0725 snr=22.8dB cos=0.9974
@@ -86,10 +86,10 @@ peak RSS          : 324.73 MiB
   [passed                ] pack-rt-model.diffusion_model.blocks.1.cross_attn.q -- pack/unpack round trip
   [passed                ] recon-model.diffusion_model.blocks.1.cross_attn.v -- relL2=0.0727 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-model.diffusion_model.blocks.1.cross_attn.v -- pack/unpack round trip
-  [passed                ] recon-model.diffusion_model.blocks.1.ffn.0 -- relL2=0.0724 snr=22.8dB cos=0.9974
-  [passed                ] pack-rt-model.diffusion_model.blocks.1.ffn.0 -- pack/unpack round trip
-  [passed                ] recon-model.diffusion_model.blocks.1.ffn.2 -- relL2=0.0728 snr=22.8dB cos=0.9973
-  [passed                ] pack-rt-model.diffusion_model.blocks.1.ffn.2 -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.blocks.1.ffn.0 -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.blocks.1.ffn.0 -- pack/unpack round trip (bounded row chunks)
+  [passed                ] recon-model.diffusion_model.blocks.1.ffn.2 -- relL2=0.0729 snr=22.7dB cos=0.9973
+  [passed                ] pack-rt-model.diffusion_model.blocks.1.ffn.2 -- pack/unpack round trip (bounded row chunks)
   [passed                ] recon-model.diffusion_model.blocks.1.self_attn.k -- relL2=0.0725 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-model.diffusion_model.blocks.1.self_attn.k -- pack/unpack round trip
   [passed                ] recon-model.diffusion_model.blocks.1.self_attn.o -- relL2=0.0723 snr=22.8dB cos=0.9974
@@ -98,11 +98,11 @@ peak RSS          : 324.73 MiB
   [passed                ] pack-rt-model.diffusion_model.blocks.1.self_attn.q -- pack/unpack round trip
   [passed                ] recon-model.diffusion_model.blocks.1.self_attn.v -- relL2=0.0725 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-model.diffusion_model.blocks.1.self_attn.v -- pack/unpack round trip
-  [passed                ] reconstruction-error-bound -- max full relL2 0.0728 (policy bound 0.25)
+  [passed                ] reconstruction-error-bound -- max full relL2 0.0729 (policy bound 0.25)
   [passed                ] scale-validation -- 20 layers OK (fp8 s_rel finite/nonnegative, fp32 s_channel finite/positive)
   [passed                ] deterministic-conversion -- two runs byte-identical
   [passed                ] deterministic-vs-disk -- recomputed packed weight matches the file
-  [passed                ] output-hash -- sha256=9f92ceaf63e7ac6398d6598c6ae5f55d2589bfa526466a72a3082fc684276344
+  [passed                ] output-hash -- sha256=c7ab1cc385c9c16568e1edf38c061111b7325533434346fd768f091f4dba4b9a
   [skipped               ] compat-comfy-kitchen -- comfy-kitchen not installed (skipped)
   [skipped               ] compat-comfyui -- ComfyUI not installed (skipped)
   [passed                ] input-hash -- {"wan_fixture.safetensors":"fda3268196c3e46785c186da58c8ef251a9b1fc01e983fed06b88f8803ec8a16"}
@@ -112,6 +112,6 @@ peak RSS          : 324.73 MiB
   comfy-kitchen >= aa1ab2263dc06225d9de6702dfc087313d4bc971 (PR #90, merged) with AsymW4A8Int8Layout; ComfyUI >= PR #15308 head 8c3a2b27c37bd34e87b58846baf962407c92843c (NOT merged into master at base bdcb886a4705a03cf40f4a7226de9fc7c059fc90); CUDA: PyTorch cu130+, SM >= 8.0; ROCm: triton >= 3.7; eager works anywhere
 
 -- output integrity --
-  sha256          : 9f92ceaf63e7ac6398d6598c6ae5f55d2589bfa526466a72a3082fc684276344
+  sha256          : c7ab1cc385c9c16568e1edf38c061111b7325533434346fd768f091f4dba4b9a
   input wan_fixture.safetensors : fda3268196c3e46785c186da58c8ef251a9b1fc01e983fed06b88f8803ec8a16
 ==============================================================================
