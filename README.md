@@ -278,9 +278,9 @@ when `--validate` was used).
 
 ### Not executed or unsupported
 
-* No end-to-end inference was run inside ComfyUI. The runtime loader requires the
-  unmerged ComfyUI PR #15308, and standalone validation does not claim runtime
-  compatibility.
+* No end-to-end inference was run inside ComfyUI. Standalone validation does not
+  claim runtime compatibility; ComfyUI >= v0.31.0 loads W4A8 natively (PR #15308
+  merged 2026-08-07).
 * Perception models (RT-DETR_v4, DepthAnything3, SAM3/SAM31) refuse conversion
   unless `--architecture` forces them.
 * Diffusers-format subfolders (`unet/diffusion_pytorch_model.safetensors`) are
@@ -371,9 +371,11 @@ used.
 ## Known limitations
 
 1. **ComfyUI runtime support is conditional.** W4A8 loading requires comfy-kitchen ≥
-   `aa1ab2263dc06225d9de6702dfc087313d4bc971` (merged) AND ComfyUI PR #15308 head
-   `8c3a2b27c37bd34e87b58846baf962407c92843c` (not merged into ComfyUI master at the
-   research revision). Standalone validation does not prove runtime compatibility;
+   `aa1ab2263dc06225d9de6702dfc087313d4bc971` (merged) AND ComfyUI PR #15308
+   ("Support asym w4a8_int", merged 2026-08-07, shipped in ComfyUI v0.31.0). On
+   ComfyUI >= v0.31.0 the loader is native and `patches/comfyui_w4a8_loader.patch`
+   is not needed; older builds (v0.30.x) need the patch. Standalone validation
+   does not prove runtime compatibility;
    use `--validate` for the optional installed-version probe.
 2. **Only 2D linear weights are quantized.** The reference format requires 2D,
    `K % 16 == 0`, plus group/convrot divisibility. Convolutions, embeddings, norms,
@@ -407,7 +409,7 @@ The format specification was verified against these exact revisions:
 | artifact | revision | note |
 |---|---|---|
 | comfy-kitchen PR #90 "Add optimized w4a8 with int8 codebook" | **MERGED**, merge commit `aa1ab2263dc06225d9de6702dfc087313d4bc971` (2026-08-06); head `b812819a97ac11d01f4a3a16ba47dd38de3b2519` | the reference W4A8 implementation |
-| ComfyUI PR #15308 "Support asym w4a8_int" | **OPEN, NOT MERGED** when checked 2026-08-07; head `8c3a2b27c37bd34e87b58846baf962407c92843c`; base `bdcb886a4705a03cf40f4a7226de9fc7c059fc90` | the ComfyUI loader support |
+| ComfyUI PR #15308 "Support asym w4a8_int" | **MERGED 2026-08-07** as commit `344b43989e` (shipped in ComfyUI v0.31.0); earlier head `8c3a2b27c37bd34e87b58846baf962407c92843c`; base `bdcb886a4705a03cf40f4a7226de9fc7c059fc90` | the ComfyUI loader support |
 | comfy-kitchen PR #96 | merge commit `3d16bed29c91a3d9d1abdc0574c87a5ba2b1ef33` | later frozen-LUT and row-chunked producer changes; this converter intentionally retains the PR #90 numerical contract while emitting the same runtime layout |
 | Reference serialized example | `Kijai/MiniMax-H3-experimental/minimax_h3_fl2va_pruned_w4a8_mixed.safetensors` (12.5 GB, header inspected) | produced by the PR author |
 | ComfyUI master (research base) | `bdcb886a4705a03cf40f4a7226de9fc7c059fc90` | used for the architecture registry (98 supported-model classes) |
@@ -473,9 +475,9 @@ macos.
 * comfy-kitchen ≥ `aa1ab2263dc06225d9de6702dfc087313d4bc971` (PR #90, merged) with
   `AsymW4A8Int8Layout` registered; eager works on CPU/CUDA/ROCm; Triton ≥ 3.7 for
   ROCm; the compiled CUDA backend requires PyTorch cu130+ and SM ≥ 8.0.
-* ComfyUI PR #15308 is **not merged** (open as of 2026-08-07, head
-  `8c3a2b27c37bd34e87b58846baf962407c92843c`), so the loader support must be
-  applied manually. The repository ships the exact patch:
+* ComfyUI PR #15308 is **merged** (2026-08-07, commit `344b43989e`, shipped in
+  ComfyUI v0.31.0), so ComfyUI >= v0.31.0 loads W4A8 natively and no patch is
+  needed. For older builds (v0.30.x) the repository ships the exact patch:
   `patches/comfyui_w4a8_loader.patch` (targets ComfyUI v0.30.0, verified with
   `git apply --check` and compile-checked). Apply from the ComfyUI root:
 

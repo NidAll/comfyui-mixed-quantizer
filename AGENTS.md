@@ -19,9 +19,10 @@ accepts only `w4a8` and defaults to it.
 
 The format spec comes from comfy-kitchen PR #90 (merged,
 `aa1ab2263dc06225d9de6702dfc087313d4bc971`). The ComfyUI loader is PR #15308
-(open, head `8c3a2b27c37bd34e87b58846baf962407c92843c`), shipped as
+("Support asym w4a8_int", merged 2026-08-07 as commit `344b43989e`, shipped in
+ComfyUI v0.31.0). ComfyUI >= v0.31.0 loads W4A8 natively; older builds need
 `patches/comfyui_w4a8_loader.patch` (verified against ComfyUI v0.30.0). Without
-that patch ComfyUI fails with `KeyError: 'asym_w4a8_int8'`.
+the patch ComfyUI fails with `KeyError: 'asym_w4a8_int8'`.
 
 Per quantized layer, the output file has:
 
@@ -176,6 +177,8 @@ small regeneration tests instead of real models.
 
 The user runs ComfyUI on Windows at `C:\Comfyui\ComfyUI` (v0.30.0 plus 23
 commits, `g0ab8332bfa`, comfy-kitchen 0.2.27) with the loader patch applied.
-The patch must be re-applied after every ComfyUI update until PR #15308 merges.
+PR #15308 merged upstream on 2026-08-07 (ComfyUI v0.31.0), so after the next
+ComfyUI update the patch can and should be removed: v0.31.0+ loads W4A8
+natively.
 The user tests with `sickOllie_zTurbo.safetensors` there; expect questions about
 load warnings and VRAM behavior.
