@@ -1,0 +1,89 @@
+==============================================================================
+comfyui_wxa8_quantizer 1.0.0 -- conversion report
+==============================================================================
+format            : asym_w4a8_int8 (asym-w4a8-int8-r1)
+architecture      : mmdit_sd3 (confidence high)
+unet prefix       : model.diffusion_model.
+input             : safetensors (testdata/mmdit_sd3_fixture.safetensors)
+output            : testdata/mmdit_sd3_fixture_w4a8.safetensors (7.67 MiB)
+elapsed           : 4.996 s
+peak RSS          : 636.79 MiB
+
+-- detection evidence --
+  + joint_blocks.0.context_block.attn.qkv.weight
+  + x_embedder.proj.weight
+  ~ final_layer.linear.weight (hint)
+  ~ y_embedder.mlp.0.weight (hint)
+
+-- tensor statistics --
+  input tensors   : 15
+  quantized layers: 12
+  kept tensors    : 3
+
+-- quantization --
+  model.diffusion_model.joint_blocks.0.context_block.attn.proj: (384, 384) gs=16 cgs=64
+  model.diffusion_model.joint_blocks.0.context_block.attn.qkv: (1152, 1024) gs=16 cgs=256
+  model.diffusion_model.joint_blocks.0.x_block.attn.proj: (384, 384) gs=16 cgs=64
+  model.diffusion_model.joint_blocks.0.x_block.attn.qkv: (1152, 384) gs=16 cgs=64
+  model.diffusion_model.joint_blocks.0.x_block.mlp.fc1: (1536, 384) gs=16 cgs=64
+  model.diffusion_model.joint_blocks.0.x_block.mlp.fc2: (384, 1536) gs=16 cgs=256
+  model.diffusion_model.joint_blocks.1.context_block.attn.proj: (384, 384) gs=16 cgs=64
+  model.diffusion_model.joint_blocks.1.context_block.attn.qkv: (1152, 1024) gs=16 cgs=256
+  model.diffusion_model.joint_blocks.1.x_block.attn.proj: (384, 384) gs=16 cgs=64
+  model.diffusion_model.joint_blocks.1.x_block.attn.qkv: (1152, 384) gs=16 cgs=64
+  model.diffusion_model.joint_blocks.1.x_block.mlp.fc1: (1536, 384) gs=16 cgs=64
+  model.diffusion_model.joint_blocks.1.x_block.mlp.fc2: (384, 1536) gs=16 cgs=256
+
+-- calibration --
+  calibration-free (reference format; per-group absmax scales)
+
+-- validation --
+  [passed                ] output-reopen -- 51 tensors, 7.68 MiB
+  [passed                ] output-entry-count -- 51 vs 51 expected
+  [passed                ] output-inventory -- missing=[] extra=[]
+  [passed                ] shape-preservation
+  [passed                ] dtype-check
+  [passed                ] metadata-present -- 12 layers recorded
+  [passed                ] extension-metadata-present -- present
+  [passed                ] metadata-layer-inventory -- layer set mismatch: []
+  [passed                ] metadata-layer-conf -- format field mismatch
+  [passed                ] recon-model.diffusion_model.joint_blocks.0.context_block.attn.qkv -- relL2=0.0727 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.joint_blocks.0.context_block.attn.qkv -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.joint_blocks.1.context_block.attn.qkv -- relL2=0.0726 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.joint_blocks.1.context_block.attn.qkv -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.joint_blocks.0.x_block.mlp.fc1 -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.joint_blocks.0.x_block.mlp.fc1 -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.joint_blocks.0.x_block.mlp.fc2 -- relL2=0.0728 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.joint_blocks.0.x_block.mlp.fc2 -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.joint_blocks.1.x_block.mlp.fc1 -- relL2=0.0726 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.joint_blocks.1.x_block.mlp.fc1 -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.joint_blocks.1.x_block.mlp.fc2 -- relL2=0.0729 snr=22.7dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.joint_blocks.1.x_block.mlp.fc2 -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.joint_blocks.0.x_block.attn.qkv -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.joint_blocks.0.x_block.attn.qkv -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.joint_blocks.1.x_block.attn.qkv -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.joint_blocks.1.x_block.attn.qkv -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.joint_blocks.0.context_block.attn.proj -- relL2=0.0722 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.joint_blocks.0.context_block.attn.proj -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.joint_blocks.0.x_block.attn.proj -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.joint_blocks.0.x_block.attn.proj -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.joint_blocks.1.context_block.attn.proj -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.joint_blocks.1.context_block.attn.proj -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.joint_blocks.1.x_block.attn.proj -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.joint_blocks.1.x_block.attn.proj -- pack/unpack round trip
+  [passed                ] reconstruction-error-bound -- max sampled relL2 0.0729 (policy bound 0.25)
+  [passed                ] scale-validation -- 12 layers OK (fp8 s_rel finite/positive, fp32 s_channel finite/positive)
+  [passed                ] deterministic-conversion -- two runs byte-identical
+  [passed                ] deterministic-vs-disk -- recomputed packed weight matches the file
+  [passed                ] output-hash -- sha256=b63ed498f35a82657d465de0c437e87c6cde56a668546319159a36b809d9b7db
+  [skipped               ] compat-comfy-kitchen -- comfy-kitchen not installed (skipped)
+  [skipped               ] compat-comfyui -- ComfyUI not installed (skipped)
+  [passed                ] input-hash -- {"testdata/mmdit_sd3_fixture.safetensors":"5cb8a1fa05fbf582dd15f0610fb99300531168615766a2eee2e8d5b5a184eadc"}
+
+-- compatibility requirements --
+  comfy-kitchen >= aa1ab2263dc06225d9de6702dfc087313d4bc971 (PR #90, merged) with AsymW4A8Int8Layout; ComfyUI >= PR #15308 head b6578f2ae11ab3dea3156ed68d8724476cda1232 (NOT merged into master at base bdcb886a4705a03cf40f4a7226de9fc7c059fc90); CUDA: PyTorch cu130+, SM >= 8.0; ROCm: triton >= 3.7; eager works anywhere
+
+-- output integrity --
+  sha256          : b63ed498f35a82657d465de0c437e87c6cde56a668546319159a36b809d9b7db
+  input mmdit_sd3_fixture.safetensors : 5cb8a1fa05fbf582dd15f0610fb99300531168615766a2eee2e8d5b5a184eadc
+==============================================================================

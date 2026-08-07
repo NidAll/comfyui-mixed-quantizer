@@ -1,0 +1,78 @@
+==============================================================================
+comfyui_wxa8_quantizer 1.0.0 -- conversion report
+==============================================================================
+format            : asym_w3a8_int8 (asym-w3a8-int8-r1)
+architecture      : minimax_h3 (confidence high)
+unet prefix       : model.
+input             : safetensors (testdata/minimax_h3_fixture.safetensors)
+output            : testdata/minimax_h3_fixture_w3a8.safetensors (22.98 MiB)
+elapsed           : 3.026 s
+peak RSS          : 715.43 MiB
+
+-- detection evidence --
+  + video_patch_proj.weight
+  + audio_patch_proj.weight
+  ~ blocks.0.attn.qkv_proj.weight (hint)
+  ~ final_layer.video_out.weight (hint)
+  ~ adaln_t_table (hint)
+
+-- tensor statistics --
+  input tensors   : 28
+  quantized layers: 8
+  kept tensors    : 20
+
+-- quantization --
+  blocks.0.attn.out_proj: (768, 768) gs=16 cgs=256
+  blocks.0.attn.qkv_proj: (2304, 768) gs=16 cgs=256
+  blocks.0.mlp.fc1: (2304, 768) gs=16 cgs=256
+  blocks.0.mlp.fc2: (768, 2304) gs=16 cgs=256
+  blocks.1.attn.out_proj: (768, 768) gs=16 cgs=256
+  blocks.1.attn.qkv_proj: (2304, 768) gs=16 cgs=256
+  blocks.1.mlp.fc1: (2304, 768) gs=16 cgs=256
+  blocks.1.mlp.fc2: (768, 2304) gs=16 cgs=256
+
+-- calibration --
+  calibration-free (reference format; per-group absmax scales)
+
+-- validation --
+  [passed                ] output-reopen -- 52 tensors, 22.99 MiB
+  [passed                ] output-entry-count -- 52 vs 52 expected
+  [passed                ] output-inventory -- missing=[] extra=[]
+  [passed                ] shape-preservation
+  [passed                ] dtype-check
+  [passed                ] metadata-present -- 8 layers recorded
+  [passed                ] extension-metadata-present -- present
+  [passed                ] metadata-layer-inventory -- layer set mismatch: []
+  [passed                ] metadata-layer-conf -- format field mismatch
+  [passed                ] recon-blocks.0.attn.qkv_proj -- relL2=0.1491 snr=16.5dB cos=0.9889
+  [passed                ] pack-rt-blocks.0.attn.qkv_proj -- pack/unpack round trip
+  [passed                ] recon-blocks.0.mlp.fc1 -- relL2=0.1492 snr=16.5dB cos=0.9889
+  [passed                ] pack-rt-blocks.0.mlp.fc1 -- pack/unpack round trip
+  [passed                ] recon-blocks.0.mlp.fc2 -- relL2=0.1487 snr=16.6dB cos=0.9889
+  [passed                ] pack-rt-blocks.0.mlp.fc2 -- pack/unpack round trip
+  [passed                ] recon-blocks.1.attn.qkv_proj -- relL2=0.1488 snr=16.5dB cos=0.9889
+  [passed                ] pack-rt-blocks.1.attn.qkv_proj -- pack/unpack round trip
+  [passed                ] recon-blocks.1.mlp.fc1 -- relL2=0.1489 snr=16.5dB cos=0.9889
+  [passed                ] pack-rt-blocks.1.mlp.fc1 -- pack/unpack round trip
+  [passed                ] recon-blocks.1.mlp.fc2 -- relL2=0.1487 snr=16.6dB cos=0.9889
+  [passed                ] pack-rt-blocks.1.mlp.fc2 -- pack/unpack round trip
+  [passed                ] recon-blocks.0.attn.out_proj -- relL2=0.1491 snr=16.5dB cos=0.9888
+  [passed                ] pack-rt-blocks.0.attn.out_proj -- pack/unpack round trip
+  [passed                ] recon-blocks.1.attn.out_proj -- relL2=0.1490 snr=16.5dB cos=0.9889
+  [passed                ] pack-rt-blocks.1.attn.out_proj -- pack/unpack round trip
+  [passed                ] reconstruction-error-bound -- max sampled relL2 0.1492 (policy bound 0.25)
+  [passed                ] scale-validation -- 8 layers OK (fp8 s_rel finite/positive, fp32 s_channel finite/positive)
+  [passed                ] deterministic-conversion -- two runs byte-identical
+  [passed                ] deterministic-vs-disk -- recomputed packed weight matches the file
+  [passed                ] output-hash -- sha256=e82056349b60c9040ffad9cc73bb46faadf1de2e088991940aeb2c3ad1b269dc
+  [skipped               ] compat-comfy-kitchen -- comfy-kitchen not installed (skipped)
+  [skipped               ] compat-comfyui -- ComfyUI not installed (skipped)
+  [passed                ] input-hash -- {"testdata/minimax_h3_fixture.safetensors":"809324a22ef0649254361404b23a49e0c0cf7fddf8e2ac479baffb8004a40446"}
+
+-- compatibility requirements --
+  W3A8 extension: no upstream runtime; requires --emit-patch runtime patch
+
+-- output integrity --
+  sha256          : e82056349b60c9040ffad9cc73bb46faadf1de2e088991940aeb2c3ad1b269dc
+  input minimax_h3_fixture.safetensors : 809324a22ef0649254361404b23a49e0c0cf7fddf8e2ac479baffb8004a40446
+==============================================================================

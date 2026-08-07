@@ -1,0 +1,101 @@
+==============================================================================
+comfyui_wxa8_quantizer 1.0.0 -- conversion report
+==============================================================================
+format            : asym_w4a8_int8 (asym-w4a8-int8-r1)
+architecture      : flux (confidence medium)
+unet prefix       : model.diffusion_model.
+input             : safetensors (testdata/flux_fixture.safetensors)
+output            : testdata/flux_fixture_w4a8.safetensors (28.29 MiB)
+elapsed           : 14.512 s
+peak RSS          : 1.00 GiB
+
+-- detection evidence --
+  + double_blocks.0.img_attn.norm.key_norm.weight
+  ~ img_in.weight (hint)
+  ~ txt_in.weight (hint)
+  ~ single_blocks.0.linear1.weight (hint)
+
+-- tensor statistics --
+  input tensors   : 23
+  quantized layers: 16
+  kept tensors    : 7
+
+-- quantization --
+  model.diffusion_model.double_blocks.0.img_attn.proj: (768, 768) gs=16 cgs=256
+  model.diffusion_model.double_blocks.0.img_attn.qkv: (768, 768) gs=16 cgs=256
+  model.diffusion_model.double_blocks.0.img_mlp.w1: (3072, 768) gs=16 cgs=256
+  model.diffusion_model.double_blocks.0.img_mlp.w2: (768, 3072) gs=16 cgs=256
+  model.diffusion_model.double_blocks.0.txt_attn.proj: (768, 768) gs=16 cgs=256
+  model.diffusion_model.double_blocks.0.txt_attn.qkv: (768, 1024) gs=16 cgs=256
+  model.diffusion_model.double_blocks.1.img_attn.proj: (768, 768) gs=16 cgs=256
+  model.diffusion_model.double_blocks.1.img_attn.qkv: (768, 768) gs=16 cgs=256
+  model.diffusion_model.double_blocks.1.img_mlp.w1: (3072, 768) gs=16 cgs=256
+  model.diffusion_model.double_blocks.1.img_mlp.w2: (768, 3072) gs=16 cgs=256
+  model.diffusion_model.double_blocks.1.txt_attn.proj: (768, 768) gs=16 cgs=256
+  model.diffusion_model.double_blocks.1.txt_attn.qkv: (768, 1024) gs=16 cgs=256
+  model.diffusion_model.single_blocks.0.linear1: (2304, 2304) gs=16 cgs=256
+  model.diffusion_model.single_blocks.0.linear2: (2304, 2304) gs=16 cgs=256
+  model.diffusion_model.single_blocks.1.linear1: (2304, 2304) gs=16 cgs=256
+  model.diffusion_model.single_blocks.1.linear2: (2304, 2304) gs=16 cgs=256
+
+-- calibration --
+  calibration-free (reference format; per-group absmax scales)
+
+-- validation --
+  [passed                ] output-reopen -- 71 tensors, 28.30 MiB
+  [passed                ] output-entry-count -- 71 vs 71 expected
+  [passed                ] output-inventory -- missing=[] extra=[]
+  [passed                ] shape-preservation
+  [passed                ] dtype-check
+  [passed                ] metadata-present -- 16 layers recorded
+  [passed                ] extension-metadata-present -- present
+  [passed                ] metadata-layer-inventory -- layer set mismatch: []
+  [passed                ] metadata-layer-conf -- format field mismatch
+  [passed                ] recon-model.diffusion_model.single_blocks.0.linear1 -- relL2=0.0727 snr=22.8dB cos=0.9976
+  [passed                ] pack-rt-model.diffusion_model.single_blocks.0.linear1 -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.single_blocks.0.linear2 -- relL2=0.0728 snr=22.8dB cos=0.9976
+  [passed                ] pack-rt-model.diffusion_model.single_blocks.0.linear2 -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.single_blocks.1.linear1 -- relL2=0.0728 snr=22.8dB cos=0.9976
+  [passed                ] pack-rt-model.diffusion_model.single_blocks.1.linear1 -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.single_blocks.1.linear2 -- relL2=0.0728 snr=22.8dB cos=0.9976
+  [passed                ] pack-rt-model.diffusion_model.single_blocks.1.linear2 -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.double_blocks.0.img_mlp.w1 -- relL2=0.0726 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.double_blocks.0.img_mlp.w1 -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.double_blocks.0.img_mlp.w2 -- relL2=0.0729 snr=22.7dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.double_blocks.0.img_mlp.w2 -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.double_blocks.1.img_mlp.w1 -- relL2=0.0727 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.double_blocks.1.img_mlp.w1 -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.double_blocks.1.img_mlp.w2 -- relL2=0.0728 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.double_blocks.1.img_mlp.w2 -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.double_blocks.0.txt_attn.qkv -- relL2=0.0727 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.double_blocks.0.txt_attn.qkv -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.double_blocks.1.txt_attn.qkv -- relL2=0.0727 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.double_blocks.1.txt_attn.qkv -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.double_blocks.0.img_attn.proj -- relL2=0.0727 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.double_blocks.0.img_attn.proj -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.double_blocks.0.img_attn.qkv -- relL2=0.0726 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.double_blocks.0.img_attn.qkv -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.double_blocks.0.txt_attn.proj -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.double_blocks.0.txt_attn.proj -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.double_blocks.1.img_attn.proj -- relL2=0.0728 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.double_blocks.1.img_attn.proj -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.double_blocks.1.img_attn.qkv -- relL2=0.0727 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.double_blocks.1.img_attn.qkv -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.double_blocks.1.txt_attn.proj -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.double_blocks.1.txt_attn.proj -- pack/unpack round trip
+  [passed                ] reconstruction-error-bound -- max sampled relL2 0.0729 (policy bound 0.25)
+  [passed                ] scale-validation -- 16 layers OK (fp8 s_rel finite/positive, fp32 s_channel finite/positive)
+  [passed                ] deterministic-conversion -- two runs byte-identical
+  [passed                ] deterministic-vs-disk -- recomputed packed weight matches the file
+  [passed                ] output-hash -- sha256=13a88def2a7d1d0210759fb3d0c6610c271ed2ba839eaf9882341238a23c2246
+  [skipped               ] compat-comfy-kitchen -- comfy-kitchen not installed (skipped)
+  [skipped               ] compat-comfyui -- ComfyUI not installed (skipped)
+  [passed                ] input-hash -- {"testdata/flux_fixture.safetensors":"7498407638a346a6e593fc57cdf8a3b9f6ee064d411c76c0ae6acd06d78c289f"}
+
+-- compatibility requirements --
+  comfy-kitchen >= aa1ab2263dc06225d9de6702dfc087313d4bc971 (PR #90, merged) with AsymW4A8Int8Layout; ComfyUI >= PR #15308 head b6578f2ae11ab3dea3156ed68d8724476cda1232 (NOT merged into master at base bdcb886a4705a03cf40f4a7226de9fc7c059fc90); CUDA: PyTorch cu130+, SM >= 8.0; ROCm: triton >= 3.7; eager works anywhere
+
+-- output integrity --
+  sha256          : 13a88def2a7d1d0210759fb3d0c6610c271ed2ba839eaf9882341238a23c2246
+  input flux_fixture.safetensors : 7498407638a346a6e593fc57cdf8a3b9f6ee064d411c76c0ae6acd06d78c289f
+==============================================================================

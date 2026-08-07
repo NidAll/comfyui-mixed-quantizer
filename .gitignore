@@ -1,0 +1,17 @@
+# virtualenv / tooling
+.venv/
+__pycache__/
+*.pyc
+
+# research checkouts (reference material only, not part of the project)
+research/
+
+# build scratch
+build/
+
+# test data: regenerable fixtures and local-only artifacts
+testdata/*.safetensors
+testdata/*.json
+testdata/*.tmp
+testdata/*.state.json
+testdata/*.log

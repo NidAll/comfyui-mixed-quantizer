@@ -1,0 +1,107 @@
+==============================================================================
+comfyui_wxa8_quantizer 1.0.0 -- conversion report
+==============================================================================
+format            : asym_w4a8_int8 (asym-w4a8-int8-r1)
+architecture      : wan (confidence medium)
+unet prefix       : model.diffusion_model.
+input             : safetensors (testdata/wan_fixture.safetensors)
+output            : testdata/wan_fixture_calib.safetensors (5.91 MiB)
+elapsed           : 5.007 s
+peak RSS          : 618.75 MiB
+
+-- detection evidence --
+  + head.modulation
+  ~ blocks.0.self_attn.q.weight (hint)
+  ~ blocks.0.cross_attn.k.weight (hint)
+  ~ patch_embedding.weight (hint)
+
+-- tensor statistics --
+  input tensors   : 31
+  quantized layers: 20
+  kept tensors    : 11
+
+-- quantization --
+  model.diffusion_model.blocks.0.cross_attn.k: (384, 384) gs=16 cgs=64
+  model.diffusion_model.blocks.0.cross_attn.o: (384, 384) gs=16 cgs=64
+  model.diffusion_model.blocks.0.cross_attn.q: (384, 384) gs=16 cgs=64
+  model.diffusion_model.blocks.0.cross_attn.v: (384, 384) gs=16 cgs=64
+  model.diffusion_model.blocks.0.ffn.0: (2240, 384) gs=16 cgs=64
+  model.diffusion_model.blocks.0.ffn.2: (384, 2240) gs=16 cgs=64
+  model.diffusion_model.blocks.0.self_attn.k: (384, 384) gs=16 cgs=64
+  model.diffusion_model.blocks.0.self_attn.o: (384, 384) gs=16 cgs=64
+  model.diffusion_model.blocks.0.self_attn.q: (384, 384) gs=16 cgs=64
+  model.diffusion_model.blocks.0.self_attn.v: (384, 384) gs=16 cgs=64
+  model.diffusion_model.blocks.1.cross_attn.k: (384, 384) gs=16 cgs=64
+  model.diffusion_model.blocks.1.cross_attn.o: (384, 384) gs=16 cgs=64
+  model.diffusion_model.blocks.1.cross_attn.q: (384, 384) gs=16 cgs=64
+  model.diffusion_model.blocks.1.cross_attn.v: (384, 384) gs=16 cgs=64
+  model.diffusion_model.blocks.1.ffn.0: (2240, 384) gs=16 cgs=64
+  model.diffusion_model.blocks.1.ffn.2: (384, 2240) gs=16 cgs=64
+  model.diffusion_model.blocks.1.self_attn.k: (384, 384) gs=16 cgs=64
+  model.diffusion_model.blocks.1.self_attn.o: (384, 384) gs=16 cgs=64
+  model.diffusion_model.blocks.1.self_attn.q: (384, 384) gs=16 cgs=64
+  model.diffusion_model.blocks.1.self_attn.v: (384, 384) gs=16 cgs=64
+
+-- calibration --
+  source=testdata/wan_calib.npz, files=['testdata/wan_calib.npz'], layers=24, provenance={"files":["testdata/wan_calib.npz"],"max_samples_per_layer":32,"method":"local activation statistics (absmax / norm per layer)","n_files":1,"n_layers_with_data":24,"source":"testdata/wan_calib.npz","synthetic":false}
+
+-- validation --
+  [passed                ] output-reopen -- 91 tensors, 5.92 MiB
+  [passed                ] output-entry-count -- 91 vs 91 expected
+  [passed                ] output-inventory -- missing=[] extra=[]
+  [passed                ] shape-preservation
+  [passed                ] dtype-check
+  [passed                ] metadata-present -- 20 layers recorded
+  [passed                ] extension-metadata-present -- present
+  [passed                ] metadata-layer-inventory -- layer set mismatch: []
+  [passed                ] metadata-layer-conf -- format field mismatch
+  [passed                ] recon-model.diffusion_model.blocks.0.ffn.0 -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.blocks.0.ffn.0 -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.blocks.0.ffn.2 -- relL2=0.0727 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.blocks.0.ffn.2 -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.blocks.1.ffn.0 -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.blocks.1.ffn.0 -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.blocks.1.ffn.2 -- relL2=0.0728 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.blocks.1.ffn.2 -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.blocks.0.cross_attn.k -- relL2=0.0727 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.blocks.0.cross_attn.k -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.blocks.0.cross_attn.o -- relL2=0.0726 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.blocks.0.cross_attn.o -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.blocks.0.cross_attn.q -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.blocks.0.cross_attn.q -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.blocks.0.cross_attn.v -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.blocks.0.cross_attn.v -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.blocks.0.self_attn.k -- relL2=0.0726 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.blocks.0.self_attn.k -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.blocks.0.self_attn.o -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.blocks.0.self_attn.o -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.blocks.0.self_attn.q -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.blocks.0.self_attn.q -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.blocks.0.self_attn.v -- relL2=0.0727 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.blocks.0.self_attn.v -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.blocks.1.cross_attn.k -- relL2=0.0726 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.blocks.1.cross_attn.k -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.blocks.1.cross_attn.o -- relL2=0.0722 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.blocks.1.cross_attn.o -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.blocks.1.cross_attn.q -- relL2=0.0723 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.blocks.1.cross_attn.q -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.blocks.1.cross_attn.v -- relL2=0.0727 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.blocks.1.cross_attn.v -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.blocks.1.self_attn.v -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.blocks.1.self_attn.v -- pack/unpack round trip
+  [passed                ] reconstruction-error-bound -- max sampled relL2 0.0728 (policy bound 0.25)
+  [passed                ] scale-validation -- 20 layers OK (fp8 s_rel finite/positive, fp32 s_channel finite/positive)
+  [passed                ] deterministic-conversion -- two runs byte-identical
+  [passed                ] deterministic-vs-disk -- recomputed packed weight matches the file
+  [passed                ] output-hash -- sha256=bf13d95ea56203abf1a2dde07a4f33ea2e01d777b1b3114a9d27fa5569e5ef0c
+  [skipped               ] compat-comfy-kitchen -- comfy-kitchen not installed (skipped)
+  [skipped               ] compat-comfyui -- ComfyUI not installed (skipped)
+  [passed                ] input-hash -- {"testdata/wan_fixture.safetensors":"4616a6fe714be2a5ebd5b69b98073ecfe4a033b33984eae8a7e2324767c232de"}
+
+-- compatibility requirements --
+  comfy-kitchen >= aa1ab2263dc06225d9de6702dfc087313d4bc971 (PR #90, merged) with AsymW4A8Int8Layout; ComfyUI >= PR #15308 head b6578f2ae11ab3dea3156ed68d8724476cda1232 (NOT merged into master at base bdcb886a4705a03cf40f4a7226de9fc7c059fc90); CUDA: PyTorch cu130+, SM >= 8.0; ROCm: triton >= 3.7; eager works anywhere
+
+-- output integrity --
+  sha256          : bf13d95ea56203abf1a2dde07a4f33ea2e01d777b1b3114a9d27fa5569e5ef0c
+  input wan_fixture.safetensors : 4616a6fe714be2a5ebd5b69b98073ecfe4a033b33984eae8a7e2324767c232de
+==============================================================================
