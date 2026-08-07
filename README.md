@@ -32,8 +32,10 @@ documented in the [Research basis](#research-basis) section below.
 
 * W4A8 weight quantization in the exact `asym_w4a8_int8` layout of comfy-kitchen
   PR #90: ConvRot-rotated int4 weights, a per-tensor 16-entry Lloyd-Max codebook,
-  fp8 group scales, and per-channel scales. Quantization is bit-exact with the
-  reference implementation (verified with golden vectors and side-by-side runs).
+  fp8 group scales, and per-channel scales. Packed int4 codes and fp8 scales are
+  byte-identical to the reference implementation; fp32 scale fields can differ in
+  the last ULPs across platforms (verified with golden vectors and side-by-side
+  runs).
 * Architecture detection from the checkpoint alone. The embedded registry has 42
   policy families that cover all 98 model classes ComfyUI supported at the research
   revision, each with its own quantize / keep / exclude rules and validation
@@ -232,7 +234,7 @@ relL2 = per-layer weight reconstruction error (max over sampled layers).
 | feature | result |
 |---|---|
 | embedded self-tests (`--self-test`) | 13/13 pass |
-| golden-vector bit-exactness vs comfy-kitchen reference | pass (2 configs) |
+| golden vectors vs comfy-kitchen reference (packed/fp8 byte-exact, fp32 within 1e-4) | pass (2 configs) |
 | side-by-side bit-exactness vs reference (9 shape/config combos, quantize + dequantize) | pass |
 | CLI kill + `--resume` recovery | pass (deterministic-vs-disk verified) |
 | calibration (npz), `--calibration-samples`, cache write/read | pass |
@@ -372,6 +374,17 @@ Files studied in ComfyUI@bdcb886 (+ PR #15308 diff): `comfy/ops.py`
 The asymmetric-correction variant (`{layer}.weight_correction [K/gs, N]`) exists in
 comfy-kitchen but the ComfyUI loader does not consume it. The converter always uses
 the symmetric codebook mode.
+
+### Cross-platform determinism
+
+Quantization is deterministic per platform: two runs on the same machine produce
+byte-identical output. Across platforms, torch reductions (quantile, amax, mean)
+can differ in the last ULPs, so the fp32 `s_channel` and `codebook` fields may vary
+in their lowest bits between x86 and ARM or between Windows and Linux. The packed
+int8 codes and the fp8 `s_rel` bytes are stable across platforms. The embedded
+golden-vector test asserts byte equality for packed/fp8 output and a 1e-4 relative
+tolerance for the fp32 fields, and the CI matrix runs it on ubuntu, windows and
+macos.
 
 ### Runtime prerequisites
 

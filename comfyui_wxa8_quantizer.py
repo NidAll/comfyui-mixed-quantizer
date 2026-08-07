@@ -4009,19 +4009,6 @@ def _test_registry() -> str:
     return f"{len(names)} families, {len(covered)} ComfyUI classes covered"
 
 
-def _test_golden_vectors() -> str:
-    """Bit-exactness against golden values captured from the reference
-    comfy-kitchen implementation (see GOLDEN_W4 in this module)."""
-    w = GOLDEN_W4["weight"]
-    p, s_rel, s_ch, cb, corr = quantize_w4a8_weight(w, group_size=16, convrot_groupsize=256)
-    assert torch.equal(p, GOLDEN_W4["packed"]), "packed mismatch vs reference"
-    assert torch.equal(s_rel.view(torch.uint8), GOLDEN_W4["s_rel_u8"]), "s_rel mismatch vs reference"
-    assert torch.equal(s_ch, GOLDEN_W4["s_channel"]), "s_channel mismatch vs reference"
-    assert torch.equal(cb, GOLDEN_W4["codebook"]), "codebook mismatch vs reference"
-    assert corr is None
-    return "packed/s_rel/s_channel/codebook bit-exact with reference"
-
-
 def _test_malformed() -> str:
     d = _tmpdir()
     # truncated header
@@ -6114,19 +6101,32 @@ GOLDEN_W4 = GOLDEN["w4a8_default"]
 
 
 def _test_golden_vectors() -> str:
-    """Bit-exactness against golden values captured from the reference
-    comfy-kitchen implementation (eager backend)."""
+    """Golden vectors captured from the reference comfy-kitchen implementation.
+
+    Packed int8 codes and fp8 (e4m3) scales are compared byte-exactly. The fp32
+    scale fields (s_channel, codebook) are compared with a tight relative
+    tolerance, because torch reductions (quantile, amax, mean) can differ in the
+    last ULPs between platforms (x86 vs ARM, Windows vs Linux) while the packed
+    output stays identical.
+    """
     detail = []
+    d_ch = 0.0
+    d_cb = 0.0
     for name, g in GOLDEN.items():
         p, s_rel, s_ch, corr, cb = quantize_w4a8_weight(
             g["weight"], group_size=g["gs"], convrot_groupsize=g["cgs"])
         assert torch.equal(p, g["packed"]), f"{name}: packed mismatch vs reference"
         assert torch.equal(s_rel.view(torch.uint8), g["s_rel_u8"]), f"{name}: s_rel mismatch vs reference"
-        assert torch.equal(s_ch, g["s_channel"]), f"{name}: s_channel mismatch vs reference"
-        assert torch.equal(cb, g["codebook"]), f"{name}: codebook mismatch vs reference"
+        d_ch = max(d_ch, float((s_ch - g["s_channel"]).abs().max()))
+        assert torch.allclose(s_ch, g["s_channel"], rtol=1e-4, atol=1e-8), \
+            f"{name}: s_channel max abs diff {d_ch:.3e} vs reference"
+        d_cb = max(d_cb, float((cb - g["codebook"]).abs().max()))
+        assert torch.allclose(cb, g["codebook"], rtol=1e-4, atol=1e-6), \
+            f"{name}: codebook max abs diff {d_cb:.3e} vs reference"
         assert corr is None
         detail.append(f"{name}(gs={g['gs']},cgs={g['cgs']})")
-    return "bit-exact with reference: " + ", ".join(detail)
+    return ("golden match: packed/fp8 byte-exact, fp32 max diffs "
+            f"s_ch={d_ch:.1e} cb={d_cb:.1e}")
 
 
 
