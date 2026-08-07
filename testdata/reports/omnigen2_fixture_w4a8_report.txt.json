@@ -1,6 +1,6 @@
 {
  "converter": "comfyui_wxa8_quantizer",
- "converter_version": "1.2.1",
+ "converter_version": "1.2.2",
  "format": "asym_w4a8_int8",
  "format_revision": "asym-w4a8-int8-r1",
  "architecture": "omnigen2",
@@ -21,48 +21,48 @@
  "input_files": [
   "testdata/omnigen2_fixture.safetensors"
  ],
- "input_bytes": 24519936,
+ "input_bytes": 80553216,
  "output_path": "testdata/omnigen2_fixture_w4a8.safetensors",
- "output_bytes": 6835136,
+ "output_bytes": 14760896,
  "n_input_tensors": 85,
  "n_quantized": 35,
  "n_kept": 50,
  "quantization_rows": [
-  "context_refiner.0.attn.to_k: (384, 384) gs=16 cgs=64",
-  "context_refiner.0.attn.to_out.0: (384, 384) gs=16 cgs=64",
-  "context_refiner.0.attn.to_q: (384, 384) gs=16 cgs=64",
-  "context_refiner.0.attn.to_v: (384, 384) gs=16 cgs=64",
-  "context_refiner.0.feed_forward.linear_1: (384, 384) gs=16 cgs=64",
-  "context_refiner.0.feed_forward.linear_2: (384, 384) gs=16 cgs=64",
-  "context_refiner.0.feed_forward.linear_3: (384, 384) gs=16 cgs=64",
-  "layers.0.attn.to_k: (384, 384) gs=16 cgs=64",
-  "layers.0.attn.to_out.0: (384, 384) gs=16 cgs=64",
-  "layers.0.attn.to_q: (384, 384) gs=16 cgs=64",
-  "layers.0.attn.to_v: (384, 384) gs=16 cgs=64",
-  "layers.0.feed_forward.linear_1: (384, 384) gs=16 cgs=64",
-  "layers.0.feed_forward.linear_2: (384, 384) gs=16 cgs=64",
-  "layers.0.feed_forward.linear_3: (384, 384) gs=16 cgs=64",
-  "layers.1.attn.to_k: (384, 384) gs=16 cgs=64",
-  "layers.1.attn.to_out.0: (384, 384) gs=16 cgs=64",
-  "layers.1.attn.to_q: (384, 384) gs=16 cgs=64",
-  "layers.1.attn.to_v: (384, 384) gs=16 cgs=64",
-  "layers.1.feed_forward.linear_1: (384, 384) gs=16 cgs=64",
-  "layers.1.feed_forward.linear_2: (384, 384) gs=16 cgs=64",
-  "layers.1.feed_forward.linear_3: (384, 384) gs=16 cgs=64",
-  "noise_refiner.0.attn.to_k: (384, 384) gs=16 cgs=64",
-  "noise_refiner.0.attn.to_out.0: (384, 384) gs=16 cgs=64",
-  "noise_refiner.0.attn.to_q: (384, 384) gs=16 cgs=64",
-  "noise_refiner.0.attn.to_v: (384, 384) gs=16 cgs=64",
-  "noise_refiner.0.feed_forward.linear_1: (384, 384) gs=16 cgs=64",
-  "noise_refiner.0.feed_forward.linear_2: (384, 384) gs=16 cgs=64",
-  "noise_refiner.0.feed_forward.linear_3: (384, 384) gs=16 cgs=64",
-  "ref_image_refiner.0.attn.to_k: (384, 384) gs=16 cgs=64",
-  "ref_image_refiner.0.attn.to_out.0: (384, 384) gs=16 cgs=64",
-  "ref_image_refiner.0.attn.to_q: (384, 384) gs=16 cgs=64",
-  "ref_image_refiner.0.attn.to_v: (384, 384) gs=16 cgs=64",
-  "ref_image_refiner.0.feed_forward.linear_1: (384, 384) gs=16 cgs=64",
-  "ref_image_refiner.0.feed_forward.linear_2: (384, 384) gs=16 cgs=64",
-  "ref_image_refiner.0.feed_forward.linear_3: (384, 384) gs=16 cgs=64"
+  "context_refiner.0.attn.to_k: (768, 768) gs=16 cgs=256",
+  "context_refiner.0.attn.to_out.0: (384, 768) gs=16 cgs=256",
+  "context_refiner.0.attn.to_q: (768, 768) gs=16 cgs=256",
+  "context_refiner.0.attn.to_v: (768, 768) gs=16 cgs=256",
+  "context_refiner.0.feed_forward.linear_1: (768, 768) gs=16 cgs=256",
+  "context_refiner.0.feed_forward.linear_2: (768, 768) gs=16 cgs=256",
+  "context_refiner.0.feed_forward.linear_3: (768, 768) gs=16 cgs=256",
+  "layers.0.attn.to_k: (768, 768) gs=16 cgs=256",
+  "layers.0.attn.to_out.0: (384, 768) gs=16 cgs=256",
+  "layers.0.attn.to_q: (768, 768) gs=16 cgs=256",
+  "layers.0.attn.to_v: (768, 768) gs=16 cgs=256",
+  "layers.0.feed_forward.linear_1: (768, 768) gs=16 cgs=256",
+  "layers.0.feed_forward.linear_2: (768, 768) gs=16 cgs=256",
+  "layers.0.feed_forward.linear_3: (768, 768) gs=16 cgs=256",
+  "layers.1.attn.to_k: (768, 768) gs=16 cgs=256",
+  "layers.1.attn.to_out.0: (384, 768) gs=16 cgs=256",
+  "layers.1.attn.to_q: (768, 768) gs=16 cgs=256",
+  "layers.1.attn.to_v: (768, 768) gs=16 cgs=256",
+  "layers.1.feed_forward.linear_1: (768, 768) gs=16 cgs=256",
+  "layers.1.feed_forward.linear_2: (768, 768) gs=16 cgs=256",
+  "layers.1.feed_forward.linear_3: (768, 768) gs=16 cgs=256",
+  "noise_refiner.0.attn.to_k: (768, 768) gs=16 cgs=256",
+  "noise_refiner.0.attn.to_out.0: (384, 768) gs=16 cgs=256",
+  "noise_refiner.0.attn.to_q: (768, 768) gs=16 cgs=256",
+  "noise_refiner.0.attn.to_v: (768, 768) gs=16 cgs=256",
+  "noise_refiner.0.feed_forward.linear_1: (768, 768) gs=16 cgs=256",
+  "noise_refiner.0.feed_forward.linear_2: (768, 768) gs=16 cgs=256",
+  "noise_refiner.0.feed_forward.linear_3: (768, 768) gs=16 cgs=256",
+  "ref_image_refiner.0.attn.to_k: (768, 768) gs=16 cgs=256",
+  "ref_image_refiner.0.attn.to_out.0: (384, 768) gs=16 cgs=256",
+  "ref_image_refiner.0.attn.to_q: (768, 768) gs=16 cgs=256",
+  "ref_image_refiner.0.attn.to_v: (768, 768) gs=16 cgs=256",
+  "ref_image_refiner.0.feed_forward.linear_1: (768, 768) gs=16 cgs=256",
+  "ref_image_refiner.0.feed_forward.linear_2: (768, 768) gs=16 cgs=256",
+  "ref_image_refiner.0.feed_forward.linear_3: (768, 768) gs=16 cgs=256"
  ],
  "tensor_decisions": [
   {
@@ -87,7 +87,7 @@
    "reason": "policy candidate",
    "layer": "context_refiner.0.attn.to_k",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "context_refiner.0.attn.to_out.0.weight",
@@ -95,7 +95,7 @@
    "reason": "policy candidate",
    "layer": "context_refiner.0.attn.to_out.0",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "context_refiner.0.attn.to_q.weight",
@@ -103,7 +103,7 @@
    "reason": "policy candidate",
    "layer": "context_refiner.0.attn.to_q",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "context_refiner.0.attn.to_v.weight",
@@ -111,7 +111,7 @@
    "reason": "policy candidate",
    "layer": "context_refiner.0.attn.to_v",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "context_refiner.0.feed_forward.linear_1.weight",
@@ -119,7 +119,7 @@
    "reason": "policy candidate",
    "layer": "context_refiner.0.feed_forward.linear_1",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "context_refiner.0.feed_forward.linear_2.weight",
@@ -127,7 +127,7 @@
    "reason": "policy candidate",
    "layer": "context_refiner.0.feed_forward.linear_2",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "context_refiner.0.feed_forward.linear_3.weight",
@@ -135,7 +135,7 @@
    "reason": "policy candidate",
    "layer": "context_refiner.0.feed_forward.linear_3",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "context_refiner.0.ffn_norm1.weight",
@@ -199,7 +199,7 @@
    "reason": "policy candidate",
    "layer": "layers.0.attn.to_k",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "layers.0.attn.to_out.0.weight",
@@ -207,7 +207,7 @@
    "reason": "policy candidate",
    "layer": "layers.0.attn.to_out.0",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "layers.0.attn.to_q.weight",
@@ -215,7 +215,7 @@
    "reason": "policy candidate",
    "layer": "layers.0.attn.to_q",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "layers.0.attn.to_v.weight",
@@ -223,7 +223,7 @@
    "reason": "policy candidate",
    "layer": "layers.0.attn.to_v",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "layers.0.feed_forward.linear_1.weight",
@@ -231,7 +231,7 @@
    "reason": "policy candidate",
    "layer": "layers.0.feed_forward.linear_1",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "layers.0.feed_forward.linear_2.weight",
@@ -239,7 +239,7 @@
    "reason": "policy candidate",
    "layer": "layers.0.feed_forward.linear_2",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "layers.0.feed_forward.linear_3.weight",
@@ -247,7 +247,7 @@
    "reason": "policy candidate",
    "layer": "layers.0.feed_forward.linear_3",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "layers.0.ffn_norm1.weight",
@@ -319,7 +319,7 @@
    "reason": "policy candidate",
    "layer": "layers.1.attn.to_k",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "layers.1.attn.to_out.0.weight",
@@ -327,7 +327,7 @@
    "reason": "policy candidate",
    "layer": "layers.1.attn.to_out.0",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "layers.1.attn.to_q.weight",
@@ -335,7 +335,7 @@
    "reason": "policy candidate",
    "layer": "layers.1.attn.to_q",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "layers.1.attn.to_v.weight",
@@ -343,7 +343,7 @@
    "reason": "policy candidate",
    "layer": "layers.1.attn.to_v",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "layers.1.feed_forward.linear_1.weight",
@@ -351,7 +351,7 @@
    "reason": "policy candidate",
    "layer": "layers.1.feed_forward.linear_1",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "layers.1.feed_forward.linear_2.weight",
@@ -359,7 +359,7 @@
    "reason": "policy candidate",
    "layer": "layers.1.feed_forward.linear_2",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "layers.1.feed_forward.linear_3.weight",
@@ -367,7 +367,7 @@
    "reason": "policy candidate",
    "layer": "layers.1.feed_forward.linear_3",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "layers.1.ffn_norm1.weight",
@@ -439,7 +439,7 @@
    "reason": "policy candidate",
    "layer": "noise_refiner.0.attn.to_k",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "noise_refiner.0.attn.to_out.0.weight",
@@ -447,7 +447,7 @@
    "reason": "policy candidate",
    "layer": "noise_refiner.0.attn.to_out.0",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "noise_refiner.0.attn.to_q.weight",
@@ -455,7 +455,7 @@
    "reason": "policy candidate",
    "layer": "noise_refiner.0.attn.to_q",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "noise_refiner.0.attn.to_v.weight",
@@ -463,7 +463,7 @@
    "reason": "policy candidate",
    "layer": "noise_refiner.0.attn.to_v",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "noise_refiner.0.feed_forward.linear_1.weight",
@@ -471,7 +471,7 @@
    "reason": "policy candidate",
    "layer": "noise_refiner.0.feed_forward.linear_1",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "noise_refiner.0.feed_forward.linear_2.weight",
@@ -479,7 +479,7 @@
    "reason": "policy candidate",
    "layer": "noise_refiner.0.feed_forward.linear_2",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "noise_refiner.0.feed_forward.linear_3.weight",
@@ -487,7 +487,7 @@
    "reason": "policy candidate",
    "layer": "noise_refiner.0.feed_forward.linear_3",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "noise_refiner.0.ffn_norm1.weight",
@@ -591,7 +591,7 @@
    "reason": "policy candidate",
    "layer": "ref_image_refiner.0.attn.to_k",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "ref_image_refiner.0.attn.to_out.0.weight",
@@ -599,7 +599,7 @@
    "reason": "policy candidate",
    "layer": "ref_image_refiner.0.attn.to_out.0",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "ref_image_refiner.0.attn.to_q.weight",
@@ -607,7 +607,7 @@
    "reason": "policy candidate",
    "layer": "ref_image_refiner.0.attn.to_q",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "ref_image_refiner.0.attn.to_v.weight",
@@ -615,7 +615,7 @@
    "reason": "policy candidate",
    "layer": "ref_image_refiner.0.attn.to_v",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "ref_image_refiner.0.feed_forward.linear_1.weight",
@@ -623,7 +623,7 @@
    "reason": "policy candidate",
    "layer": "ref_image_refiner.0.feed_forward.linear_1",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "ref_image_refiner.0.feed_forward.linear_2.weight",
@@ -631,7 +631,7 @@
    "reason": "policy candidate",
    "layer": "ref_image_refiner.0.feed_forward.linear_2",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "ref_image_refiner.0.feed_forward.linear_3.weight",
@@ -639,7 +639,7 @@
    "reason": "policy candidate",
    "layer": "ref_image_refiner.0.feed_forward.linear_3",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "ref_image_refiner.0.ffn_norm1.weight",
@@ -752,7 +752,7 @@
   {
    "name": "output-reopen",
    "status": "passed",
-   "detail": "190 tensors, 6.54 MiB",
+   "detail": "190 tensors, 14.10 MiB",
    "reason": ""
   },
   {
@@ -806,7 +806,7 @@
   {
    "name": "tensor-payload-hash",
    "status": "passed",
-   "detail": "sha256=1c6301a65b4d506cf2dbec7cf22375b5efca9b0120ed5f3ef237446db1cc98c5",
+   "detail": "sha256=b6ca4647494e92b0c98c809edee79fffe306a02458fe69378b6860d6a0142798",
    "reason": ""
   },
   {
@@ -824,7 +824,7 @@
   {
    "name": "recon-context_refiner.0.attn.to_k",
    "status": "passed",
-   "detail": "relL2=0.0725 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0727 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -836,7 +836,7 @@
   {
    "name": "recon-context_refiner.0.attn.to_out.0",
    "status": "passed",
-   "detail": "relL2=0.0724 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -860,7 +860,7 @@
   {
    "name": "recon-context_refiner.0.attn.to_v",
    "status": "passed",
-   "detail": "relL2=0.0723 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0727 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -872,7 +872,7 @@
   {
    "name": "recon-context_refiner.0.feed_forward.linear_1",
    "status": "passed",
-   "detail": "relL2=0.0725 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0728 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -896,7 +896,7 @@
   {
    "name": "recon-context_refiner.0.feed_forward.linear_3",
    "status": "passed",
-   "detail": "relL2=0.0724 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0727 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -920,7 +920,7 @@
   {
    "name": "recon-layers.0.attn.to_out.0",
    "status": "passed",
-   "detail": "relL2=0.0725 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0724 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -932,7 +932,7 @@
   {
    "name": "recon-layers.0.attn.to_q",
    "status": "passed",
-   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0728 snr=22.8dB cos=0.9973",
    "reason": ""
   },
   {
@@ -956,7 +956,7 @@
   {
    "name": "recon-layers.0.feed_forward.linear_1",
    "status": "passed",
-   "detail": "relL2=0.0725 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -968,7 +968,7 @@
   {
    "name": "recon-layers.0.feed_forward.linear_2",
    "status": "passed",
-   "detail": "relL2=0.0724 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0727 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -980,7 +980,7 @@
   {
    "name": "recon-layers.0.feed_forward.linear_3",
    "status": "passed",
-   "detail": "relL2=0.0724 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0727 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -992,7 +992,7 @@
   {
    "name": "recon-layers.1.attn.to_k",
    "status": "passed",
-   "detail": "relL2=0.0723 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0725 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1004,7 +1004,7 @@
   {
    "name": "recon-layers.1.attn.to_out.0",
    "status": "passed",
-   "detail": "relL2=0.0723 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1016,7 +1016,7 @@
   {
    "name": "recon-layers.1.attn.to_q",
    "status": "passed",
-   "detail": "relL2=0.0725 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0727 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1028,7 +1028,7 @@
   {
    "name": "recon-layers.1.attn.to_v",
    "status": "passed",
-   "detail": "relL2=0.0724 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1040,7 +1040,7 @@
   {
    "name": "recon-layers.1.feed_forward.linear_1",
    "status": "passed",
-   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0725 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1052,7 +1052,7 @@
   {
    "name": "recon-layers.1.feed_forward.linear_2",
    "status": "passed",
-   "detail": "relL2=0.0724 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1064,7 +1064,7 @@
   {
    "name": "recon-layers.1.feed_forward.linear_3",
    "status": "passed",
-   "detail": "relL2=0.0723 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1076,7 +1076,7 @@
   {
    "name": "recon-noise_refiner.0.attn.to_k",
    "status": "passed",
-   "detail": "relL2=0.0725 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1088,7 +1088,7 @@
   {
    "name": "recon-noise_refiner.0.attn.to_out.0",
    "status": "passed",
-   "detail": "relL2=0.0724 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0725 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1100,7 +1100,7 @@
   {
    "name": "recon-noise_refiner.0.attn.to_q",
    "status": "passed",
-   "detail": "relL2=0.0725 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1112,7 +1112,7 @@
   {
    "name": "recon-noise_refiner.0.attn.to_v",
    "status": "passed",
-   "detail": "relL2=0.0724 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1124,7 +1124,7 @@
   {
    "name": "recon-noise_refiner.0.feed_forward.linear_1",
    "status": "passed",
-   "detail": "relL2=0.0725 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1136,7 +1136,7 @@
   {
    "name": "recon-noise_refiner.0.feed_forward.linear_2",
    "status": "passed",
-   "detail": "relL2=0.0723 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1148,7 +1148,7 @@
   {
    "name": "recon-noise_refiner.0.feed_forward.linear_3",
    "status": "passed",
-   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0727 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1172,7 +1172,7 @@
   {
    "name": "recon-ref_image_refiner.0.attn.to_out.0",
    "status": "passed",
-   "detail": "relL2=0.0725 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1208,7 +1208,7 @@
   {
    "name": "recon-ref_image_refiner.0.feed_forward.linear_1",
    "status": "passed",
-   "detail": "relL2=0.0724 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1220,7 +1220,7 @@
   {
    "name": "recon-ref_image_refiner.0.feed_forward.linear_2",
    "status": "passed",
-   "detail": "relL2=0.0724 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1244,7 +1244,7 @@
   {
    "name": "reconstruction-error-bound",
    "status": "passed",
-   "detail": "max full relL2 0.0727 (policy bound 0.25)",
+   "detail": "max full relL2 0.0728 (policy bound 0.25)",
    "reason": ""
   },
   {
@@ -1268,14 +1268,14 @@
   {
    "name": "output-hash",
    "status": "passed",
-   "detail": "sha256=a058d16862fddd48d4ecb6ca11b9762242494b990f45a214e46641a2b3505f94",
+   "detail": "sha256=8e8bc59b10fcef7f44be0a3de4b1691a77918a5b915ee4a07bde1370d1a7acfa",
    "reason": ""
   },
   {
    "name": "compat-comfy-kitchen",
-   "status": "skipped",
-   "detail": "comfy-kitchen not installed (skipped)",
-   "reason": "optional runtime probe"
+   "status": "passed",
+   "detail": "installed comfy-kitchen: 0.2.28, static package source contains AsymW4A8Int8Layout: True",
+   "reason": ""
   },
   {
    "name": "compat-comfyui",
@@ -1286,7 +1286,7 @@
   {
    "name": "input-hash",
    "status": "passed",
-   "detail": "{\"omnigen2_fixture.safetensors\":\"cca5ac8d6b3c08befe6e16ec15f697b318131af49907712518de878489d38f55\"}",
+   "detail": "{\"omnigen2_fixture.safetensors\":\"1003519a6195d9210d9b695ae3e06b575fbcea833fbb6ba4e55b76e5af557e9c\"}",
    "reason": ""
   },
   {
@@ -1296,13 +1296,13 @@
    "reason": ""
   }
  ],
- "compatibility_summary": "comfy-kitchen >= aa1ab2263dc06225d9de6702dfc087313d4bc971 (PR #90, merged) with AsymW4A8Int8Layout; ComfyUI >= PR #15308 head 8c3a2b27c37bd34e87b58846baf962407c92843c (NOT merged into master at base bdcb886a4705a03cf40f4a7226de9fc7c059fc90); CUDA: PyTorch cu130+, SM >= 8.0; ROCm: triton >= 3.7; eager works anywhere",
+ "compatibility_summary": "comfy-kitchen >= aa1ab2263dc06225d9de6702dfc087313d4bc971 (PR #90, merged) with AsymW4A8Int8Layout; ComfyUI >= v0.31.0 (PR #15308 merged as 344b43989e; older builds need patches/comfyui_w4a8_loader.patch); CUDA: PyTorch cu130+, SM >= 8.0; ROCm: triton >= 3.7; eager works anywhere",
  "input_hashes": {
-  "testdata/omnigen2_fixture.safetensors": "cca5ac8d6b3c08befe6e16ec15f697b318131af49907712518de878489d38f55"
+  "testdata/omnigen2_fixture.safetensors": "1003519a6195d9210d9b695ae3e06b575fbcea833fbb6ba4e55b76e5af557e9c"
  },
- "output_sha256": "a058d16862fddd48d4ecb6ca11b9762242494b990f45a214e46641a2b3505f94",
- "elapsed_seconds": 7.252,
- "peak_rss_bytes": 616312832,
+ "output_sha256": "8e8bc59b10fcef7f44be0a3de4b1691a77918a5b915ee4a07bde1370d1a7acfa",
+ "elapsed_seconds": 14.612,
+ "peak_rss_bytes": 720318464,
  "environment": {
   "python": "3.11.15",
   "torch_version": "2.13.0+cu130",
@@ -1319,9 +1319,9 @@
   "numpy_version": "2.4.6",
   "platform": "linux",
   "cpu_count": 16,
-  "has_comfy_kitchen": false,
-  "comfy_kitchen_rev": null,
-  "comfy_kitchen_has_w4a8_layout": false,
+  "has_comfy_kitchen": true,
+  "comfy_kitchen_rev": "0.2.28",
+  "comfy_kitchen_has_w4a8_layout": true,
   "has_comfy_quant_ops": false,
   "comfyui_quant_algos": []
  },

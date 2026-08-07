@@ -1,13 +1,13 @@
 ==============================================================================
-comfyui_wxa8_quantizer 1.2.1 -- conversion report
+comfyui_wxa8_quantizer 1.2.2 -- conversion report
 ==============================================================================
 format            : asym_w4a8_int8 (asym-w4a8-int8-r1)
 architecture      : boogu (confidence high)
 unet prefix       : model.
 input             : safetensors (testdata/boogu_fixture.safetensors)
-output            : testdata/boogu_fixture_w4a8.safetensors (13.44 MiB)
-elapsed           : 14.784 s
-peak RSS          : 616.23 MiB
+output            : testdata/boogu_fixture_w4a8.safetensors (29.43 MiB)
+elapsed           : 28.748 s
+peak RSS          : 781.07 MiB
 
 -- detection evidence --
   + double_stream_layers.0.img_instruct_attn.processor.img_to_q.weight
@@ -24,85 +24,85 @@ peak RSS          : 616.23 MiB
   kept tensors    : 102
 
 -- quantization --
-  context_refiner.0.attn.to_k: (384, 384) gs=16 cgs=64
-  context_refiner.0.attn.to_out.0: (384, 384) gs=16 cgs=64
-  context_refiner.0.attn.to_q: (384, 384) gs=16 cgs=64
-  context_refiner.0.attn.to_v: (384, 384) gs=16 cgs=64
-  context_refiner.0.feed_forward.linear_1: (384, 384) gs=16 cgs=64
-  context_refiner.0.feed_forward.linear_2: (384, 384) gs=16 cgs=64
-  context_refiner.0.feed_forward.linear_3: (384, 384) gs=16 cgs=64
-  double_stream_layers.0.img_feed_forward.linear_1: (384, 384) gs=16 cgs=64
-  double_stream_layers.0.img_feed_forward.linear_2: (384, 384) gs=16 cgs=64
-  double_stream_layers.0.img_feed_forward.linear_3: (384, 384) gs=16 cgs=64
-  double_stream_layers.0.img_instruct_attn.processor.img_out: (384, 384) gs=16 cgs=64
-  double_stream_layers.0.img_instruct_attn.processor.img_to_k: (384, 384) gs=16 cgs=64
-  double_stream_layers.0.img_instruct_attn.processor.img_to_q: (384, 384) gs=16 cgs=64
-  double_stream_layers.0.img_instruct_attn.processor.img_to_v: (384, 384) gs=16 cgs=64
-  double_stream_layers.0.img_instruct_attn.processor.instruct_out: (384, 384) gs=16 cgs=64
-  double_stream_layers.0.img_instruct_attn.processor.instruct_to_k: (384, 384) gs=16 cgs=64
-  double_stream_layers.0.img_instruct_attn.processor.instruct_to_q: (384, 384) gs=16 cgs=64
-  double_stream_layers.0.img_instruct_attn.processor.instruct_to_v: (384, 384) gs=16 cgs=64
-  double_stream_layers.0.img_instruct_attn.to_out.0: (384, 384) gs=16 cgs=64
-  double_stream_layers.0.img_self_attn.to_k: (384, 384) gs=16 cgs=64
-  double_stream_layers.0.img_self_attn.to_out.0: (384, 384) gs=16 cgs=64
-  double_stream_layers.0.img_self_attn.to_q: (384, 384) gs=16 cgs=64
-  double_stream_layers.0.img_self_attn.to_v: (384, 384) gs=16 cgs=64
-  double_stream_layers.0.instruct_feed_forward.linear_1: (384, 384) gs=16 cgs=64
-  double_stream_layers.0.instruct_feed_forward.linear_2: (384, 384) gs=16 cgs=64
-  double_stream_layers.0.instruct_feed_forward.linear_3: (384, 384) gs=16 cgs=64
-  double_stream_layers.1.img_feed_forward.linear_1: (384, 384) gs=16 cgs=64
-  double_stream_layers.1.img_feed_forward.linear_2: (384, 384) gs=16 cgs=64
-  double_stream_layers.1.img_feed_forward.linear_3: (384, 384) gs=16 cgs=64
-  double_stream_layers.1.img_instruct_attn.processor.img_out: (384, 384) gs=16 cgs=64
-  double_stream_layers.1.img_instruct_attn.processor.img_to_k: (384, 384) gs=16 cgs=64
-  double_stream_layers.1.img_instruct_attn.processor.img_to_q: (384, 384) gs=16 cgs=64
-  double_stream_layers.1.img_instruct_attn.processor.img_to_v: (384, 384) gs=16 cgs=64
-  double_stream_layers.1.img_instruct_attn.processor.instruct_out: (384, 384) gs=16 cgs=64
-  double_stream_layers.1.img_instruct_attn.processor.instruct_to_k: (384, 384) gs=16 cgs=64
-  double_stream_layers.1.img_instruct_attn.processor.instruct_to_q: (384, 384) gs=16 cgs=64
-  double_stream_layers.1.img_instruct_attn.processor.instruct_to_v: (384, 384) gs=16 cgs=64
-  double_stream_layers.1.img_instruct_attn.to_out.0: (384, 384) gs=16 cgs=64
-  double_stream_layers.1.img_self_attn.to_k: (384, 384) gs=16 cgs=64
-  double_stream_layers.1.img_self_attn.to_out.0: (384, 384) gs=16 cgs=64
-  double_stream_layers.1.img_self_attn.to_q: (384, 384) gs=16 cgs=64
-  double_stream_layers.1.img_self_attn.to_v: (384, 384) gs=16 cgs=64
-  double_stream_layers.1.instruct_feed_forward.linear_1: (384, 384) gs=16 cgs=64
-  double_stream_layers.1.instruct_feed_forward.linear_2: (384, 384) gs=16 cgs=64
-  double_stream_layers.1.instruct_feed_forward.linear_3: (384, 384) gs=16 cgs=64
-  noise_refiner.0.attn.to_k: (384, 384) gs=16 cgs=64
-  noise_refiner.0.attn.to_out.0: (384, 384) gs=16 cgs=64
-  noise_refiner.0.attn.to_q: (384, 384) gs=16 cgs=64
-  noise_refiner.0.attn.to_v: (384, 384) gs=16 cgs=64
-  noise_refiner.0.feed_forward.linear_1: (384, 384) gs=16 cgs=64
-  noise_refiner.0.feed_forward.linear_2: (384, 384) gs=16 cgs=64
-  noise_refiner.0.feed_forward.linear_3: (384, 384) gs=16 cgs=64
-  ref_image_refiner.0.attn.to_k: (384, 384) gs=16 cgs=64
-  ref_image_refiner.0.attn.to_out.0: (384, 384) gs=16 cgs=64
-  ref_image_refiner.0.attn.to_q: (384, 384) gs=16 cgs=64
-  ref_image_refiner.0.attn.to_v: (384, 384) gs=16 cgs=64
-  ref_image_refiner.0.feed_forward.linear_1: (384, 384) gs=16 cgs=64
-  ref_image_refiner.0.feed_forward.linear_2: (384, 384) gs=16 cgs=64
-  ref_image_refiner.0.feed_forward.linear_3: (384, 384) gs=16 cgs=64
-  single_stream_layers.0.attn.to_k: (384, 384) gs=16 cgs=64
-  single_stream_layers.0.attn.to_out.0: (384, 384) gs=16 cgs=64
-  single_stream_layers.0.attn.to_q: (384, 384) gs=16 cgs=64
-  single_stream_layers.0.attn.to_v: (384, 384) gs=16 cgs=64
-  single_stream_layers.0.feed_forward.linear_1: (384, 384) gs=16 cgs=64
-  single_stream_layers.0.feed_forward.linear_2: (384, 384) gs=16 cgs=64
-  single_stream_layers.0.feed_forward.linear_3: (384, 384) gs=16 cgs=64
-  single_stream_layers.1.attn.to_k: (384, 384) gs=16 cgs=64
-  single_stream_layers.1.attn.to_out.0: (384, 384) gs=16 cgs=64
-  single_stream_layers.1.attn.to_q: (384, 384) gs=16 cgs=64
-  single_stream_layers.1.attn.to_v: (384, 384) gs=16 cgs=64
-  single_stream_layers.1.feed_forward.linear_1: (384, 384) gs=16 cgs=64
-  single_stream_layers.1.feed_forward.linear_2: (384, 384) gs=16 cgs=64
-  single_stream_layers.1.feed_forward.linear_3: (384, 384) gs=16 cgs=64
+  context_refiner.0.attn.to_k: (768, 768) gs=16 cgs=256
+  context_refiner.0.attn.to_out.0: (384, 768) gs=16 cgs=256
+  context_refiner.0.attn.to_q: (768, 768) gs=16 cgs=256
+  context_refiner.0.attn.to_v: (768, 768) gs=16 cgs=256
+  context_refiner.0.feed_forward.linear_1: (768, 768) gs=16 cgs=256
+  context_refiner.0.feed_forward.linear_2: (768, 768) gs=16 cgs=256
+  context_refiner.0.feed_forward.linear_3: (768, 768) gs=16 cgs=256
+  double_stream_layers.0.img_feed_forward.linear_1: (768, 768) gs=16 cgs=256
+  double_stream_layers.0.img_feed_forward.linear_2: (768, 768) gs=16 cgs=256
+  double_stream_layers.0.img_feed_forward.linear_3: (768, 768) gs=16 cgs=256
+  double_stream_layers.0.img_instruct_attn.processor.img_out: (384, 768) gs=16 cgs=256
+  double_stream_layers.0.img_instruct_attn.processor.img_to_k: (768, 768) gs=16 cgs=256
+  double_stream_layers.0.img_instruct_attn.processor.img_to_q: (768, 768) gs=16 cgs=256
+  double_stream_layers.0.img_instruct_attn.processor.img_to_v: (768, 768) gs=16 cgs=256
+  double_stream_layers.0.img_instruct_attn.processor.instruct_out: (384, 768) gs=16 cgs=256
+  double_stream_layers.0.img_instruct_attn.processor.instruct_to_k: (768, 768) gs=16 cgs=256
+  double_stream_layers.0.img_instruct_attn.processor.instruct_to_q: (768, 768) gs=16 cgs=256
+  double_stream_layers.0.img_instruct_attn.processor.instruct_to_v: (768, 768) gs=16 cgs=256
+  double_stream_layers.0.img_instruct_attn.to_out.0: (768, 768) gs=16 cgs=256
+  double_stream_layers.0.img_self_attn.to_k: (768, 768) gs=16 cgs=256
+  double_stream_layers.0.img_self_attn.to_out.0: (768, 768) gs=16 cgs=256
+  double_stream_layers.0.img_self_attn.to_q: (768, 768) gs=16 cgs=256
+  double_stream_layers.0.img_self_attn.to_v: (768, 768) gs=16 cgs=256
+  double_stream_layers.0.instruct_feed_forward.linear_1: (768, 768) gs=16 cgs=256
+  double_stream_layers.0.instruct_feed_forward.linear_2: (768, 768) gs=16 cgs=256
+  double_stream_layers.0.instruct_feed_forward.linear_3: (768, 768) gs=16 cgs=256
+  double_stream_layers.1.img_feed_forward.linear_1: (768, 768) gs=16 cgs=256
+  double_stream_layers.1.img_feed_forward.linear_2: (768, 768) gs=16 cgs=256
+  double_stream_layers.1.img_feed_forward.linear_3: (768, 768) gs=16 cgs=256
+  double_stream_layers.1.img_instruct_attn.processor.img_out: (384, 768) gs=16 cgs=256
+  double_stream_layers.1.img_instruct_attn.processor.img_to_k: (768, 768) gs=16 cgs=256
+  double_stream_layers.1.img_instruct_attn.processor.img_to_q: (768, 768) gs=16 cgs=256
+  double_stream_layers.1.img_instruct_attn.processor.img_to_v: (768, 768) gs=16 cgs=256
+  double_stream_layers.1.img_instruct_attn.processor.instruct_out: (384, 768) gs=16 cgs=256
+  double_stream_layers.1.img_instruct_attn.processor.instruct_to_k: (768, 768) gs=16 cgs=256
+  double_stream_layers.1.img_instruct_attn.processor.instruct_to_q: (768, 768) gs=16 cgs=256
+  double_stream_layers.1.img_instruct_attn.processor.instruct_to_v: (768, 768) gs=16 cgs=256
+  double_stream_layers.1.img_instruct_attn.to_out.0: (768, 768) gs=16 cgs=256
+  double_stream_layers.1.img_self_attn.to_k: (768, 768) gs=16 cgs=256
+  double_stream_layers.1.img_self_attn.to_out.0: (768, 768) gs=16 cgs=256
+  double_stream_layers.1.img_self_attn.to_q: (768, 768) gs=16 cgs=256
+  double_stream_layers.1.img_self_attn.to_v: (768, 768) gs=16 cgs=256
+  double_stream_layers.1.instruct_feed_forward.linear_1: (768, 768) gs=16 cgs=256
+  double_stream_layers.1.instruct_feed_forward.linear_2: (768, 768) gs=16 cgs=256
+  double_stream_layers.1.instruct_feed_forward.linear_3: (768, 768) gs=16 cgs=256
+  noise_refiner.0.attn.to_k: (768, 768) gs=16 cgs=256
+  noise_refiner.0.attn.to_out.0: (384, 768) gs=16 cgs=256
+  noise_refiner.0.attn.to_q: (768, 768) gs=16 cgs=256
+  noise_refiner.0.attn.to_v: (768, 768) gs=16 cgs=256
+  noise_refiner.0.feed_forward.linear_1: (768, 768) gs=16 cgs=256
+  noise_refiner.0.feed_forward.linear_2: (768, 768) gs=16 cgs=256
+  noise_refiner.0.feed_forward.linear_3: (768, 768) gs=16 cgs=256
+  ref_image_refiner.0.attn.to_k: (768, 768) gs=16 cgs=256
+  ref_image_refiner.0.attn.to_out.0: (384, 768) gs=16 cgs=256
+  ref_image_refiner.0.attn.to_q: (768, 768) gs=16 cgs=256
+  ref_image_refiner.0.attn.to_v: (768, 768) gs=16 cgs=256
+  ref_image_refiner.0.feed_forward.linear_1: (768, 768) gs=16 cgs=256
+  ref_image_refiner.0.feed_forward.linear_2: (768, 768) gs=16 cgs=256
+  ref_image_refiner.0.feed_forward.linear_3: (768, 768) gs=16 cgs=256
+  single_stream_layers.0.attn.to_k: (768, 768) gs=16 cgs=256
+  single_stream_layers.0.attn.to_out.0: (384, 768) gs=16 cgs=256
+  single_stream_layers.0.attn.to_q: (768, 768) gs=16 cgs=256
+  single_stream_layers.0.attn.to_v: (768, 768) gs=16 cgs=256
+  single_stream_layers.0.feed_forward.linear_1: (768, 768) gs=16 cgs=256
+  single_stream_layers.0.feed_forward.linear_2: (768, 768) gs=16 cgs=256
+  single_stream_layers.0.feed_forward.linear_3: (768, 768) gs=16 cgs=256
+  single_stream_layers.1.attn.to_k: (768, 768) gs=16 cgs=256
+  single_stream_layers.1.attn.to_out.0: (384, 768) gs=16 cgs=256
+  single_stream_layers.1.attn.to_q: (768, 768) gs=16 cgs=256
+  single_stream_layers.1.attn.to_v: (768, 768) gs=16 cgs=256
+  single_stream_layers.1.feed_forward.linear_1: (768, 768) gs=16 cgs=256
+  single_stream_layers.1.feed_forward.linear_2: (768, 768) gs=16 cgs=256
+  single_stream_layers.1.feed_forward.linear_3: (768, 768) gs=16 cgs=256
 
 -- calibration --
   calibration-free (reference format; per-group absmax scales)
 
 -- validation --
-  [passed                ] output-reopen -- 394 tensors, 13.50 MiB
+  [passed                ] output-reopen -- 394 tensors, 29.49 MiB
   [passed                ] output-entry-count -- 394 vs 394 expected
   [passed                ] output-inventory -- missing=[] extra=[]
   [passed                ] shape-preservation
@@ -111,169 +111,169 @@ peak RSS          : 616.23 MiB
   [passed                ] extension-metadata-present -- present
   [passed                ] extension-metadata-schema -- required fields, revision and architecture
   [passed                ] metadata-source-hash -- source content hashes match
-  [passed                ] tensor-payload-hash -- sha256=d6463de96ef1d9a274420965534ed5ed1e33bdb92d7dcbb0de4b1811eb932878
+  [passed                ] tensor-payload-hash -- sha256=a9ee4e3e312f6cdb81d9adf31fd1a9d61d47227c13bdbe60dbfcb01abb888fd9
   [passed                ] metadata-layer-inventory -- 73 layers match
   [passed                ] metadata-layer-conf -- format/group/ConvRot fields valid
-  [passed                ] recon-context_refiner.0.attn.to_k -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] recon-context_refiner.0.attn.to_k -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-context_refiner.0.attn.to_k -- pack/unpack round trip
-  [passed                ] recon-context_refiner.0.attn.to_out.0 -- relL2=0.0726 snr=22.8dB cos=0.9974
+  [passed                ] recon-context_refiner.0.attn.to_out.0 -- relL2=0.0725 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-context_refiner.0.attn.to_out.0 -- pack/unpack round trip
   [passed                ] recon-context_refiner.0.attn.to_q -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-context_refiner.0.attn.to_q -- pack/unpack round trip
-  [passed                ] recon-context_refiner.0.attn.to_v -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] recon-context_refiner.0.attn.to_v -- relL2=0.0727 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-context_refiner.0.attn.to_v -- pack/unpack round trip
-  [passed                ] recon-context_refiner.0.feed_forward.linear_1 -- relL2=0.0723 snr=22.8dB cos=0.9974
+  [passed                ] recon-context_refiner.0.feed_forward.linear_1 -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-context_refiner.0.feed_forward.linear_1 -- pack/unpack round trip
-  [passed                ] recon-context_refiner.0.feed_forward.linear_2 -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] recon-context_refiner.0.feed_forward.linear_2 -- relL2=0.0727 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-context_refiner.0.feed_forward.linear_2 -- pack/unpack round trip
   [passed                ] recon-context_refiner.0.feed_forward.linear_3 -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-context_refiner.0.feed_forward.linear_3 -- pack/unpack round trip
-  [passed                ] recon-double_stream_layers.0.img_feed_forward.linear_1 -- relL2=0.0723 snr=22.8dB cos=0.9974
+  [passed                ] recon-double_stream_layers.0.img_feed_forward.linear_1 -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-double_stream_layers.0.img_feed_forward.linear_1 -- pack/unpack round trip
-  [passed                ] recon-double_stream_layers.0.img_feed_forward.linear_2 -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] recon-double_stream_layers.0.img_feed_forward.linear_2 -- relL2=0.0727 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-double_stream_layers.0.img_feed_forward.linear_2 -- pack/unpack round trip
   [passed                ] recon-double_stream_layers.0.img_feed_forward.linear_3 -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-double_stream_layers.0.img_feed_forward.linear_3 -- pack/unpack round trip
-  [passed                ] recon-double_stream_layers.0.img_instruct_attn.processor.img_out -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] recon-double_stream_layers.0.img_instruct_attn.processor.img_out -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-double_stream_layers.0.img_instruct_attn.processor.img_out -- pack/unpack round trip
-  [passed                ] recon-double_stream_layers.0.img_instruct_attn.processor.img_to_k -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] recon-double_stream_layers.0.img_instruct_attn.processor.img_to_k -- relL2=0.0727 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-double_stream_layers.0.img_instruct_attn.processor.img_to_k -- pack/unpack round trip
   [passed                ] recon-double_stream_layers.0.img_instruct_attn.processor.img_to_q -- relL2=0.0725 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-double_stream_layers.0.img_instruct_attn.processor.img_to_q -- pack/unpack round trip
-  [passed                ] recon-double_stream_layers.0.img_instruct_attn.processor.img_to_v -- relL2=0.0722 snr=22.8dB cos=0.9974
+  [passed                ] recon-double_stream_layers.0.img_instruct_attn.processor.img_to_v -- relL2=0.0727 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-double_stream_layers.0.img_instruct_attn.processor.img_to_v -- pack/unpack round trip
-  [passed                ] recon-double_stream_layers.0.img_instruct_attn.processor.instruct_out -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] recon-double_stream_layers.0.img_instruct_attn.processor.instruct_out -- relL2=0.0725 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-double_stream_layers.0.img_instruct_attn.processor.instruct_out -- pack/unpack round trip
-  [passed                ] recon-double_stream_layers.0.img_instruct_attn.processor.instruct_to_k -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] recon-double_stream_layers.0.img_instruct_attn.processor.instruct_to_k -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-double_stream_layers.0.img_instruct_attn.processor.instruct_to_k -- pack/unpack round trip
   [passed                ] recon-double_stream_layers.0.img_instruct_attn.processor.instruct_to_q -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-double_stream_layers.0.img_instruct_attn.processor.instruct_to_q -- pack/unpack round trip
   [passed                ] recon-double_stream_layers.0.img_instruct_attn.processor.instruct_to_v -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-double_stream_layers.0.img_instruct_attn.processor.instruct_to_v -- pack/unpack round trip
-  [passed                ] recon-double_stream_layers.0.img_instruct_attn.to_out.0 -- relL2=0.0723 snr=22.8dB cos=0.9974
+  [passed                ] recon-double_stream_layers.0.img_instruct_attn.to_out.0 -- relL2=0.0724 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-double_stream_layers.0.img_instruct_attn.to_out.0 -- pack/unpack round trip
-  [passed                ] recon-double_stream_layers.0.img_self_attn.to_k -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] recon-double_stream_layers.0.img_self_attn.to_k -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-double_stream_layers.0.img_self_attn.to_k -- pack/unpack round trip
-  [passed                ] recon-double_stream_layers.0.img_self_attn.to_out.0 -- relL2=0.0723 snr=22.8dB cos=0.9974
+  [passed                ] recon-double_stream_layers.0.img_self_attn.to_out.0 -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-double_stream_layers.0.img_self_attn.to_out.0 -- pack/unpack round trip
-  [passed                ] recon-double_stream_layers.0.img_self_attn.to_q -- relL2=0.0726 snr=22.8dB cos=0.9974
+  [passed                ] recon-double_stream_layers.0.img_self_attn.to_q -- relL2=0.0728 snr=22.8dB cos=0.9973
   [passed                ] pack-rt-double_stream_layers.0.img_self_attn.to_q -- pack/unpack round trip
-  [passed                ] recon-double_stream_layers.0.img_self_attn.to_v -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] recon-double_stream_layers.0.img_self_attn.to_v -- relL2=0.0727 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-double_stream_layers.0.img_self_attn.to_v -- pack/unpack round trip
-  [passed                ] recon-double_stream_layers.0.instruct_feed_forward.linear_1 -- relL2=0.0727 snr=22.8dB cos=0.9974
+  [passed                ] recon-double_stream_layers.0.instruct_feed_forward.linear_1 -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-double_stream_layers.0.instruct_feed_forward.linear_1 -- pack/unpack round trip
-  [passed                ] recon-double_stream_layers.0.instruct_feed_forward.linear_2 -- relL2=0.0723 snr=22.8dB cos=0.9974
+  [passed                ] recon-double_stream_layers.0.instruct_feed_forward.linear_2 -- relL2=0.0727 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-double_stream_layers.0.instruct_feed_forward.linear_2 -- pack/unpack round trip
-  [passed                ] recon-double_stream_layers.0.instruct_feed_forward.linear_3 -- relL2=0.0723 snr=22.8dB cos=0.9974
+  [passed                ] recon-double_stream_layers.0.instruct_feed_forward.linear_3 -- relL2=0.0727 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-double_stream_layers.0.instruct_feed_forward.linear_3 -- pack/unpack round trip
-  [passed                ] recon-double_stream_layers.1.img_feed_forward.linear_1 -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] recon-double_stream_layers.1.img_feed_forward.linear_1 -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-double_stream_layers.1.img_feed_forward.linear_1 -- pack/unpack round trip
   [passed                ] recon-double_stream_layers.1.img_feed_forward.linear_2 -- relL2=0.0725 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-double_stream_layers.1.img_feed_forward.linear_2 -- pack/unpack round trip
-  [passed                ] recon-double_stream_layers.1.img_feed_forward.linear_3 -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] recon-double_stream_layers.1.img_feed_forward.linear_3 -- relL2=0.0727 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-double_stream_layers.1.img_feed_forward.linear_3 -- pack/unpack round trip
-  [passed                ] recon-double_stream_layers.1.img_instruct_attn.processor.img_out -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] recon-double_stream_layers.1.img_instruct_attn.processor.img_out -- relL2=0.0727 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-double_stream_layers.1.img_instruct_attn.processor.img_out -- pack/unpack round trip
-  [passed                ] recon-double_stream_layers.1.img_instruct_attn.processor.img_to_k -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] recon-double_stream_layers.1.img_instruct_attn.processor.img_to_k -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-double_stream_layers.1.img_instruct_attn.processor.img_to_k -- pack/unpack round trip
-  [passed                ] recon-double_stream_layers.1.img_instruct_attn.processor.img_to_q -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] recon-double_stream_layers.1.img_instruct_attn.processor.img_to_q -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-double_stream_layers.1.img_instruct_attn.processor.img_to_q -- pack/unpack round trip
   [passed                ] recon-double_stream_layers.1.img_instruct_attn.processor.img_to_v -- relL2=0.0727 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-double_stream_layers.1.img_instruct_attn.processor.img_to_v -- pack/unpack round trip
-  [passed                ] recon-double_stream_layers.1.img_instruct_attn.processor.instruct_out -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] recon-double_stream_layers.1.img_instruct_attn.processor.instruct_out -- relL2=0.0725 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-double_stream_layers.1.img_instruct_attn.processor.instruct_out -- pack/unpack round trip
-  [passed                ] recon-double_stream_layers.1.img_instruct_attn.processor.instruct_to_k -- relL2=0.0723 snr=22.8dB cos=0.9974
+  [passed                ] recon-double_stream_layers.1.img_instruct_attn.processor.instruct_to_k -- relL2=0.0727 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-double_stream_layers.1.img_instruct_attn.processor.instruct_to_k -- pack/unpack round trip
-  [passed                ] recon-double_stream_layers.1.img_instruct_attn.processor.instruct_to_q -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] recon-double_stream_layers.1.img_instruct_attn.processor.instruct_to_q -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-double_stream_layers.1.img_instruct_attn.processor.instruct_to_q -- pack/unpack round trip
   [passed                ] recon-double_stream_layers.1.img_instruct_attn.processor.instruct_to_v -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-double_stream_layers.1.img_instruct_attn.processor.instruct_to_v -- pack/unpack round trip
-  [passed                ] recon-double_stream_layers.1.img_instruct_attn.to_out.0 -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] recon-double_stream_layers.1.img_instruct_attn.to_out.0 -- relL2=0.0727 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-double_stream_layers.1.img_instruct_attn.to_out.0 -- pack/unpack round trip
-  [passed                ] recon-double_stream_layers.1.img_self_attn.to_k -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] recon-double_stream_layers.1.img_self_attn.to_k -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-double_stream_layers.1.img_self_attn.to_k -- pack/unpack round trip
   [passed                ] recon-double_stream_layers.1.img_self_attn.to_out.0 -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-double_stream_layers.1.img_self_attn.to_out.0 -- pack/unpack round trip
-  [passed                ] recon-double_stream_layers.1.img_self_attn.to_q -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] recon-double_stream_layers.1.img_self_attn.to_q -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-double_stream_layers.1.img_self_attn.to_q -- pack/unpack round trip
   [passed                ] recon-double_stream_layers.1.img_self_attn.to_v -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-double_stream_layers.1.img_self_attn.to_v -- pack/unpack round trip
-  [passed                ] recon-double_stream_layers.1.instruct_feed_forward.linear_1 -- relL2=0.0723 snr=22.8dB cos=0.9974
+  [passed                ] recon-double_stream_layers.1.instruct_feed_forward.linear_1 -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-double_stream_layers.1.instruct_feed_forward.linear_1 -- pack/unpack round trip
   [passed                ] recon-double_stream_layers.1.instruct_feed_forward.linear_2 -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-double_stream_layers.1.instruct_feed_forward.linear_2 -- pack/unpack round trip
-  [passed                ] recon-double_stream_layers.1.instruct_feed_forward.linear_3 -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] recon-double_stream_layers.1.instruct_feed_forward.linear_3 -- relL2=0.0727 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-double_stream_layers.1.instruct_feed_forward.linear_3 -- pack/unpack round trip
-  [passed                ] recon-noise_refiner.0.attn.to_k -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] recon-noise_refiner.0.attn.to_k -- relL2=0.0728 snr=22.8dB cos=0.9973
   [passed                ] pack-rt-noise_refiner.0.attn.to_k -- pack/unpack round trip
-  [passed                ] recon-noise_refiner.0.attn.to_out.0 -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] recon-noise_refiner.0.attn.to_out.0 -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-noise_refiner.0.attn.to_out.0 -- pack/unpack round trip
-  [passed                ] recon-noise_refiner.0.attn.to_q -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] recon-noise_refiner.0.attn.to_q -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-noise_refiner.0.attn.to_q -- pack/unpack round trip
-  [passed                ] recon-noise_refiner.0.attn.to_v -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] recon-noise_refiner.0.attn.to_v -- relL2=0.0728 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-noise_refiner.0.attn.to_v -- pack/unpack round trip
-  [passed                ] recon-noise_refiner.0.feed_forward.linear_1 -- relL2=0.0721 snr=22.8dB cos=0.9974
+  [passed                ] recon-noise_refiner.0.feed_forward.linear_1 -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-noise_refiner.0.feed_forward.linear_1 -- pack/unpack round trip
-  [passed                ] recon-noise_refiner.0.feed_forward.linear_2 -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] recon-noise_refiner.0.feed_forward.linear_2 -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-noise_refiner.0.feed_forward.linear_2 -- pack/unpack round trip
   [passed                ] recon-noise_refiner.0.feed_forward.linear_3 -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-noise_refiner.0.feed_forward.linear_3 -- pack/unpack round trip
-  [passed                ] recon-ref_image_refiner.0.attn.to_k -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] recon-ref_image_refiner.0.attn.to_k -- relL2=0.0727 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-ref_image_refiner.0.attn.to_k -- pack/unpack round trip
   [passed                ] recon-ref_image_refiner.0.attn.to_out.0 -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-ref_image_refiner.0.attn.to_out.0 -- pack/unpack round trip
-  [passed                ] recon-ref_image_refiner.0.attn.to_q -- relL2=0.0723 snr=22.8dB cos=0.9974
+  [passed                ] recon-ref_image_refiner.0.attn.to_q -- relL2=0.0727 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-ref_image_refiner.0.attn.to_q -- pack/unpack round trip
-  [passed                ] recon-ref_image_refiner.0.attn.to_v -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] recon-ref_image_refiner.0.attn.to_v -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-ref_image_refiner.0.attn.to_v -- pack/unpack round trip
-  [passed                ] recon-ref_image_refiner.0.feed_forward.linear_1 -- relL2=0.0726 snr=22.8dB cos=0.9974
+  [passed                ] recon-ref_image_refiner.0.feed_forward.linear_1 -- relL2=0.0727 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-ref_image_refiner.0.feed_forward.linear_1 -- pack/unpack round trip
-  [passed                ] recon-ref_image_refiner.0.feed_forward.linear_2 -- relL2=0.0726 snr=22.8dB cos=0.9974
+  [passed                ] recon-ref_image_refiner.0.feed_forward.linear_2 -- relL2=0.0725 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-ref_image_refiner.0.feed_forward.linear_2 -- pack/unpack round trip
-  [passed                ] recon-ref_image_refiner.0.feed_forward.linear_3 -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] recon-ref_image_refiner.0.feed_forward.linear_3 -- relL2=0.0727 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-ref_image_refiner.0.feed_forward.linear_3 -- pack/unpack round trip
-  [passed                ] recon-single_stream_layers.0.attn.to_k -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] recon-single_stream_layers.0.attn.to_k -- relL2=0.0727 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-single_stream_layers.0.attn.to_k -- pack/unpack round trip
-  [passed                ] recon-single_stream_layers.0.attn.to_out.0 -- relL2=0.0723 snr=22.8dB cos=0.9974
+  [passed                ] recon-single_stream_layers.0.attn.to_out.0 -- relL2=0.0727 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-single_stream_layers.0.attn.to_out.0 -- pack/unpack round trip
-  [passed                ] recon-single_stream_layers.0.attn.to_q -- relL2=0.0722 snr=22.8dB cos=0.9974
+  [passed                ] recon-single_stream_layers.0.attn.to_q -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-single_stream_layers.0.attn.to_q -- pack/unpack round trip
-  [passed                ] recon-single_stream_layers.0.attn.to_v -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] recon-single_stream_layers.0.attn.to_v -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-single_stream_layers.0.attn.to_v -- pack/unpack round trip
-  [passed                ] recon-single_stream_layers.0.feed_forward.linear_1 -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] recon-single_stream_layers.0.feed_forward.linear_1 -- relL2=0.0727 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-single_stream_layers.0.feed_forward.linear_1 -- pack/unpack round trip
   [passed                ] recon-single_stream_layers.0.feed_forward.linear_2 -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-single_stream_layers.0.feed_forward.linear_2 -- pack/unpack round trip
-  [passed                ] recon-single_stream_layers.0.feed_forward.linear_3 -- relL2=0.0726 snr=22.8dB cos=0.9974
+  [passed                ] recon-single_stream_layers.0.feed_forward.linear_3 -- relL2=0.0727 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-single_stream_layers.0.feed_forward.linear_3 -- pack/unpack round trip
-  [passed                ] recon-single_stream_layers.1.attn.to_k -- relL2=0.0723 snr=22.8dB cos=0.9974
+  [passed                ] recon-single_stream_layers.1.attn.to_k -- relL2=0.0727 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-single_stream_layers.1.attn.to_k -- pack/unpack round trip
-  [passed                ] recon-single_stream_layers.1.attn.to_out.0 -- relL2=0.0721 snr=22.8dB cos=0.9974
+  [passed                ] recon-single_stream_layers.1.attn.to_out.0 -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-single_stream_layers.1.attn.to_out.0 -- pack/unpack round trip
   [passed                ] recon-single_stream_layers.1.attn.to_q -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-single_stream_layers.1.attn.to_q -- pack/unpack round trip
-  [passed                ] recon-single_stream_layers.1.attn.to_v -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] recon-single_stream_layers.1.attn.to_v -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-single_stream_layers.1.attn.to_v -- pack/unpack round trip
-  [passed                ] recon-single_stream_layers.1.feed_forward.linear_1 -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] recon-single_stream_layers.1.feed_forward.linear_1 -- relL2=0.0727 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-single_stream_layers.1.feed_forward.linear_1 -- pack/unpack round trip
-  [passed                ] recon-single_stream_layers.1.feed_forward.linear_2 -- relL2=0.0727 snr=22.8dB cos=0.9974
+  [passed                ] recon-single_stream_layers.1.feed_forward.linear_2 -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-single_stream_layers.1.feed_forward.linear_2 -- pack/unpack round trip
-  [passed                ] recon-single_stream_layers.1.feed_forward.linear_3 -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] recon-single_stream_layers.1.feed_forward.linear_3 -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-single_stream_layers.1.feed_forward.linear_3 -- pack/unpack round trip
-  [passed                ] reconstruction-error-bound -- max full relL2 0.0727 (policy bound 0.25)
+  [passed                ] reconstruction-error-bound -- max full relL2 0.0728 (policy bound 0.25)
   [passed                ] scale-validation -- 73 layers OK (fp8 s_rel finite/nonnegative, fp32 s_channel finite/positive)
   [passed                ] deterministic-conversion -- two runs byte-identical
   [passed                ] deterministic-vs-disk -- recomputed packed weight matches the file
-  [passed                ] output-hash -- sha256=b4be1209d0c7a9b9fb01dc2e8d1d769487857670d1ea9bc258ba9184d2659b8c
-  [skipped               ] compat-comfy-kitchen -- comfy-kitchen not installed (skipped)
+  [passed                ] output-hash -- sha256=94f95ca560426c3a995219fcff1d7f9786a0de696db6b92a070728066b139f84
+  [passed                ] compat-comfy-kitchen -- installed comfy-kitchen: 0.2.28, static package source contains AsymW4A8Int8Layout: True
   [skipped               ] compat-comfyui -- ComfyUI not installed (skipped)
-  [passed                ] input-hash -- {"boogu_fixture.safetensors":"0bc5694340578d927d136c8eaa4de205efc6f7192a42a9c63b7365a7758c1ccf"}
+  [passed                ] input-hash -- {"boogu_fixture.safetensors":"67ac4691950492f7d04baf2a00d7c82315bee1bdd505589d25e2c184aeceff66"}
   [passed                ] final-publication -- final file reopens; embedded tensor payload hash matches
 
 -- compatibility requirements --
-  comfy-kitchen >= aa1ab2263dc06225d9de6702dfc087313d4bc971 (PR #90, merged) with AsymW4A8Int8Layout; ComfyUI >= PR #15308 head 8c3a2b27c37bd34e87b58846baf962407c92843c (NOT merged into master at base bdcb886a4705a03cf40f4a7226de9fc7c059fc90); CUDA: PyTorch cu130+, SM >= 8.0; ROCm: triton >= 3.7; eager works anywhere
+  comfy-kitchen >= aa1ab2263dc06225d9de6702dfc087313d4bc971 (PR #90, merged) with AsymW4A8Int8Layout; ComfyUI >= v0.31.0 (PR #15308 merged as 344b43989e; older builds need patches/comfyui_w4a8_loader.patch); CUDA: PyTorch cu130+, SM >= 8.0; ROCm: triton >= 3.7; eager works anywhere
 
 -- output integrity --
-  sha256          : b4be1209d0c7a9b9fb01dc2e8d1d769487857670d1ea9bc258ba9184d2659b8c
-  input boogu_fixture.safetensors : 0bc5694340578d927d136c8eaa4de205efc6f7192a42a9c63b7365a7758c1ccf
+  sha256          : 94f95ca560426c3a995219fcff1d7f9786a0de696db6b92a070728066b139f84
+  input boogu_fixture.safetensors : 67ac4691950492f7d04baf2a00d7c82315bee1bdd505589d25e2c184aeceff66
 ==============================================================================

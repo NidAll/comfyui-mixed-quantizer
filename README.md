@@ -177,10 +177,13 @@ The safetensors header carries two metadata blocks:
 
 * `__metadata__["_quantization_metadata"]` (verified ComfyUI key): a JSON string of
   the form `{"layers": {layer: {"format": "asym_w4a8_int8", "group_size": 16,
-  "convrot": true, "convrot_groupsize": 256}}}`. Layer names are the full state-dict
-  keys, including any `model.diffusion_model.` prefix. ComfyUI's
-  `comfy/utils.py::convert_old_quants` converts this into per-layer `comfy_quant`
-  blobs that the PR #15308 loader reads.
+  "convrot": true, "convrot_groupsize": 256}}}`. `convrot_groupsize` is always 256:
+  the comfy-kitchen CUDA fused kernels implement ConvRot 256 only, so a smaller
+  per-layer value cannot run at inference. Layers whose K is not divisible by 256
+  are therefore kept at original precision and do not appear in this block. Layer
+  names are the full state-dict keys, including any `model.diffusion_model.`
+  prefix. ComfyUI's `comfy/utils.py::convert_old_quants` converts this into
+  per-layer `comfy_quant` blobs that the PR #15308 loader reads.
 * `__metadata__["comfy_wxa8"]` (namespaced extension, never official): converter
   schema `comfy_wxa8/v1`, converter name and version, format revision, detected
   architecture and confidence, source whole-file hashes under portable file labels
@@ -227,10 +230,13 @@ with the runtime status of each family.
 
 ## Compatibility matrix
 
-Fixture rows were rerun with `comfyui_wxa8_quantizer.py 1.2.1` on torch 2.13.0 /
-safetensors 0.8.0 using CPU quantization. The real-model and CUDA rows are retained
-from the documented 1.1.x runs because those checkpoints and a GPU are not stored in
-this repository. "Executed"
+Fixture rows were rerun with `comfyui_wxa8_quantizer.py 1.2.2` on torch 2.13.0 /
+safetensors 0.8.0 using CPU quantization. Since 1.2.2 the converter only emits
+W4A8 layers with `convrot_groupsize = 256` (the comfy-kitchen CUDA fused kernels
+implement ConvRot 256 only); 2D linears whose K is not divisible by 256 pass
+through at original precision with the reason recorded. The real-model and CUDA
+rows are retained from the documented 1.1.x/1.2.1 runs because those checkpoints
+and a GPU are not stored in this repository. "Executed"
 means the conversion finished and the output passed the standalone validation suite
 (reopen, inventory, shapes, dtypes, metadata, pack round trips, scale checks,
 reconstruction error vs the original weights, deterministic checks, output hash).
@@ -241,18 +247,18 @@ when `--validate` was used).
 
 | architecture family | ComfyUI classes | test input | result | max relL2 |
 |---|---|---|---|---|
-| sd15 | SD15, SD15-inpaint, Zero123 | fixture (8 tensors) | pass | 0.0729 |
-| sdxl | SDXL, SSD-1B, Vega, KOALA, SDXL-inpaint | fixture (28 tensors) | pass | 0.0729 |
-| flux | Flux, FluxInpaint, FluxSchnell, LongCat, Ovis | fixture (23 tensors) | pass | 0.0729 |
-| wan | Wan2.1/2.2 (20 classes) | fixture (31 tensors) | pass | 0.0728 |
+| sd15 | SD15, SD15-inpaint, Zero123 | fixture (8 tensors, 2 quantized) | pass | 0.0729 |
+| sdxl | SDXL, SSD-1B, Vega, KOALA, SDXL-inpaint | fixture (28 tensors, 8 quantized) | pass | 0.0729 |
+| flux | Flux, FluxInpaint, FluxSchnell, LongCat, Ovis | fixture (23 tensors, 16 quantized) | pass | 0.0729 |
+| wan | Wan2.1/2.2 (20 classes) | fixture (31 tensors, 16 quantized) | pass | 0.0727 |
 | wan | Wan2.1 T2V 1.3B (real, 2.64 GiB) | 300 layers | pass (full validation) | 0.0730 |
-| minimax_h3 | MiniMaxH3 | fixture (30 tensors, prefix-less) | pass | 0.0728 |
-| hydit | HunyuanDiT, HunyuanDiT1 | fixture (12 tensors) | pass | 0.0728 |
-| mmdit_sd3 | SD3 (and SD3.5 family) | fixture (15 tensors) | pass | 0.0729 |
-| lumina2 | Lumina2, ZImage, ZImagePixelSpace | fixture (real naming, 35 tensors) | pass | 0.0727 |
+| minimax_h3 | MiniMaxH3 | fixture (30 tensors, prefix-less, 6 quantized) | pass | 0.0727 |
+| hydit | HunyuanDiT, HunyuanDiT1 | fixture (12 tensors, 8 quantized) | pass | 0.0728 |
+| mmdit_sd3 | SD3 (and SD3.5 family) | fixture (15 tensors, 12 quantized) | pass | 0.0728 |
+| lumina2 | Lumina2, ZImage, ZImagePixelSpace | fixture (real naming, 35 tensors, 20 quantized) | pass | 0.0728 |
 | lumina2 | Z-Image Turbo (real, sickOllie_zTurbo 11.46 GiB, bf16) | 170 layers, 3.42 GiB out | pass (full validation, cuda) | 0.0730 |
-| boogu | Boogu-Image-0.1 (Base/Turbo/Edit naming) | fixture (real naming, 73 layers) | pass | 0.0727 |
-| omnigen2 | OmniGen2 | fixture (real naming, 35 layers) | pass | 0.0727 |
+| boogu | Boogu-Image-0.1 (Base/Turbo/Edit naming) | fixture (real naming, 73 layers) | pass | 0.0728 |
+| omnigen2 | OmniGen2 | fixture (real naming, 35 layers) | pass | 0.0728 |
 | (runtime) | real ComfyUI v0.30.0 + loader patch + comfy-kitchen 0.2.27 load | zimage + minimax_h3 outputs | pass (QuantizedTensor, AsymW4A8Int8Layout) | - |
 | (input form) | sharded directory | hydit fixture split in 2 shards | pass | 0.0728 |
 | (input form) | bounded-memory chunked path (32 MiB budget) | Wan + MiniMax H3 fixtures | pass | 0.0729 |
@@ -377,11 +383,16 @@ used.
    is not needed; older builds (v0.30.x) need the patch. Standalone validation
    does not prove runtime compatibility;
    use `--validate` for the optional installed-version probe.
-2. **Only 2D linear weights are quantized.** The reference format requires 2D,
-   `K % 16 == 0`, plus group/convrot divisibility. Convolutions, embeddings, norms,
-   positionals, heads, and modulations pass through at original precision, with the
-   reason recorded in the report. Layers whose K is not divisible by 16 cannot be
-   quantized in this format at all.
+2. **Only 2D linear weights are quantized, and only with `convrot_groupsize =
+   256`.** The reference format requires 2D, `K % 16 == 0`, plus group/convrot
+   divisibility. The comfy-kitchen CUDA fused kernels (activation ConvRot + int8
+   quantize, chunked codebook GEMM, weight rotation) implement ConvRot 256 only;
+   a layer whose K is not divisible by 256 cannot run on the CUDA runtime with a
+   smaller ConvRot group and raises "convrot fused kernel only supports group_size
+   256" at sampling. Such layers pass through at original precision with the reason
+   recorded in the report (this is why real checkpoints with K=320 attention
+   projections, for example SDXL attn1, keep those weights in bf16/fp16). Layers
+   whose K is not divisible by 16 cannot be quantized in this format at all.
 3. **Detection is heuristic.** It mirrors ComfyUI's `detect_unet_config` signatures
    at the research revision, but ambiguous or unknown checkpoints are refused unless
    `--architecture` is supplied.
@@ -432,7 +443,10 @@ Files studied in ComfyUI@bdcb886 (+ PR #15308 diff): `comfy/ops.py`
 1. Input: 2D weight `W [N, K]`; constraints `K % 16 == 0`, `K % group_size == 0`,
    `K % convrot_groupsize == 0`, `group_size >= 4`, and
    `(16 % group_size == 0 or group_size % 16 == 0)`. The CUDA dequant kernel
-   requires group sizes in `{4, 8, 16}` or multiples of 16.
+   requires weight group sizes in `{4, 8, 16}` or multiples of 16, and the CUDA
+   fused ConvRot kernels additionally require `convrot_groupsize == 256` (so
+   `K % 256 == 0`). The converter therefore emits only `convrot_groupsize = 256`
+   and passes through any linear whose K is not divisible by 256.
 2. ConvRot rotation: `W_rot = W @ (I ⊗ H)^T` where `H` is a normalized regular
    Hadamard built by Kronecker products of `H4 = [[1,1,1,-1],[1,1,-1,1],
    [1,-1,1,1],[-1,1,1,1]]/2` (size must be a power of 4). Runtime applies the same

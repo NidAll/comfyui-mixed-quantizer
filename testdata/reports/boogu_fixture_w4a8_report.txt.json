@@ -1,6 +1,6 @@
 {
  "converter": "comfyui_wxa8_quantizer",
- "converter_version": "1.2.1",
+ "converter_version": "1.2.2",
  "format": "asym_w4a8_int8",
  "format_revision": "asym-w4a8-int8-r1",
  "architecture": "boogu",
@@ -22,86 +22,86 @@
  "input_files": [
   "testdata/boogu_fixture.safetensors"
  ],
- "input_bytes": 50976000,
+ "input_bytes": 169530624,
  "output_path": "testdata/boogu_fixture_w4a8.safetensors",
- "output_bytes": 14090560,
+ "output_bytes": 30860608,
  "n_input_tensors": 175,
  "n_quantized": 73,
  "n_kept": 102,
  "quantization_rows": [
-  "context_refiner.0.attn.to_k: (384, 384) gs=16 cgs=64",
-  "context_refiner.0.attn.to_out.0: (384, 384) gs=16 cgs=64",
-  "context_refiner.0.attn.to_q: (384, 384) gs=16 cgs=64",
-  "context_refiner.0.attn.to_v: (384, 384) gs=16 cgs=64",
-  "context_refiner.0.feed_forward.linear_1: (384, 384) gs=16 cgs=64",
-  "context_refiner.0.feed_forward.linear_2: (384, 384) gs=16 cgs=64",
-  "context_refiner.0.feed_forward.linear_3: (384, 384) gs=16 cgs=64",
-  "double_stream_layers.0.img_feed_forward.linear_1: (384, 384) gs=16 cgs=64",
-  "double_stream_layers.0.img_feed_forward.linear_2: (384, 384) gs=16 cgs=64",
-  "double_stream_layers.0.img_feed_forward.linear_3: (384, 384) gs=16 cgs=64",
-  "double_stream_layers.0.img_instruct_attn.processor.img_out: (384, 384) gs=16 cgs=64",
-  "double_stream_layers.0.img_instruct_attn.processor.img_to_k: (384, 384) gs=16 cgs=64",
-  "double_stream_layers.0.img_instruct_attn.processor.img_to_q: (384, 384) gs=16 cgs=64",
-  "double_stream_layers.0.img_instruct_attn.processor.img_to_v: (384, 384) gs=16 cgs=64",
-  "double_stream_layers.0.img_instruct_attn.processor.instruct_out: (384, 384) gs=16 cgs=64",
-  "double_stream_layers.0.img_instruct_attn.processor.instruct_to_k: (384, 384) gs=16 cgs=64",
-  "double_stream_layers.0.img_instruct_attn.processor.instruct_to_q: (384, 384) gs=16 cgs=64",
-  "double_stream_layers.0.img_instruct_attn.processor.instruct_to_v: (384, 384) gs=16 cgs=64",
-  "double_stream_layers.0.img_instruct_attn.to_out.0: (384, 384) gs=16 cgs=64",
-  "double_stream_layers.0.img_self_attn.to_k: (384, 384) gs=16 cgs=64",
-  "double_stream_layers.0.img_self_attn.to_out.0: (384, 384) gs=16 cgs=64",
-  "double_stream_layers.0.img_self_attn.to_q: (384, 384) gs=16 cgs=64",
-  "double_stream_layers.0.img_self_attn.to_v: (384, 384) gs=16 cgs=64",
-  "double_stream_layers.0.instruct_feed_forward.linear_1: (384, 384) gs=16 cgs=64",
-  "double_stream_layers.0.instruct_feed_forward.linear_2: (384, 384) gs=16 cgs=64",
-  "double_stream_layers.0.instruct_feed_forward.linear_3: (384, 384) gs=16 cgs=64",
-  "double_stream_layers.1.img_feed_forward.linear_1: (384, 384) gs=16 cgs=64",
-  "double_stream_layers.1.img_feed_forward.linear_2: (384, 384) gs=16 cgs=64",
-  "double_stream_layers.1.img_feed_forward.linear_3: (384, 384) gs=16 cgs=64",
-  "double_stream_layers.1.img_instruct_attn.processor.img_out: (384, 384) gs=16 cgs=64",
-  "double_stream_layers.1.img_instruct_attn.processor.img_to_k: (384, 384) gs=16 cgs=64",
-  "double_stream_layers.1.img_instruct_attn.processor.img_to_q: (384, 384) gs=16 cgs=64",
-  "double_stream_layers.1.img_instruct_attn.processor.img_to_v: (384, 384) gs=16 cgs=64",
-  "double_stream_layers.1.img_instruct_attn.processor.instruct_out: (384, 384) gs=16 cgs=64",
-  "double_stream_layers.1.img_instruct_attn.processor.instruct_to_k: (384, 384) gs=16 cgs=64",
-  "double_stream_layers.1.img_instruct_attn.processor.instruct_to_q: (384, 384) gs=16 cgs=64",
-  "double_stream_layers.1.img_instruct_attn.processor.instruct_to_v: (384, 384) gs=16 cgs=64",
-  "double_stream_layers.1.img_instruct_attn.to_out.0: (384, 384) gs=16 cgs=64",
-  "double_stream_layers.1.img_self_attn.to_k: (384, 384) gs=16 cgs=64",
-  "double_stream_layers.1.img_self_attn.to_out.0: (384, 384) gs=16 cgs=64",
-  "double_stream_layers.1.img_self_attn.to_q: (384, 384) gs=16 cgs=64",
-  "double_stream_layers.1.img_self_attn.to_v: (384, 384) gs=16 cgs=64",
-  "double_stream_layers.1.instruct_feed_forward.linear_1: (384, 384) gs=16 cgs=64",
-  "double_stream_layers.1.instruct_feed_forward.linear_2: (384, 384) gs=16 cgs=64",
-  "double_stream_layers.1.instruct_feed_forward.linear_3: (384, 384) gs=16 cgs=64",
-  "noise_refiner.0.attn.to_k: (384, 384) gs=16 cgs=64",
-  "noise_refiner.0.attn.to_out.0: (384, 384) gs=16 cgs=64",
-  "noise_refiner.0.attn.to_q: (384, 384) gs=16 cgs=64",
-  "noise_refiner.0.attn.to_v: (384, 384) gs=16 cgs=64",
-  "noise_refiner.0.feed_forward.linear_1: (384, 384) gs=16 cgs=64",
-  "noise_refiner.0.feed_forward.linear_2: (384, 384) gs=16 cgs=64",
-  "noise_refiner.0.feed_forward.linear_3: (384, 384) gs=16 cgs=64",
-  "ref_image_refiner.0.attn.to_k: (384, 384) gs=16 cgs=64",
-  "ref_image_refiner.0.attn.to_out.0: (384, 384) gs=16 cgs=64",
-  "ref_image_refiner.0.attn.to_q: (384, 384) gs=16 cgs=64",
-  "ref_image_refiner.0.attn.to_v: (384, 384) gs=16 cgs=64",
-  "ref_image_refiner.0.feed_forward.linear_1: (384, 384) gs=16 cgs=64",
-  "ref_image_refiner.0.feed_forward.linear_2: (384, 384) gs=16 cgs=64",
-  "ref_image_refiner.0.feed_forward.linear_3: (384, 384) gs=16 cgs=64",
-  "single_stream_layers.0.attn.to_k: (384, 384) gs=16 cgs=64",
-  "single_stream_layers.0.attn.to_out.0: (384, 384) gs=16 cgs=64",
-  "single_stream_layers.0.attn.to_q: (384, 384) gs=16 cgs=64",
-  "single_stream_layers.0.attn.to_v: (384, 384) gs=16 cgs=64",
-  "single_stream_layers.0.feed_forward.linear_1: (384, 384) gs=16 cgs=64",
-  "single_stream_layers.0.feed_forward.linear_2: (384, 384) gs=16 cgs=64",
-  "single_stream_layers.0.feed_forward.linear_3: (384, 384) gs=16 cgs=64",
-  "single_stream_layers.1.attn.to_k: (384, 384) gs=16 cgs=64",
-  "single_stream_layers.1.attn.to_out.0: (384, 384) gs=16 cgs=64",
-  "single_stream_layers.1.attn.to_q: (384, 384) gs=16 cgs=64",
-  "single_stream_layers.1.attn.to_v: (384, 384) gs=16 cgs=64",
-  "single_stream_layers.1.feed_forward.linear_1: (384, 384) gs=16 cgs=64",
-  "single_stream_layers.1.feed_forward.linear_2: (384, 384) gs=16 cgs=64",
-  "single_stream_layers.1.feed_forward.linear_3: (384, 384) gs=16 cgs=64"
+  "context_refiner.0.attn.to_k: (768, 768) gs=16 cgs=256",
+  "context_refiner.0.attn.to_out.0: (384, 768) gs=16 cgs=256",
+  "context_refiner.0.attn.to_q: (768, 768) gs=16 cgs=256",
+  "context_refiner.0.attn.to_v: (768, 768) gs=16 cgs=256",
+  "context_refiner.0.feed_forward.linear_1: (768, 768) gs=16 cgs=256",
+  "context_refiner.0.feed_forward.linear_2: (768, 768) gs=16 cgs=256",
+  "context_refiner.0.feed_forward.linear_3: (768, 768) gs=16 cgs=256",
+  "double_stream_layers.0.img_feed_forward.linear_1: (768, 768) gs=16 cgs=256",
+  "double_stream_layers.0.img_feed_forward.linear_2: (768, 768) gs=16 cgs=256",
+  "double_stream_layers.0.img_feed_forward.linear_3: (768, 768) gs=16 cgs=256",
+  "double_stream_layers.0.img_instruct_attn.processor.img_out: (384, 768) gs=16 cgs=256",
+  "double_stream_layers.0.img_instruct_attn.processor.img_to_k: (768, 768) gs=16 cgs=256",
+  "double_stream_layers.0.img_instruct_attn.processor.img_to_q: (768, 768) gs=16 cgs=256",
+  "double_stream_layers.0.img_instruct_attn.processor.img_to_v: (768, 768) gs=16 cgs=256",
+  "double_stream_layers.0.img_instruct_attn.processor.instruct_out: (384, 768) gs=16 cgs=256",
+  "double_stream_layers.0.img_instruct_attn.processor.instruct_to_k: (768, 768) gs=16 cgs=256",
+  "double_stream_layers.0.img_instruct_attn.processor.instruct_to_q: (768, 768) gs=16 cgs=256",
+  "double_stream_layers.0.img_instruct_attn.processor.instruct_to_v: (768, 768) gs=16 cgs=256",
+  "double_stream_layers.0.img_instruct_attn.to_out.0: (768, 768) gs=16 cgs=256",
+  "double_stream_layers.0.img_self_attn.to_k: (768, 768) gs=16 cgs=256",
+  "double_stream_layers.0.img_self_attn.to_out.0: (768, 768) gs=16 cgs=256",
+  "double_stream_layers.0.img_self_attn.to_q: (768, 768) gs=16 cgs=256",
+  "double_stream_layers.0.img_self_attn.to_v: (768, 768) gs=16 cgs=256",
+  "double_stream_layers.0.instruct_feed_forward.linear_1: (768, 768) gs=16 cgs=256",
+  "double_stream_layers.0.instruct_feed_forward.linear_2: (768, 768) gs=16 cgs=256",
+  "double_stream_layers.0.instruct_feed_forward.linear_3: (768, 768) gs=16 cgs=256",
+  "double_stream_layers.1.img_feed_forward.linear_1: (768, 768) gs=16 cgs=256",
+  "double_stream_layers.1.img_feed_forward.linear_2: (768, 768) gs=16 cgs=256",
+  "double_stream_layers.1.img_feed_forward.linear_3: (768, 768) gs=16 cgs=256",
+  "double_stream_layers.1.img_instruct_attn.processor.img_out: (384, 768) gs=16 cgs=256",
+  "double_stream_layers.1.img_instruct_attn.processor.img_to_k: (768, 768) gs=16 cgs=256",
+  "double_stream_layers.1.img_instruct_attn.processor.img_to_q: (768, 768) gs=16 cgs=256",
+  "double_stream_layers.1.img_instruct_attn.processor.img_to_v: (768, 768) gs=16 cgs=256",
+  "double_stream_layers.1.img_instruct_attn.processor.instruct_out: (384, 768) gs=16 cgs=256",
+  "double_stream_layers.1.img_instruct_attn.processor.instruct_to_k: (768, 768) gs=16 cgs=256",
+  "double_stream_layers.1.img_instruct_attn.processor.instruct_to_q: (768, 768) gs=16 cgs=256",
+  "double_stream_layers.1.img_instruct_attn.processor.instruct_to_v: (768, 768) gs=16 cgs=256",
+  "double_stream_layers.1.img_instruct_attn.to_out.0: (768, 768) gs=16 cgs=256",
+  "double_stream_layers.1.img_self_attn.to_k: (768, 768) gs=16 cgs=256",
+  "double_stream_layers.1.img_self_attn.to_out.0: (768, 768) gs=16 cgs=256",
+  "double_stream_layers.1.img_self_attn.to_q: (768, 768) gs=16 cgs=256",
+  "double_stream_layers.1.img_self_attn.to_v: (768, 768) gs=16 cgs=256",
+  "double_stream_layers.1.instruct_feed_forward.linear_1: (768, 768) gs=16 cgs=256",
+  "double_stream_layers.1.instruct_feed_forward.linear_2: (768, 768) gs=16 cgs=256",
+  "double_stream_layers.1.instruct_feed_forward.linear_3: (768, 768) gs=16 cgs=256",
+  "noise_refiner.0.attn.to_k: (768, 768) gs=16 cgs=256",
+  "noise_refiner.0.attn.to_out.0: (384, 768) gs=16 cgs=256",
+  "noise_refiner.0.attn.to_q: (768, 768) gs=16 cgs=256",
+  "noise_refiner.0.attn.to_v: (768, 768) gs=16 cgs=256",
+  "noise_refiner.0.feed_forward.linear_1: (768, 768) gs=16 cgs=256",
+  "noise_refiner.0.feed_forward.linear_2: (768, 768) gs=16 cgs=256",
+  "noise_refiner.0.feed_forward.linear_3: (768, 768) gs=16 cgs=256",
+  "ref_image_refiner.0.attn.to_k: (768, 768) gs=16 cgs=256",
+  "ref_image_refiner.0.attn.to_out.0: (384, 768) gs=16 cgs=256",
+  "ref_image_refiner.0.attn.to_q: (768, 768) gs=16 cgs=256",
+  "ref_image_refiner.0.attn.to_v: (768, 768) gs=16 cgs=256",
+  "ref_image_refiner.0.feed_forward.linear_1: (768, 768) gs=16 cgs=256",
+  "ref_image_refiner.0.feed_forward.linear_2: (768, 768) gs=16 cgs=256",
+  "ref_image_refiner.0.feed_forward.linear_3: (768, 768) gs=16 cgs=256",
+  "single_stream_layers.0.attn.to_k: (768, 768) gs=16 cgs=256",
+  "single_stream_layers.0.attn.to_out.0: (384, 768) gs=16 cgs=256",
+  "single_stream_layers.0.attn.to_q: (768, 768) gs=16 cgs=256",
+  "single_stream_layers.0.attn.to_v: (768, 768) gs=16 cgs=256",
+  "single_stream_layers.0.feed_forward.linear_1: (768, 768) gs=16 cgs=256",
+  "single_stream_layers.0.feed_forward.linear_2: (768, 768) gs=16 cgs=256",
+  "single_stream_layers.0.feed_forward.linear_3: (768, 768) gs=16 cgs=256",
+  "single_stream_layers.1.attn.to_k: (768, 768) gs=16 cgs=256",
+  "single_stream_layers.1.attn.to_out.0: (384, 768) gs=16 cgs=256",
+  "single_stream_layers.1.attn.to_q: (768, 768) gs=16 cgs=256",
+  "single_stream_layers.1.attn.to_v: (768, 768) gs=16 cgs=256",
+  "single_stream_layers.1.feed_forward.linear_1: (768, 768) gs=16 cgs=256",
+  "single_stream_layers.1.feed_forward.linear_2: (768, 768) gs=16 cgs=256",
+  "single_stream_layers.1.feed_forward.linear_3: (768, 768) gs=16 cgs=256"
  ],
  "tensor_decisions": [
   {
@@ -126,7 +126,7 @@
    "reason": "policy candidate",
    "layer": "context_refiner.0.attn.to_k",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "context_refiner.0.attn.to_out.0.weight",
@@ -134,7 +134,7 @@
    "reason": "policy candidate",
    "layer": "context_refiner.0.attn.to_out.0",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "context_refiner.0.attn.to_q.weight",
@@ -142,7 +142,7 @@
    "reason": "policy candidate",
    "layer": "context_refiner.0.attn.to_q",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "context_refiner.0.attn.to_v.weight",
@@ -150,7 +150,7 @@
    "reason": "policy candidate",
    "layer": "context_refiner.0.attn.to_v",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "context_refiner.0.feed_forward.linear_1.weight",
@@ -158,7 +158,7 @@
    "reason": "policy candidate",
    "layer": "context_refiner.0.feed_forward.linear_1",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "context_refiner.0.feed_forward.linear_2.weight",
@@ -166,7 +166,7 @@
    "reason": "policy candidate",
    "layer": "context_refiner.0.feed_forward.linear_2",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "context_refiner.0.feed_forward.linear_3.weight",
@@ -174,7 +174,7 @@
    "reason": "policy candidate",
    "layer": "context_refiner.0.feed_forward.linear_3",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "context_refiner.0.ffn_norm1.weight",
@@ -222,7 +222,7 @@
    "reason": "policy candidate",
    "layer": "double_stream_layers.0.img_feed_forward.linear_1",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "double_stream_layers.0.img_feed_forward.linear_2.weight",
@@ -230,7 +230,7 @@
    "reason": "policy candidate",
    "layer": "double_stream_layers.0.img_feed_forward.linear_2",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "double_stream_layers.0.img_feed_forward.linear_3.weight",
@@ -238,7 +238,7 @@
    "reason": "policy candidate",
    "layer": "double_stream_layers.0.img_feed_forward.linear_3",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "double_stream_layers.0.img_ffn_norm1.weight",
@@ -278,7 +278,7 @@
    "reason": "policy candidate",
    "layer": "double_stream_layers.0.img_instruct_attn.processor.img_out",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "double_stream_layers.0.img_instruct_attn.processor.img_to_k.weight",
@@ -286,7 +286,7 @@
    "reason": "policy candidate",
    "layer": "double_stream_layers.0.img_instruct_attn.processor.img_to_k",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "double_stream_layers.0.img_instruct_attn.processor.img_to_q.weight",
@@ -294,7 +294,7 @@
    "reason": "policy candidate",
    "layer": "double_stream_layers.0.img_instruct_attn.processor.img_to_q",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "double_stream_layers.0.img_instruct_attn.processor.img_to_v.weight",
@@ -302,7 +302,7 @@
    "reason": "policy candidate",
    "layer": "double_stream_layers.0.img_instruct_attn.processor.img_to_v",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "double_stream_layers.0.img_instruct_attn.processor.instruct_out.weight",
@@ -310,7 +310,7 @@
    "reason": "policy candidate",
    "layer": "double_stream_layers.0.img_instruct_attn.processor.instruct_out",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "double_stream_layers.0.img_instruct_attn.processor.instruct_to_k.weight",
@@ -318,7 +318,7 @@
    "reason": "policy candidate",
    "layer": "double_stream_layers.0.img_instruct_attn.processor.instruct_to_k",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "double_stream_layers.0.img_instruct_attn.processor.instruct_to_q.weight",
@@ -326,7 +326,7 @@
    "reason": "policy candidate",
    "layer": "double_stream_layers.0.img_instruct_attn.processor.instruct_to_q",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "double_stream_layers.0.img_instruct_attn.processor.instruct_to_v.weight",
@@ -334,7 +334,7 @@
    "reason": "policy candidate",
    "layer": "double_stream_layers.0.img_instruct_attn.processor.instruct_to_v",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "double_stream_layers.0.img_instruct_attn.to_out.0.weight",
@@ -342,7 +342,7 @@
    "reason": "policy candidate",
    "layer": "double_stream_layers.0.img_instruct_attn.to_out.0",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "double_stream_layers.0.img_norm1.linear.bias",
@@ -438,7 +438,7 @@
    "reason": "policy candidate",
    "layer": "double_stream_layers.0.img_self_attn.to_k",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "double_stream_layers.0.img_self_attn.to_out.0.weight",
@@ -446,7 +446,7 @@
    "reason": "policy candidate",
    "layer": "double_stream_layers.0.img_self_attn.to_out.0",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "double_stream_layers.0.img_self_attn.to_q.weight",
@@ -454,7 +454,7 @@
    "reason": "policy candidate",
    "layer": "double_stream_layers.0.img_self_attn.to_q",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "double_stream_layers.0.img_self_attn.to_v.weight",
@@ -462,7 +462,7 @@
    "reason": "policy candidate",
    "layer": "double_stream_layers.0.img_self_attn.to_v",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "double_stream_layers.0.img_self_attn_norm.weight",
@@ -486,7 +486,7 @@
    "reason": "policy candidate",
    "layer": "double_stream_layers.0.instruct_feed_forward.linear_1",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "double_stream_layers.0.instruct_feed_forward.linear_2.weight",
@@ -494,7 +494,7 @@
    "reason": "policy candidate",
    "layer": "double_stream_layers.0.instruct_feed_forward.linear_2",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "double_stream_layers.0.instruct_feed_forward.linear_3.weight",
@@ -502,7 +502,7 @@
    "reason": "policy candidate",
    "layer": "double_stream_layers.0.instruct_feed_forward.linear_3",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "double_stream_layers.0.instruct_ffn_norm1.weight",
@@ -582,7 +582,7 @@
    "reason": "policy candidate",
    "layer": "double_stream_layers.1.img_feed_forward.linear_1",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "double_stream_layers.1.img_feed_forward.linear_2.weight",
@@ -590,7 +590,7 @@
    "reason": "policy candidate",
    "layer": "double_stream_layers.1.img_feed_forward.linear_2",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "double_stream_layers.1.img_feed_forward.linear_3.weight",
@@ -598,7 +598,7 @@
    "reason": "policy candidate",
    "layer": "double_stream_layers.1.img_feed_forward.linear_3",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "double_stream_layers.1.img_ffn_norm1.weight",
@@ -638,7 +638,7 @@
    "reason": "policy candidate",
    "layer": "double_stream_layers.1.img_instruct_attn.processor.img_out",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "double_stream_layers.1.img_instruct_attn.processor.img_to_k.weight",
@@ -646,7 +646,7 @@
    "reason": "policy candidate",
    "layer": "double_stream_layers.1.img_instruct_attn.processor.img_to_k",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "double_stream_layers.1.img_instruct_attn.processor.img_to_q.weight",
@@ -654,7 +654,7 @@
    "reason": "policy candidate",
    "layer": "double_stream_layers.1.img_instruct_attn.processor.img_to_q",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "double_stream_layers.1.img_instruct_attn.processor.img_to_v.weight",
@@ -662,7 +662,7 @@
    "reason": "policy candidate",
    "layer": "double_stream_layers.1.img_instruct_attn.processor.img_to_v",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "double_stream_layers.1.img_instruct_attn.processor.instruct_out.weight",
@@ -670,7 +670,7 @@
    "reason": "policy candidate",
    "layer": "double_stream_layers.1.img_instruct_attn.processor.instruct_out",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "double_stream_layers.1.img_instruct_attn.processor.instruct_to_k.weight",
@@ -678,7 +678,7 @@
    "reason": "policy candidate",
    "layer": "double_stream_layers.1.img_instruct_attn.processor.instruct_to_k",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "double_stream_layers.1.img_instruct_attn.processor.instruct_to_q.weight",
@@ -686,7 +686,7 @@
    "reason": "policy candidate",
    "layer": "double_stream_layers.1.img_instruct_attn.processor.instruct_to_q",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "double_stream_layers.1.img_instruct_attn.processor.instruct_to_v.weight",
@@ -694,7 +694,7 @@
    "reason": "policy candidate",
    "layer": "double_stream_layers.1.img_instruct_attn.processor.instruct_to_v",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "double_stream_layers.1.img_instruct_attn.to_out.0.weight",
@@ -702,7 +702,7 @@
    "reason": "policy candidate",
    "layer": "double_stream_layers.1.img_instruct_attn.to_out.0",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "double_stream_layers.1.img_norm1.linear.bias",
@@ -798,7 +798,7 @@
    "reason": "policy candidate",
    "layer": "double_stream_layers.1.img_self_attn.to_k",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "double_stream_layers.1.img_self_attn.to_out.0.weight",
@@ -806,7 +806,7 @@
    "reason": "policy candidate",
    "layer": "double_stream_layers.1.img_self_attn.to_out.0",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "double_stream_layers.1.img_self_attn.to_q.weight",
@@ -814,7 +814,7 @@
    "reason": "policy candidate",
    "layer": "double_stream_layers.1.img_self_attn.to_q",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "double_stream_layers.1.img_self_attn.to_v.weight",
@@ -822,7 +822,7 @@
    "reason": "policy candidate",
    "layer": "double_stream_layers.1.img_self_attn.to_v",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "double_stream_layers.1.img_self_attn_norm.weight",
@@ -846,7 +846,7 @@
    "reason": "policy candidate",
    "layer": "double_stream_layers.1.instruct_feed_forward.linear_1",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "double_stream_layers.1.instruct_feed_forward.linear_2.weight",
@@ -854,7 +854,7 @@
    "reason": "policy candidate",
    "layer": "double_stream_layers.1.instruct_feed_forward.linear_2",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "double_stream_layers.1.instruct_feed_forward.linear_3.weight",
@@ -862,7 +862,7 @@
    "reason": "policy candidate",
    "layer": "double_stream_layers.1.instruct_feed_forward.linear_3",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "double_stream_layers.1.instruct_ffn_norm1.weight",
@@ -958,7 +958,7 @@
    "reason": "policy candidate",
    "layer": "noise_refiner.0.attn.to_k",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "noise_refiner.0.attn.to_out.0.weight",
@@ -966,7 +966,7 @@
    "reason": "policy candidate",
    "layer": "noise_refiner.0.attn.to_out.0",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "noise_refiner.0.attn.to_q.weight",
@@ -974,7 +974,7 @@
    "reason": "policy candidate",
    "layer": "noise_refiner.0.attn.to_q",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "noise_refiner.0.attn.to_v.weight",
@@ -982,7 +982,7 @@
    "reason": "policy candidate",
    "layer": "noise_refiner.0.attn.to_v",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "noise_refiner.0.feed_forward.linear_1.weight",
@@ -990,7 +990,7 @@
    "reason": "policy candidate",
    "layer": "noise_refiner.0.feed_forward.linear_1",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "noise_refiner.0.feed_forward.linear_2.weight",
@@ -998,7 +998,7 @@
    "reason": "policy candidate",
    "layer": "noise_refiner.0.feed_forward.linear_2",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "noise_refiner.0.feed_forward.linear_3.weight",
@@ -1006,7 +1006,7 @@
    "reason": "policy candidate",
    "layer": "noise_refiner.0.feed_forward.linear_3",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "noise_refiner.0.ffn_norm1.weight",
@@ -1110,7 +1110,7 @@
    "reason": "policy candidate",
    "layer": "ref_image_refiner.0.attn.to_k",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "ref_image_refiner.0.attn.to_out.0.weight",
@@ -1118,7 +1118,7 @@
    "reason": "policy candidate",
    "layer": "ref_image_refiner.0.attn.to_out.0",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "ref_image_refiner.0.attn.to_q.weight",
@@ -1126,7 +1126,7 @@
    "reason": "policy candidate",
    "layer": "ref_image_refiner.0.attn.to_q",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "ref_image_refiner.0.attn.to_v.weight",
@@ -1134,7 +1134,7 @@
    "reason": "policy candidate",
    "layer": "ref_image_refiner.0.attn.to_v",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "ref_image_refiner.0.feed_forward.linear_1.weight",
@@ -1142,7 +1142,7 @@
    "reason": "policy candidate",
    "layer": "ref_image_refiner.0.feed_forward.linear_1",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "ref_image_refiner.0.feed_forward.linear_2.weight",
@@ -1150,7 +1150,7 @@
    "reason": "policy candidate",
    "layer": "ref_image_refiner.0.feed_forward.linear_2",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "ref_image_refiner.0.feed_forward.linear_3.weight",
@@ -1158,7 +1158,7 @@
    "reason": "policy candidate",
    "layer": "ref_image_refiner.0.feed_forward.linear_3",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "ref_image_refiner.0.ffn_norm1.weight",
@@ -1214,7 +1214,7 @@
    "reason": "policy candidate",
    "layer": "single_stream_layers.0.attn.to_k",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "single_stream_layers.0.attn.to_out.0.weight",
@@ -1222,7 +1222,7 @@
    "reason": "policy candidate",
    "layer": "single_stream_layers.0.attn.to_out.0",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "single_stream_layers.0.attn.to_q.weight",
@@ -1230,7 +1230,7 @@
    "reason": "policy candidate",
    "layer": "single_stream_layers.0.attn.to_q",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "single_stream_layers.0.attn.to_v.weight",
@@ -1238,7 +1238,7 @@
    "reason": "policy candidate",
    "layer": "single_stream_layers.0.attn.to_v",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "single_stream_layers.0.feed_forward.linear_1.weight",
@@ -1246,7 +1246,7 @@
    "reason": "policy candidate",
    "layer": "single_stream_layers.0.feed_forward.linear_1",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "single_stream_layers.0.feed_forward.linear_2.weight",
@@ -1254,7 +1254,7 @@
    "reason": "policy candidate",
    "layer": "single_stream_layers.0.feed_forward.linear_2",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "single_stream_layers.0.feed_forward.linear_3.weight",
@@ -1262,7 +1262,7 @@
    "reason": "policy candidate",
    "layer": "single_stream_layers.0.feed_forward.linear_3",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "single_stream_layers.0.ffn_norm1.weight",
@@ -1334,7 +1334,7 @@
    "reason": "policy candidate",
    "layer": "single_stream_layers.1.attn.to_k",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "single_stream_layers.1.attn.to_out.0.weight",
@@ -1342,7 +1342,7 @@
    "reason": "policy candidate",
    "layer": "single_stream_layers.1.attn.to_out.0",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "single_stream_layers.1.attn.to_q.weight",
@@ -1350,7 +1350,7 @@
    "reason": "policy candidate",
    "layer": "single_stream_layers.1.attn.to_q",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "single_stream_layers.1.attn.to_v.weight",
@@ -1358,7 +1358,7 @@
    "reason": "policy candidate",
    "layer": "single_stream_layers.1.attn.to_v",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "single_stream_layers.1.feed_forward.linear_1.weight",
@@ -1366,7 +1366,7 @@
    "reason": "policy candidate",
    "layer": "single_stream_layers.1.feed_forward.linear_1",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "single_stream_layers.1.feed_forward.linear_2.weight",
@@ -1374,7 +1374,7 @@
    "reason": "policy candidate",
    "layer": "single_stream_layers.1.feed_forward.linear_2",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "single_stream_layers.1.feed_forward.linear_3.weight",
@@ -1382,7 +1382,7 @@
    "reason": "policy candidate",
    "layer": "single_stream_layers.1.feed_forward.linear_3",
    "group_size": 16,
-   "convrot_groupsize": 64
+   "convrot_groupsize": 256
   },
   {
    "name": "single_stream_layers.1.ffn_norm1.weight",
@@ -1511,7 +1511,7 @@
   {
    "name": "output-reopen",
    "status": "passed",
-   "detail": "394 tensors, 13.50 MiB",
+   "detail": "394 tensors, 29.49 MiB",
    "reason": ""
   },
   {
@@ -1565,7 +1565,7 @@
   {
    "name": "tensor-payload-hash",
    "status": "passed",
-   "detail": "sha256=d6463de96ef1d9a274420965534ed5ed1e33bdb92d7dcbb0de4b1811eb932878",
+   "detail": "sha256=a9ee4e3e312f6cdb81d9adf31fd1a9d61d47227c13bdbe60dbfcb01abb888fd9",
    "reason": ""
   },
   {
@@ -1583,7 +1583,7 @@
   {
    "name": "recon-context_refiner.0.attn.to_k",
    "status": "passed",
-   "detail": "relL2=0.0724 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1595,7 +1595,7 @@
   {
    "name": "recon-context_refiner.0.attn.to_out.0",
    "status": "passed",
-   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0725 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1619,7 +1619,7 @@
   {
    "name": "recon-context_refiner.0.attn.to_v",
    "status": "passed",
-   "detail": "relL2=0.0725 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0727 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1631,7 +1631,7 @@
   {
    "name": "recon-context_refiner.0.feed_forward.linear_1",
    "status": "passed",
-   "detail": "relL2=0.0723 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1643,7 +1643,7 @@
   {
    "name": "recon-context_refiner.0.feed_forward.linear_2",
    "status": "passed",
-   "detail": "relL2=0.0725 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0727 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1667,7 +1667,7 @@
   {
    "name": "recon-double_stream_layers.0.img_feed_forward.linear_1",
    "status": "passed",
-   "detail": "relL2=0.0723 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1679,7 +1679,7 @@
   {
    "name": "recon-double_stream_layers.0.img_feed_forward.linear_2",
    "status": "passed",
-   "detail": "relL2=0.0724 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0727 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1703,7 +1703,7 @@
   {
    "name": "recon-double_stream_layers.0.img_instruct_attn.processor.img_out",
    "status": "passed",
-   "detail": "relL2=0.0724 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1715,7 +1715,7 @@
   {
    "name": "recon-double_stream_layers.0.img_instruct_attn.processor.img_to_k",
    "status": "passed",
-   "detail": "relL2=0.0725 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0727 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1739,7 +1739,7 @@
   {
    "name": "recon-double_stream_layers.0.img_instruct_attn.processor.img_to_v",
    "status": "passed",
-   "detail": "relL2=0.0722 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0727 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1751,7 +1751,7 @@
   {
    "name": "recon-double_stream_layers.0.img_instruct_attn.processor.instruct_out",
    "status": "passed",
-   "detail": "relL2=0.0724 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0725 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1763,7 +1763,7 @@
   {
    "name": "recon-double_stream_layers.0.img_instruct_attn.processor.instruct_to_k",
    "status": "passed",
-   "detail": "relL2=0.0724 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1799,7 +1799,7 @@
   {
    "name": "recon-double_stream_layers.0.img_instruct_attn.to_out.0",
    "status": "passed",
-   "detail": "relL2=0.0723 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0724 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1811,7 +1811,7 @@
   {
    "name": "recon-double_stream_layers.0.img_self_attn.to_k",
    "status": "passed",
-   "detail": "relL2=0.0725 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1823,7 +1823,7 @@
   {
    "name": "recon-double_stream_layers.0.img_self_attn.to_out.0",
    "status": "passed",
-   "detail": "relL2=0.0723 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1835,7 +1835,7 @@
   {
    "name": "recon-double_stream_layers.0.img_self_attn.to_q",
    "status": "passed",
-   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0728 snr=22.8dB cos=0.9973",
    "reason": ""
   },
   {
@@ -1847,7 +1847,7 @@
   {
    "name": "recon-double_stream_layers.0.img_self_attn.to_v",
    "status": "passed",
-   "detail": "relL2=0.0724 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0727 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1859,7 +1859,7 @@
   {
    "name": "recon-double_stream_layers.0.instruct_feed_forward.linear_1",
    "status": "passed",
-   "detail": "relL2=0.0727 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1871,7 +1871,7 @@
   {
    "name": "recon-double_stream_layers.0.instruct_feed_forward.linear_2",
    "status": "passed",
-   "detail": "relL2=0.0723 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0727 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1883,7 +1883,7 @@
   {
    "name": "recon-double_stream_layers.0.instruct_feed_forward.linear_3",
    "status": "passed",
-   "detail": "relL2=0.0723 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0727 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1895,7 +1895,7 @@
   {
    "name": "recon-double_stream_layers.1.img_feed_forward.linear_1",
    "status": "passed",
-   "detail": "relL2=0.0725 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1919,7 +1919,7 @@
   {
    "name": "recon-double_stream_layers.1.img_feed_forward.linear_3",
    "status": "passed",
-   "detail": "relL2=0.0724 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0727 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1931,7 +1931,7 @@
   {
    "name": "recon-double_stream_layers.1.img_instruct_attn.processor.img_out",
    "status": "passed",
-   "detail": "relL2=0.0724 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0727 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1943,7 +1943,7 @@
   {
    "name": "recon-double_stream_layers.1.img_instruct_attn.processor.img_to_k",
    "status": "passed",
-   "detail": "relL2=0.0724 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1955,7 +1955,7 @@
   {
    "name": "recon-double_stream_layers.1.img_instruct_attn.processor.img_to_q",
    "status": "passed",
-   "detail": "relL2=0.0724 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1979,7 +1979,7 @@
   {
    "name": "recon-double_stream_layers.1.img_instruct_attn.processor.instruct_out",
    "status": "passed",
-   "detail": "relL2=0.0724 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0725 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -1991,7 +1991,7 @@
   {
    "name": "recon-double_stream_layers.1.img_instruct_attn.processor.instruct_to_k",
    "status": "passed",
-   "detail": "relL2=0.0723 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0727 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -2003,7 +2003,7 @@
   {
    "name": "recon-double_stream_layers.1.img_instruct_attn.processor.instruct_to_q",
    "status": "passed",
-   "detail": "relL2=0.0724 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -2027,7 +2027,7 @@
   {
    "name": "recon-double_stream_layers.1.img_instruct_attn.to_out.0",
    "status": "passed",
-   "detail": "relL2=0.0725 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0727 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -2039,7 +2039,7 @@
   {
    "name": "recon-double_stream_layers.1.img_self_attn.to_k",
    "status": "passed",
-   "detail": "relL2=0.0724 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -2063,7 +2063,7 @@
   {
    "name": "recon-double_stream_layers.1.img_self_attn.to_q",
    "status": "passed",
-   "detail": "relL2=0.0725 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -2087,7 +2087,7 @@
   {
    "name": "recon-double_stream_layers.1.instruct_feed_forward.linear_1",
    "status": "passed",
-   "detail": "relL2=0.0723 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -2111,7 +2111,7 @@
   {
    "name": "recon-double_stream_layers.1.instruct_feed_forward.linear_3",
    "status": "passed",
-   "detail": "relL2=0.0725 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0727 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -2123,7 +2123,7 @@
   {
    "name": "recon-noise_refiner.0.attn.to_k",
    "status": "passed",
-   "detail": "relL2=0.0725 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0728 snr=22.8dB cos=0.9973",
    "reason": ""
   },
   {
@@ -2135,7 +2135,7 @@
   {
    "name": "recon-noise_refiner.0.attn.to_out.0",
    "status": "passed",
-   "detail": "relL2=0.0724 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -2147,7 +2147,7 @@
   {
    "name": "recon-noise_refiner.0.attn.to_q",
    "status": "passed",
-   "detail": "relL2=0.0724 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -2159,7 +2159,7 @@
   {
    "name": "recon-noise_refiner.0.attn.to_v",
    "status": "passed",
-   "detail": "relL2=0.0725 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0728 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -2171,7 +2171,7 @@
   {
    "name": "recon-noise_refiner.0.feed_forward.linear_1",
    "status": "passed",
-   "detail": "relL2=0.0721 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -2183,7 +2183,7 @@
   {
    "name": "recon-noise_refiner.0.feed_forward.linear_2",
    "status": "passed",
-   "detail": "relL2=0.0724 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -2207,7 +2207,7 @@
   {
    "name": "recon-ref_image_refiner.0.attn.to_k",
    "status": "passed",
-   "detail": "relL2=0.0724 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0727 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -2231,7 +2231,7 @@
   {
    "name": "recon-ref_image_refiner.0.attn.to_q",
    "status": "passed",
-   "detail": "relL2=0.0723 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0727 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -2243,7 +2243,7 @@
   {
    "name": "recon-ref_image_refiner.0.attn.to_v",
    "status": "passed",
-   "detail": "relL2=0.0724 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -2255,7 +2255,7 @@
   {
    "name": "recon-ref_image_refiner.0.feed_forward.linear_1",
    "status": "passed",
-   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0727 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -2267,7 +2267,7 @@
   {
    "name": "recon-ref_image_refiner.0.feed_forward.linear_2",
    "status": "passed",
-   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0725 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -2279,7 +2279,7 @@
   {
    "name": "recon-ref_image_refiner.0.feed_forward.linear_3",
    "status": "passed",
-   "detail": "relL2=0.0724 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0727 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -2291,7 +2291,7 @@
   {
    "name": "recon-single_stream_layers.0.attn.to_k",
    "status": "passed",
-   "detail": "relL2=0.0724 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0727 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -2303,7 +2303,7 @@
   {
    "name": "recon-single_stream_layers.0.attn.to_out.0",
    "status": "passed",
-   "detail": "relL2=0.0723 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0727 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -2315,7 +2315,7 @@
   {
    "name": "recon-single_stream_layers.0.attn.to_q",
    "status": "passed",
-   "detail": "relL2=0.0722 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -2327,7 +2327,7 @@
   {
    "name": "recon-single_stream_layers.0.attn.to_v",
    "status": "passed",
-   "detail": "relL2=0.0725 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -2339,7 +2339,7 @@
   {
    "name": "recon-single_stream_layers.0.feed_forward.linear_1",
    "status": "passed",
-   "detail": "relL2=0.0724 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0727 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -2363,7 +2363,7 @@
   {
    "name": "recon-single_stream_layers.0.feed_forward.linear_3",
    "status": "passed",
-   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0727 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -2375,7 +2375,7 @@
   {
    "name": "recon-single_stream_layers.1.attn.to_k",
    "status": "passed",
-   "detail": "relL2=0.0723 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0727 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -2387,7 +2387,7 @@
   {
    "name": "recon-single_stream_layers.1.attn.to_out.0",
    "status": "passed",
-   "detail": "relL2=0.0721 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -2411,7 +2411,7 @@
   {
    "name": "recon-single_stream_layers.1.attn.to_v",
    "status": "passed",
-   "detail": "relL2=0.0725 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -2423,7 +2423,7 @@
   {
    "name": "recon-single_stream_layers.1.feed_forward.linear_1",
    "status": "passed",
-   "detail": "relL2=0.0724 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0727 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -2435,7 +2435,7 @@
   {
    "name": "recon-single_stream_layers.1.feed_forward.linear_2",
    "status": "passed",
-   "detail": "relL2=0.0727 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -2447,7 +2447,7 @@
   {
    "name": "recon-single_stream_layers.1.feed_forward.linear_3",
    "status": "passed",
-   "detail": "relL2=0.0724 snr=22.8dB cos=0.9974",
+   "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
    "reason": ""
   },
   {
@@ -2459,7 +2459,7 @@
   {
    "name": "reconstruction-error-bound",
    "status": "passed",
-   "detail": "max full relL2 0.0727 (policy bound 0.25)",
+   "detail": "max full relL2 0.0728 (policy bound 0.25)",
    "reason": ""
   },
   {
@@ -2483,14 +2483,14 @@
   {
    "name": "output-hash",
    "status": "passed",
-   "detail": "sha256=b4be1209d0c7a9b9fb01dc2e8d1d769487857670d1ea9bc258ba9184d2659b8c",
+   "detail": "sha256=94f95ca560426c3a995219fcff1d7f9786a0de696db6b92a070728066b139f84",
    "reason": ""
   },
   {
    "name": "compat-comfy-kitchen",
-   "status": "skipped",
-   "detail": "comfy-kitchen not installed (skipped)",
-   "reason": "optional runtime probe"
+   "status": "passed",
+   "detail": "installed comfy-kitchen: 0.2.28, static package source contains AsymW4A8Int8Layout: True",
+   "reason": ""
   },
   {
    "name": "compat-comfyui",
@@ -2501,7 +2501,7 @@
   {
    "name": "input-hash",
    "status": "passed",
-   "detail": "{\"boogu_fixture.safetensors\":\"0bc5694340578d927d136c8eaa4de205efc6f7192a42a9c63b7365a7758c1ccf\"}",
+   "detail": "{\"boogu_fixture.safetensors\":\"67ac4691950492f7d04baf2a00d7c82315bee1bdd505589d25e2c184aeceff66\"}",
    "reason": ""
   },
   {
@@ -2511,13 +2511,13 @@
    "reason": ""
   }
  ],
- "compatibility_summary": "comfy-kitchen >= aa1ab2263dc06225d9de6702dfc087313d4bc971 (PR #90, merged) with AsymW4A8Int8Layout; ComfyUI >= PR #15308 head 8c3a2b27c37bd34e87b58846baf962407c92843c (NOT merged into master at base bdcb886a4705a03cf40f4a7226de9fc7c059fc90); CUDA: PyTorch cu130+, SM >= 8.0; ROCm: triton >= 3.7; eager works anywhere",
+ "compatibility_summary": "comfy-kitchen >= aa1ab2263dc06225d9de6702dfc087313d4bc971 (PR #90, merged) with AsymW4A8Int8Layout; ComfyUI >= v0.31.0 (PR #15308 merged as 344b43989e; older builds need patches/comfyui_w4a8_loader.patch); CUDA: PyTorch cu130+, SM >= 8.0; ROCm: triton >= 3.7; eager works anywhere",
  "input_hashes": {
-  "testdata/boogu_fixture.safetensors": "0bc5694340578d927d136c8eaa4de205efc6f7192a42a9c63b7365a7758c1ccf"
+  "testdata/boogu_fixture.safetensors": "67ac4691950492f7d04baf2a00d7c82315bee1bdd505589d25e2c184aeceff66"
  },
- "output_sha256": "b4be1209d0c7a9b9fb01dc2e8d1d769487857670d1ea9bc258ba9184d2659b8c",
- "elapsed_seconds": 14.784,
- "peak_rss_bytes": 646164480,
+ "output_sha256": "94f95ca560426c3a995219fcff1d7f9786a0de696db6b92a070728066b139f84",
+ "elapsed_seconds": 28.748,
+ "peak_rss_bytes": 819011584,
  "environment": {
   "python": "3.11.15",
   "torch_version": "2.13.0+cu130",
@@ -2534,9 +2534,9 @@
   "numpy_version": "2.4.6",
   "platform": "linux",
   "cpu_count": 16,
-  "has_comfy_kitchen": false,
-  "comfy_kitchen_rev": null,
-  "comfy_kitchen_has_w4a8_layout": false,
+  "has_comfy_kitchen": true,
+  "comfy_kitchen_rev": "0.2.28",
+  "comfy_kitchen_has_w4a8_layout": true,
   "has_comfy_quant_ops": false,
   "comfyui_quant_algos": []
  },

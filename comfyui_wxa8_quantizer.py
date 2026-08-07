@@ -37,10 +37,10 @@ Reference implementation (authoritative, merged):
         This converter deliberately retains the verified PR #90 numerical contract;
         its stored per-layer codebook remains consumable by later runtimes.
 
-  * ComfyUI PR #15308  "Support asym w4a8_int" (OPEN / NOT MERGED at research time)
-        https://github.com/Comfy-Org/ComfyUI/pull/15308
-        head commit : 8c3a2b27c37bd34e87b58846baf962407c92843c
-        base commit: bdcb886a4705a03cf40f4a7226de9fc7c059fc90 (2026-08-06, ComfyUI master)
+  * ComfyUI PR #15308  "Support asym w4a8_int" (MERGED 2026-08-07 as
+        commit 344b43989e, shipped in ComfyUI v0.31.0; earlier head
+        8c3a2b27c37bd34e87b58846baf962407c92843c was studied at research time,
+        base bdcb886a4705a03cf40f4a7226de9fc7c059fc90)
         files studied:
           comfy/ops.py        (_load_quantized_module: pops weight_s_rel / weight_s_channel
                                / weight_codebook, reads layer_conf "group_size" and
@@ -109,12 +109,18 @@ W4A8 numerical representation ("asym_w4a8_int8", verified against the eager back
   * Runtime prerequisites (state explicitly in metadata/reports):
        - comfy-kitchen >= merge commit aa1ab2263dc06225d9de6702dfc087313d4bc971
          (PR #90; AsymW4A8Int8Layout registered; eager/triton/CUDA backends)
-       - ComfyUI >= PR #15308 head 8c3a2b27c37bd34e87b58846baf962407c92843c
-         (NOT merged into ComfyUI master as of bdcb886a4705a03cf40f4a7226de9fc7c059fc90)
+       - ComfyUI >= v0.31.0 (native loader, PR #15308 merged as
+         344b43989e); older builds need patches/comfyui_w4a8_loader.patch
        - CUDA backend requires PyTorch cu130+ and SM >= 8.0; Triton >= 3.7 for
          ROCm; pure-torch eager works on CPU/CUDA/ROCm for dequant + linear.
   * Group sizes accepted by the CUDA dequant kernel: G in {4, 8, 16} or a
     multiple of 16 (a 16-wide vector spans at most 4 groups).
+  * ConvRot group: always 256. The comfy-kitchen 0.2.27 CUDA fused kernels
+    (activation rotation + quantize, chunked codebook GEMM, weight rotation)
+    implement ConvRot only for a 256-wide Hadamard group and throw
+    "convrot fused kernel only supports group_size 256" otherwise. A layer is
+    therefore W4A8-quantized only when K % 256 == 0; any other 2D linear
+    passes through at original precision with the reason recorded.
 
 ------------------------------------------------------------------------------
 Usage
@@ -169,8 +175,15 @@ except Exception as _exc:  # pragma: no cover - import guard
 # Version / revision constants (research record; see module docstring)
 # ---------------------------------------------------------------------------
 CONVERTER_NAME = "comfyui_wxa8_quantizer"
-CONVERTER_VERSION = "1.2.1"
+CONVERTER_VERSION = "1.2.2"
 FORMAT_W4A8 = "asym_w4a8_int8"
+
+# comfy-kitchen 0.2.27 CUDA fused kernels implement ConvRot only for a 256-wide
+# Hadamard group (int8_linear.cu: "convrot fused kernel only supports group_size
+# 256"). W4A8 therefore requires K % 256 == 0; layers whose K is not divisible
+# by 256 pass through at original precision instead of being quantized with a
+# smaller ConvRot group.
+W4A8_CONVROT_GROUPSIZE = 256
 FORMAT_W4A8_REVISION = "asym-w4a8-int8-r1"
 MAX_SAFETENSORS_HEADER_SIZE = 100_000_000
 METADATA_KEY_QUANT = "_quantization_metadata"     # official key read by ComfyUI
@@ -1204,21 +1217,6 @@ def rotate_int8_convrot_weight(weight: torch.Tensor, group_size: int) -> torch.T
     return rotate_weight(weight, h, group_size)
 
 
-def pick_convrot_group_size(k: int, max_group: int = 256) -> int:
-    """Largest power-of-4 divisor of K that is <= max_group (>= 4).
-
-    K % 16 == 0 is guaranteed by the W4A8 shape rules, so 4 always divides K.
-    """
-    candidates = []
-    group = 4
-    while group <= max_group:
-        candidates.append(group)
-        group *= 4
-    for g in reversed(candidates):
-        if k % g == 0:
-            return g
-    raise PolicyError(f"K={k} has no power-of-4 divisor >= 4")
-
 # ---------------------------------------------------------------------------
 # Shape validation (W4A8: port of validate_w4a8_weight_shape / operands)
 # ---------------------------------------------------------------------------
@@ -1497,7 +1495,6 @@ class FamilyPolicy:
     keep: Tuple[str, ...] = ()
     exclude: Tuple[str, ...] = ()
     group_size: int = 16
-    convrot_max: int = 256
     min_weight_numel: int = 4096
     max_rel_l2: float = 0.25
     min_cosine: float = 0.95
@@ -2754,10 +2751,12 @@ def classify_tensors(info: CheckpointInfo, detection: DetectionResult,
                                             f"not in {policy.family} quantize set; passthrough"))
             continue
 
-        # shape / dtype gates
+        # shape / dtype gates. ConvRot is always 256-wide: the comfy-kitchen
+        # 0.2.27 CUDA fused kernels throw unless convrot_groupsize == 256, so
+        # layers whose K is not divisible by 256 pass through at original
+        # precision (they cannot run on the CUDA runtime with a smaller group).
         ok, why = w4_weight_is_quantizable(meta.shape, meta.dtype, group_size,
-                                           pick_convrot_group_size(int(meta.shape[1]), policy.convrot_max)
-                                           if len(meta.shape) == 2 else 256)
+                                           W4A8_CONVROT_GROUPSIZE)
         if not ok:
             decisions.append(TensorDecision(name, DecisionKind.KEEP, f"not quantizable: {why}; passthrough"))
             continue
@@ -2765,10 +2764,10 @@ def classify_tensors(info: CheckpointInfo, detection: DetectionResult,
             decisions.append(TensorDecision(name, DecisionKind.KEEP,
                                             f"small tensor (<{min_numel} elements); passthrough"))
             continue
-        cgs = pick_convrot_group_size(int(meta.shape[1]), policy.convrot_max)
         decisions.append(TensorDecision(
             name, DecisionKind.QUANTIZE, "policy candidate",
-            layer=layer, group_size=group_size, convrot_groupsize=cgs))
+            layer=layer, group_size=group_size,
+            convrot_groupsize=W4A8_CONVROT_GROUPSIZE))
 
     return decisions
 
@@ -4280,9 +4279,12 @@ def build_extension_metadata(info: CheckpointInfo, plan: ConversionPlan,
             "comfyui": {
                 "required_pr": COMFYUI_PR,
                 "required_head": COMFYUI_PR_HEAD,
-                "merged": False,
-                "note": "ComfyUI PR #15308 (asym_w4a8_int8 loader) is NOT merged into "
-                        "master as of base commit " + COMFYUI_BASE,
+                "merged": True,
+                "merged_commit": "344b43989e",
+                "min_version": "0.31.0",
+                "note": "ComfyUI PR #15308 (asym_w4a8_int8 loader) merged 2026-08-07; "
+                        "ComfyUI >= v0.31.0 loads W4A8 natively, older builds need "
+                        "patches/comfyui_w4a8_loader.patch (base " + COMFYUI_BASE + ")",
             },
             "cuda_backend": {
                 "requires": "PyTorch cu130+, SM >= 8.0",
@@ -4905,8 +4907,8 @@ def build_report(info: CheckpointInfo, plan: ConversionPlan, env: EnvironmentInf
                  quant_rows: List[str]) -> Dict[str, Any]:
     comp = [
         "comfy-kitchen >= %s (PR #90, merged) with AsymW4A8Int8Layout" % COMFY_KITCHEN_REV,
-        "ComfyUI >= PR #%d head %s (NOT merged into master at base %s)" % (
-            COMFYUI_PR, COMFYUI_PR_HEAD, COMFYUI_BASE),
+        "ComfyUI >= v0.31.0 (PR #%d merged as 344b43989e; older builds need "
+        "patches/comfyui_w4a8_loader.patch)" % COMFYUI_PR,
         "CUDA: PyTorch cu130+, SM >= 8.0; ROCm: triton >= 3.7; eager works anywhere",
     ]
     return {
@@ -5083,6 +5085,13 @@ def plan_from_output(output_path: str, detection: DetectionResult,
         if conf.get("format") != fmt or group_size <= 0 or convrot_groupsize <= 0:
             raise ValidationError(
                 f"{output_path}: incompatible format/group metadata for {layer!r}")
+        if convrot_groupsize != W4A8_CONVROT_GROUPSIZE:
+            raise ValidationError(
+                f"{output_path}: layer {layer!r} uses convrot_groupsize "
+                f"{convrot_groupsize}, but the comfy-kitchen 0.2.27 CUDA "
+                f"runtime only supports {W4A8_CONVROT_GROUPSIZE} (K must be "
+                "divisible by 256). Re-convert the checkpoint with converter "
+                f">= 1.2.2; incompatible layers now pass through.")
         source_name = f"{layer}.weight"
         if info is not None:
             source_meta = info.by_name(source_name)
@@ -5489,29 +5498,33 @@ def _test_detection_safety() -> str:
     # published checkpoint): double/single stream layers plus OmniGen2-style
     # refiners and embedders. Detection must land on the dedicated boogu
     # family, and the linear attention / FFN weights must actually quantize.
+    # K must be divisible by 256 for W4A8 (CUDA ConvRot is 256-only); the
+    # K=320 context_refiner to_k below is the passthrough case (it would have
+    # crashed the comfy-kitchen 0.2.27 CUDA kernel as convrot_groupsize 64).
     boogu_keys: Sequence[Tuple[str, Tuple[int, ...]]] = [
-        ("double_stream_layers.0.img_instruct_attn.processor.img_to_q.weight", (64, 64)),
-        ("double_stream_layers.0.img_instruct_attn.processor.img_out.weight", (64, 64)),
-        ("double_stream_layers.0.img_self_attn.to_q.weight", (64, 64)),
-        ("double_stream_layers.0.img_self_attn.to_k.weight", (16, 64)),
-        ("double_stream_layers.0.img_self_attn.to_out.0.weight", (64, 64)),
-        ("double_stream_layers.0.img_feed_forward.linear_1.weight", (256, 64)),
-        ("double_stream_layers.0.img_feed_forward.linear_2.weight", (64, 256)),
-        ("double_stream_layers.0.img_feed_forward.linear_3.weight", (256, 64)),
-        ("double_stream_layers.0.instruct_feed_forward.linear_1.weight", (256, 64)),
+        ("double_stream_layers.0.img_instruct_attn.processor.img_to_q.weight", (256, 256)),
+        ("double_stream_layers.0.img_instruct_attn.processor.img_out.weight", (256, 256)),
+        ("double_stream_layers.0.img_self_attn.to_q.weight", (256, 256)),
+        ("double_stream_layers.0.img_self_attn.to_k.weight", (64, 256)),
+        ("double_stream_layers.0.img_self_attn.to_out.0.weight", (256, 256)),
+        ("double_stream_layers.0.img_feed_forward.linear_1.weight", (256, 256)),
+        ("double_stream_layers.0.img_feed_forward.linear_2.weight", (256, 256)),
+        ("double_stream_layers.0.img_feed_forward.linear_3.weight", (256, 256)),
+        ("double_stream_layers.0.instruct_feed_forward.linear_1.weight", (256, 256)),
         ("double_stream_layers.0.img_norm1.linear.weight", (256, 64)),
         ("double_stream_layers.0.img_norm1.linear.bias", (256,)),
         ("double_stream_layers.0.img_norm1.norm.weight", (64,)),
-        ("single_stream_layers.0.attn.to_q.weight", (64, 64)),
-        ("single_stream_layers.0.attn.to_k.weight", (16, 64)),
-        ("single_stream_layers.0.attn.to_out.0.weight", (64, 64)),
-        ("single_stream_layers.0.feed_forward.linear_1.weight", (256, 64)),
-        ("single_stream_layers.0.feed_forward.linear_2.weight", (64, 256)),
+        ("single_stream_layers.0.attn.to_q.weight", (256, 256)),
+        ("single_stream_layers.0.attn.to_k.weight", (64, 256)),
+        ("single_stream_layers.0.attn.to_out.0.weight", (256, 256)),
+        ("single_stream_layers.0.feed_forward.linear_1.weight", (256, 256)),
+        ("single_stream_layers.0.feed_forward.linear_2.weight", (256, 256)),
         ("single_stream_layers.0.norm1.linear.weight", (256, 64)),
-        ("context_refiner.0.attn.to_q.weight", (64, 64)),
-        ("context_refiner.0.feed_forward.linear_1.weight", (256, 64)),
-        ("noise_refiner.0.attn.to_q.weight", (64, 64)),
-        ("ref_image_refiner.0.feed_forward.linear_1.weight", (256, 64)),
+        ("context_refiner.0.attn.to_q.weight", (256, 256)),
+        ("context_refiner.0.attn.to_k.weight", (64, 320)),
+        ("context_refiner.0.feed_forward.linear_1.weight", (256, 256)),
+        ("noise_refiner.0.attn.to_q.weight", (256, 256)),
+        ("ref_image_refiner.0.feed_forward.linear_1.weight", (256, 256)),
         ("x_embedder.weight", (64, 64)),
         ("ref_image_patch_embedder.weight", (64, 64)),
         ("time_caption_embed.timestep_embedder.linear_1.weight", (64, 64)),
@@ -5525,11 +5538,17 @@ def _test_detection_safety() -> str:
     assert get_family("Boogu").family == "boogu"
     quantized = {d.name for d in decisions if d.kind == DecisionKind.QUANTIZE}
     kept = {d.name for d in decisions if d.kind != DecisionKind.QUANTIZE}
-    assert len(quantized) == 16, sorted(quantized)
+    assert len(quantized) == 18, sorted(quantized)
     assert "double_stream_layers.0.img_instruct_attn.processor.img_to_q.weight" in quantized
     assert "double_stream_layers.0.img_self_attn.to_q.weight" in quantized
     assert "single_stream_layers.0.feed_forward.linear_1.weight" in quantized
     assert "context_refiner.0.attn.to_q.weight" in quantized
+    # K=320 is not divisible by 256: must pass through, not quantize with a
+    # smaller ConvRot group (CUDA fused kernel is 256-only)
+    cr_k = next(d for d in decisions
+                if d.name == "context_refiner.0.attn.to_k.weight")
+    assert cr_k.kind == DecisionKind.KEEP, cr_k
+    assert "256" in cr_k.reason, cr_k.reason
     assert "double_stream_layers.0.img_norm1.linear.weight" in kept  # modulation
     assert "single_stream_layers.0.norm1.linear.weight" in kept      # modulation
     assert "norm_out.linear_1.weight" in kept                        # output head
@@ -5539,19 +5558,19 @@ def _test_detection_safety() -> str:
     # Real OmniGen2 key naming (BAAI/OmniGen2): layers.N + refiners. Detection
     # must land on omnigen2 and the linear weights must quantize too.
     og2_keys: Sequence[Tuple[str, Tuple[int, ...]]] = [
-        ("layers.0.attn.to_q.weight", (64, 64)),
-        ("layers.0.attn.to_k.weight", (16, 64)),
-        ("layers.0.attn.to_v.weight", (16, 64)),
-        ("layers.0.attn.to_out.0.weight", (64, 64)),
-        ("layers.0.feed_forward.linear_1.weight", (256, 64)),
-        ("layers.0.feed_forward.linear_2.weight", (64, 256)),
-        ("layers.0.feed_forward.linear_3.weight", (256, 64)),
+        ("layers.0.attn.to_q.weight", (256, 256)),
+        ("layers.0.attn.to_k.weight", (64, 256)),
+        ("layers.0.attn.to_v.weight", (64, 256)),
+        ("layers.0.attn.to_out.0.weight", (256, 256)),
+        ("layers.0.feed_forward.linear_1.weight", (256, 256)),
+        ("layers.0.feed_forward.linear_2.weight", (256, 256)),
+        ("layers.0.feed_forward.linear_3.weight", (256, 256)),
         ("layers.0.norm1.linear.weight", (256, 64)),
         ("layers.0.attn.norm_k.weight", (64,)),
-        ("context_refiner.0.attn.to_q.weight", (64, 64)),
-        ("context_refiner.0.feed_forward.linear_1.weight", (256, 64)),
-        ("noise_refiner.0.attn.to_q.weight", (64, 64)),
-        ("noise_refiner.0.feed_forward.linear_1.weight", (256, 64)),
+        ("context_refiner.0.attn.to_q.weight", (256, 256)),
+        ("context_refiner.0.feed_forward.linear_1.weight", (256, 256)),
+        ("noise_refiner.0.attn.to_q.weight", (256, 256)),
+        ("noise_refiner.0.feed_forward.linear_1.weight", (256, 256)),
         ("time_caption_embed.timestep_embedder.linear_1.bias", (64,)),
         ("x_embedder.weight", (64, 64)),
         ("ref_image_patch_embedder.weight", (64, 64)),
@@ -5562,7 +5581,7 @@ def _test_detection_safety() -> str:
     assert det.confidence == "high", det.confidence
     quantized = {d.name for d in decisions if d.kind == DecisionKind.QUANTIZE}
     kept = {d.name for d in decisions if d.kind != DecisionKind.QUANTIZE}
-    assert len(quantized) == 9, sorted(quantized)
+    assert len(quantized) == 11, sorted(quantized)
     assert "layers.0.attn.to_q.weight" in quantized
     assert "layers.0.feed_forward.linear_2.weight" in quantized
     assert "context_refiner.0.attn.to_q.weight" in quantized
@@ -5711,8 +5730,8 @@ def _test_sensitivity_planning() -> str:
     k_name = "model.diffusion_model.blocks.0.cross_attn.k.weight"
     safetensors.torch.save_file({
         "model.diffusion_model.head.modulation": torch.zeros(1),
-        q_name: torch.zeros(64, 64),
-        k_name: torch.randn(64, 64),
+        q_name: torch.zeros(256, 256),
+        k_name: torch.randn(256, 256),
     }, path)
     info = discover_checkpoint(path)
     det = detect_architecture(
@@ -5744,8 +5763,8 @@ def _test_sensitivity_planning() -> str:
     finally:
         engine.close()
     with safe_open(out, framework="pt") as st:
-        assert tuple(st.get_tensor(q_name).shape) == (64, 32)
-        assert tuple(st.get_tensor(k_name).shape) == (64, 64)
+        assert tuple(st.get_tensor(q_name).shape) == (256, 128)
+        assert tuple(st.get_tensor(k_name).shape) == (256, 256)
         assert st.get_tensor(k_name).dtype == torch.float32
     return "sensitivity decisions frozen before packed/passthrough offsets"
 

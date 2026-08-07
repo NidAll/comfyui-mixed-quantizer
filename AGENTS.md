@@ -13,7 +13,7 @@ accepts only `w4a8` and defaults to it.
 - Repo (public): `https://github.com/NidAll/comfyui-w4a8-quantizer`
   (renamed from `comfyui-wxa8-quantizer`; old URL redirects)
 - Branch: `main`, SSH remote `git@github.com:NidAll/comfyui-w4a8-quantizer.git`
-- Script version: `1.2.1` (`CONVERTER_VERSION` in the script)
+- Script version: `1.2.2` (`CONVERTER_VERSION` in the script)
 
 ## Format facts (verified, do not guess)
 
@@ -37,8 +37,16 @@ Per quantized layer, the output file has:
 
 Shape rules: 2D only, `K % 16 == 0`, `K % group_size == 0`, group_size >= 4 and
 `(16 % group_size == 0 or group_size % 16 == 0)`, `K % convrot_groupsize == 0`.
-The convrot group is picked per layer as the largest power of 4 up to 256 that
-divides K. The CUDA kernel requires group sizes in {4, 8, 16} or multiples of 16.
+ConvRot is ALWAYS 256-wide (v1.2.2+): the comfy-kitchen CUDA fused kernels
+(activation rotation+quantize, chunked codebook GEMM, weight rotation) implement
+ConvRot 256 only and throw `convrot fused kernel only supports group_size 256` at
+sampling otherwise. Therefore `K % 256 == 0` is required for quantization; any
+2D linear whose K is not divisible by 256 passes through at original precision
+with the reason recorded (e.g. SDXL attn1 K=320, WAN FFN K=384/2240, MiniMaxH3
+fc2 K=1152, Boogu/OmniGen2 layers with K%256 != 0). Do not reintroduce adaptive
+per-layer convrot group sizes (4/16/64): they serialize and validate, but crash
+the CUDA runtime. The CUDA dequant kernel requires weight group sizes in
+{4, 8, 16} or multiples of 16 (this is `group_size`, unrelated to ConvRot).
 
 ## Architecture registry
 
@@ -102,7 +110,7 @@ pip install --python .venv/bin/python PKG`.
 ## Common commands
 
 ```bash
-.venv/bin/python comfyui_wxa8_quantizer.py --self-test          # 13/13 required
+.venv/bin/python comfyui_wxa8_quantizer.py --self-test          # 19/19 required
 .venv/bin/python comfyui_wxa8_quantizer.py --list-architectures
 .venv/bin/python comfyui_wxa8_quantizer.py MODEL.safetensors --inspect
 .venv/bin/python comfyui_wxa8_quantizer.py MODEL.safetensors \
@@ -133,9 +141,11 @@ small regeneration tests instead of real models.
 
 ## Verification before claiming success
 
-1. `--self-test` must pass 13/13.
+1. `--self-test` must pass 19/19.
 2. Convert affected families from `testdata/make_fixtures.py` with `--validate`;
-   max relL2 should be about 0.073 (chunked path about 0.085).
+   max relL2 should be about 0.073 (chunked path about 0.085). Every quantized
+   layer in the report must show `cgs=256`; layers with K%256 != 0 must appear as
+   passthrough with "divisible by convrot_groupsize=256" in the reason.
 3. For converter changes, the CI matrix runs self-tests and a fixture
    conversion on ubuntu / windows / macos on every push.
 4. For loader questions, reproduce with the real ComfyUI path:

@@ -10,6 +10,8 @@ def make_sdxl():
     sd[p+"input_blocks.0.0.bias"] = torch.randn(320) * 0.01
     for b in range(2):
         pre = f"{p}input_blocks.{b+1}.0.transformer_blocks.0."
+        # attn1 keeps the real SDXL K=320: K % 256 != 0, so it must pass
+        # through (CUDA ConvRot is 256-only); attn2 K=2048 quantizes.
         for a in ("attn1", "attn2"):
             sd[pre+a+".to_q.weight"] = L(320, 320 if a=="attn1" else 2048)
             sd[pre+a+".to_k.weight"] = L(320, 320 if a=="attn1" else 2048)
@@ -60,8 +62,9 @@ def make_wan():
     for b in range(2):
         for attn in ("self_attn", "cross_attn"):
             for proj in ("q", "k", "v", "o"):
-                sd[p+f"blocks.{b}.{attn}.{proj}.weight"] = L(384, 384)
-            sd[p+f"blocks.{b}.{attn}.norm_q.weight"] = torch.randn(384) * 0.1
+                sd[p+f"blocks.{b}.{attn}.{proj}.weight"] = L(768, 768)
+            sd[p+f"blocks.{b}.{attn}.norm_q.weight"] = torch.randn(768) * 0.1
+        # real WAN FFN dims: K=384 / K=2240 are not divisible by 256 and pass through
         sd[p+f"blocks.{b}.ffn.0.weight"] = L(2240, 384, 0.005)
         sd[p+f"blocks.{b}.ffn.2.weight"] = L(384, 2240, 0.005)
         sd[p+f"blocks.{b}.modulation"] = torch.randn(1, 6, 384) * 0.1
@@ -79,7 +82,8 @@ def make_minimax_h3():
         sd[f"blocks.{b}.attn.out_proj.weight"] = L(768, 768, 0.01)
         sd[f"blocks.{b}.attn.q_norm.weight"] = torch.randn(128) * 0.1
         sd[f"blocks.{b}.attn.k_norm.weight"] = torch.randn(128) * 0.1
-        # ffn_hidden_size = fc1.out // 2 = 1152; fc2 = Linear(ffn, hidden) -> K=1152
+        # ffn_hidden_size = fc1.out // 2 = 1152; fc2 = Linear(ffn, hidden) -> K=1152.
+        # K=1152 is not divisible by 256, so fc2 passes through at original precision.
         sd[f"blocks.{b}.mlp.fc1.weight"] = L(2304, 768, 0.005)
         sd[f"blocks.{b}.mlp.fc2.weight"] = L(768, 1152, 0.005)
         sd[f"blocks.{b}.adaln_proj.linear.weight"] = L(13824, 8, 0.05)
@@ -97,7 +101,7 @@ def make_minimax_h3():
     sd["token_refiner.blocks.0.attn.qkv_proj.weight"] = L(2304, 768, 0.005)
     sd["token_refiner.blocks.0.attn.out_proj.weight"] = L(768, 768, 0.01)
     sd["token_refiner.blocks.0.mlp.fc1.weight"] = L(2304, 768, 0.005)
-    sd["token_refiner.blocks.0.mlp.fc2.weight"] = L(768, 1152, 0.005)
+    sd["token_refiner.blocks.0.mlp.fc2.weight"] = L(768, 1152, 0.005)  # K%256!=0: passthrough
     return sd
 
 def make_zimage():
@@ -107,26 +111,26 @@ def make_zimage():
     sd = {}; p = "model.diffusion_model."
     for b in range(3):
         pre = p + f"layers.{b}."
-        sd[pre + "attention.qkv.weight"] = L(1152, 384)
-        sd[pre + "attention.out.weight"] = L(384, 384)
-        sd[pre + "feed_forward.w1.weight"] = L(1024, 384, 0.01)
+        sd[pre + "attention.qkv.weight"] = L(1152, 768)
+        sd[pre + "attention.out.weight"] = L(384, 768)
+        sd[pre + "feed_forward.w1.weight"] = L(1024, 768, 0.01)
         sd[pre + "feed_forward.w2.weight"] = L(384, 1024, 0.01)
-        sd[pre + "feed_forward.w3.weight"] = L(1024, 384, 0.01)
+        sd[pre + "feed_forward.w3.weight"] = L(1024, 768, 0.01)
         sd[pre + "adaLN_modulation.0.weight"] = L(1536, 64)
         sd[pre + "attention_norm1.weight"] = torch.randn(384) * 0.1
         sd[pre + "attention.q_norm.weight"] = torch.randn(128) * 0.1
     for b in range(1):
         pre = p + f"context_refiner.{b}."
-        sd[pre + "attention.qkv.weight"] = L(1152, 384)
-        sd[pre + "attention.out.weight"] = L(384, 384)
-        sd[pre + "feed_forward.w1.weight"] = L(1024, 384, 0.01)
+        sd[pre + "attention.qkv.weight"] = L(1152, 768)
+        sd[pre + "attention.out.weight"] = L(384, 768)
+        sd[pre + "feed_forward.w1.weight"] = L(1024, 768, 0.01)
         sd[pre + "feed_forward.w2.weight"] = L(384, 1024, 0.01)
-        sd[pre + "feed_forward.w3.weight"] = L(1024, 384, 0.01)
+        sd[pre + "feed_forward.w3.weight"] = L(1024, 768, 0.01)
     sd[p + "cap_embedder.1.weight"] = L(384, 256)
     sd[p + "x_embedder.weight"] = L(384, 64)
     sd[p + "t_embedder.mlp.0.weight"] = L(256, 64)
     sd[p + "final_layer.adaLN_modulation.1.weight"] = L(384, 64)
-    sd[p + "final_layer.linear.weight"] = L(16, 384, 0.01)
+    sd[p + "final_layer.linear.weight"] = L(16, 384, 0.01)  # K=384: K%256!=0, passthrough
     sd[p + "cap_pad_token"] = torch.randn(1, 384)
     return sd
 
@@ -134,9 +138,9 @@ def make_zimage():
 def make_hydit():
     sd = {}; p = "model.diffusion_model."
     for b in range(2):
-        sd[p+f"blocks.{b}.attn.qkv.weight"] = L(384, 384, 0.01)
-        sd[p+f"blocks.{b}.attn.proj.weight"] = L(384, 384, 0.01)
-        sd[p+f"blocks.{b}.mlp.fc1.weight"] = L(1536, 384, 0.005)
+        sd[p+f"blocks.{b}.attn.qkv.weight"] = L(768, 768, 0.01)
+        sd[p+f"blocks.{b}.attn.proj.weight"] = L(384, 768, 0.01)
+        sd[p+f"blocks.{b}.mlp.fc1.weight"] = L(1536, 768, 0.005)
         sd[p+f"blocks.{b}.mlp.fc2.weight"] = L(384, 1536, 0.005)
     sd[p+"mlp_t5.0.weight"] = L(384, 1024, 0.01)
     sd[p+"x_embedder.proj.weight"] = L(384, 64, 0.02)
@@ -149,10 +153,10 @@ def _og2_refiner(name):
     sd = {}
     pre = f"{name}.0."
     for proj in ("to_q", "to_k", "to_v"):
-        sd[pre + "attn." + proj + ".weight"] = L(384, 384)
-    sd[pre + "attn.to_out.0.weight"] = L(384, 384)
+        sd[pre + "attn." + proj + ".weight"] = L(768, 768)
+    sd[pre + "attn.to_out.0.weight"] = L(384, 768)
     for i in (1, 2, 3):
-        sd[pre + f"feed_forward.linear_{i}.weight"] = L(384, 384)
+        sd[pre + f"feed_forward.linear_{i}.weight"] = L(768, 768)
     sd[pre + "attn.norm_k.weight"] = torch.randn(384) * 0.1
     sd[pre + "attn.norm_q.weight"] = torch.randn(384) * 0.1
     sd[pre + "ffn_norm1.weight"] = torch.randn(384) * 0.1
@@ -175,7 +179,7 @@ def _og2_embedders():
     sd["time_caption_embed.timestep_embedder.linear_2.weight"] = L(384, 256)
     sd["time_caption_embed.timestep_embedder.linear_2.bias"] = torch.randn(384) * 0.01
     sd["time_caption_embed.caption_embedder.0.weight"] = L(384, 1024)
-    sd["time_caption_embed.caption_embedder.1.weight"] = L(384, 384)
+    sd["time_caption_embed.caption_embedder.1.weight"] = L(384, 384)  # K%256!=0: passthrough
     sd["time_caption_embed.caption_embedder.1.bias"] = torch.randn(384) * 0.01
     sd["norm_out.linear_1.weight"] = L(384, 64)
     sd["norm_out.linear_1.bias"] = torch.randn(384) * 0.01
@@ -193,16 +197,16 @@ def make_boogu():
     for b in range(2):
         pre = f"double_stream_layers.{b}."
         for proj in ("to_q", "to_k", "to_v"):
-            sd[pre + "img_self_attn." + proj + ".weight"] = L(384, 384)
-            sd[pre + "img_instruct_attn.processor.img_" + proj + ".weight"] = L(384, 384)
-            sd[pre + "img_instruct_attn.processor.instruct_" + proj + ".weight"] = L(384, 384)
-        sd[pre + "img_self_attn.to_out.0.weight"] = L(384, 384)
-        sd[pre + "img_instruct_attn.to_out.0.weight"] = L(384, 384)
-        sd[pre + "img_instruct_attn.processor.img_out.weight"] = L(384, 384)
-        sd[pre + "img_instruct_attn.processor.instruct_out.weight"] = L(384, 384)
+            sd[pre + "img_self_attn." + proj + ".weight"] = L(768, 768)
+            sd[pre + "img_instruct_attn.processor.img_" + proj + ".weight"] = L(768, 768)
+            sd[pre + "img_instruct_attn.processor.instruct_" + proj + ".weight"] = L(768, 768)
+        sd[pre + "img_self_attn.to_out.0.weight"] = L(768, 768)
+        sd[pre + "img_instruct_attn.to_out.0.weight"] = L(768, 768)
+        sd[pre + "img_instruct_attn.processor.img_out.weight"] = L(384, 768)
+        sd[pre + "img_instruct_attn.processor.instruct_out.weight"] = L(384, 768)
         for ffn in ("img_feed_forward", "instruct_feed_forward"):
             for i in (1, 2, 3):
-                sd[pre + f"{ffn}.linear_{i}.weight"] = L(384, 384)
+                sd[pre + f"{ffn}.linear_{i}.weight"] = L(768, 768)
         for mod in ("img_norm1", "img_norm2", "img_norm3", "instruct_norm1", "instruct_norm2"):
             sd[pre + f"{mod}.linear.weight"] = L(1536, 64)
             sd[pre + f"{mod}.linear.bias"] = torch.randn(1536) * 0.01
@@ -221,10 +225,10 @@ def make_boogu():
     for b in range(2):
         pre = f"single_stream_layers.{b}."
         for proj in ("to_q", "to_k", "to_v"):
-            sd[pre + "attn." + proj + ".weight"] = L(384, 384)
-        sd[pre + "attn.to_out.0.weight"] = L(384, 384)
+            sd[pre + "attn." + proj + ".weight"] = L(768, 768)
+        sd[pre + "attn.to_out.0.weight"] = L(384, 768)
         for i in (1, 2, 3):
-            sd[pre + f"feed_forward.linear_{i}.weight"] = L(384, 384)
+            sd[pre + f"feed_forward.linear_{i}.weight"] = L(768, 768)
         sd[pre + "norm1.linear.weight"] = L(1536, 64)
         sd[pre + "norm1.linear.bias"] = torch.randn(1536) * 0.01
         sd[pre + "norm1.norm.weight"] = torch.randn(384) * 0.1
@@ -245,10 +249,10 @@ def make_omnigen2():
     for b in range(2):
         pre = f"layers.{b}."
         for proj in ("to_q", "to_k", "to_v"):
-            sd[pre + "attn." + proj + ".weight"] = L(384, 384)
-        sd[pre + "attn.to_out.0.weight"] = L(384, 384)
+            sd[pre + "attn." + proj + ".weight"] = L(768, 768)
+        sd[pre + "attn.to_out.0.weight"] = L(384, 768)
         for i in (1, 2, 3):
-            sd[pre + f"feed_forward.linear_{i}.weight"] = L(384, 384)
+            sd[pre + f"feed_forward.linear_{i}.weight"] = L(768, 768)
         sd[pre + "norm1.linear.weight"] = L(1536, 64)
         sd[pre + "norm1.linear.bias"] = torch.randn(1536) * 0.01
         sd[pre + "norm1.norm.weight"] = torch.randn(384) * 0.1
@@ -265,11 +269,11 @@ def make_omnigen2():
 def make_mmdit_sd3():
     sd = {}; p = "model.diffusion_model."
     for b in range(2):
-        sd[p+f"joint_blocks.{b}.x_block.attn.qkv.weight"] = L(1152, 384, 0.005)
-        sd[p+f"joint_blocks.{b}.x_block.attn.proj.weight"] = L(384, 384, 0.01)
+        sd[p+f"joint_blocks.{b}.x_block.attn.qkv.weight"] = L(1152, 768, 0.005)
+        sd[p+f"joint_blocks.{b}.x_block.attn.proj.weight"] = L(384, 768, 0.01)
         sd[p+f"joint_blocks.{b}.context_block.attn.qkv.weight"] = L(1152, 1024, 0.005)
-        sd[p+f"joint_blocks.{b}.context_block.attn.proj.weight"] = L(384, 384, 0.01)
-        sd[p+f"joint_blocks.{b}.x_block.mlp.fc1.weight"] = L(1536, 384, 0.005)
+        sd[p+f"joint_blocks.{b}.context_block.attn.proj.weight"] = L(384, 768, 0.01)
+        sd[p+f"joint_blocks.{b}.x_block.mlp.fc1.weight"] = L(1536, 768, 0.005)
         sd[p+f"joint_blocks.{b}.x_block.mlp.fc2.weight"] = L(384, 1536, 0.005)
     sd[p+"x_embedder.proj.weight"] = L(384, 64, 0.02)
     sd[p+"y_embedder.mlp.0.weight"] = L(384, 2816, 0.01)
