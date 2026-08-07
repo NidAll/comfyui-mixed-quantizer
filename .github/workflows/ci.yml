@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  selftest:
+    name: self-test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install CPU torch (no CUDA wheels in CI)
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install other dependencies
+        run: pip install safetensors numpy
+
+      - name: Embedded self-tests
+        run: python comfyui_wxa8_quantizer.py --self-test
+
+      - name: "Smoke test: architecture registry"
+        run: python comfyui_wxa8_quantizer.py --list-architectures
+
+      - name: Fixture conversion with full validation
+        shell: bash
+        run: |
+          python testdata/make_fixtures.py testdata/wan_fixture.safetensors
+          python comfyui_wxa8_quantizer.py testdata/wan_fixture.safetensors --output testdata/ci_out.safetensors --format w4a8 --validate
