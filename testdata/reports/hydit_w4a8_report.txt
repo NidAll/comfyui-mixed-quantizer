@@ -6,8 +6,8 @@ architecture      : hydit (confidence medium)
 unet prefix       : model.diffusion_model.
 input             : safetensors (testdata/hydit_fixture.safetensors)
 output            : testdata/hydit_fixture_w4a8.safetensors (9.10 MiB)
-elapsed           : 3.036 s
-peak RSS          : 610.51 MiB
+elapsed           : 2.716 s
+peak RSS          : 609.26 MiB
 
 -- detection evidence --
   + mlp_t5.0.weight
@@ -63,7 +63,7 @@ peak RSS          : 610.51 MiB
   [passed                ] scale-validation -- 8 layers OK (fp8 s_rel finite/positive, fp32 s_channel finite/positive)
   [passed                ] deterministic-conversion -- two runs byte-identical
   [passed                ] deterministic-vs-disk -- recomputed packed weight matches the file
-  [passed                ] output-hash -- sha256=1fe4d75d749b8a35e665b9b03de23c0ed27edbc4f030eb1ac9aa3b2dd28ba97c
+  [passed                ] output-hash -- sha256=06ef5cc112236667dcec49beb2f9108dab314cb6d4ce3465cac9be2e64b00600
   [skipped               ] compat-comfy-kitchen -- comfy-kitchen not installed (skipped)
   [skipped               ] compat-comfyui -- ComfyUI not installed (skipped)
   [passed                ] input-hash -- {"testdata/hydit_fixture.safetensors":"3a6c1511bb676562d2c95df990171659e6eee42d98cbc778245f0fa7416ab7a7"}
@@ -72,6 +72,6 @@ peak RSS          : 610.51 MiB
   comfy-kitchen >= aa1ab2263dc06225d9de6702dfc087313d4bc971 (PR #90, merged) with AsymW4A8Int8Layout; ComfyUI >= PR #15308 head b6578f2ae11ab3dea3156ed68d8724476cda1232 (NOT merged into master at base bdcb886a4705a03cf40f4a7226de9fc7c059fc90); CUDA: PyTorch cu130+, SM >= 8.0; ROCm: triton >= 3.7; eager works anywhere
 
 -- output integrity --
-  sha256          : 1fe4d75d749b8a35e665b9b03de23c0ed27edbc4f030eb1ac9aa3b2dd28ba97c
+  sha256          : 06ef5cc112236667dcec49beb2f9108dab314cb6d4ce3465cac9be2e64b00600
   input hydit_fixture.safetensors : 3a6c1511bb676562d2c95df990171659e6eee42d98cbc778245f0fa7416ab7a7
 ==============================================================================

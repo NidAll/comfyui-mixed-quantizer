@@ -6,8 +6,8 @@ architecture      : wan (confidence medium)
 unet prefix       : model.diffusion_model.
 input             : safetensors (testdata/wan_fixture.safetensors)
 output            : testdata/wan_fixture_w4a8.safetensors (5.91 MiB)
-elapsed           : 4.97 s
-peak RSS          : 614.61 MiB
+elapsed           : 4.557 s
+peak RSS          : 613.66 MiB
 
 -- detection evidence --
   + head.modulation
@@ -93,7 +93,7 @@ peak RSS          : 614.61 MiB
   [passed                ] scale-validation -- 20 layers OK (fp8 s_rel finite/positive, fp32 s_channel finite/positive)
   [passed                ] deterministic-conversion -- two runs byte-identical
   [passed                ] deterministic-vs-disk -- recomputed packed weight matches the file
-  [passed                ] output-hash -- sha256=107dc998fa620e315219e56f4c1ee2a4761a765891c20cbf60ab0c5037c21e2c
+  [passed                ] output-hash -- sha256=85aa5a3135b1b28333f8bb347a31645e87ac00480fc11af84f93982e18994980
   [skipped               ] compat-comfy-kitchen -- comfy-kitchen not installed (skipped)
   [skipped               ] compat-comfyui -- ComfyUI not installed (skipped)
   [passed                ] input-hash -- {"testdata/wan_fixture.safetensors":"4616a6fe714be2a5ebd5b69b98073ecfe4a033b33984eae8a7e2324767c232de"}
@@ -102,6 +102,6 @@ peak RSS          : 614.61 MiB
   comfy-kitchen >= aa1ab2263dc06225d9de6702dfc087313d4bc971 (PR #90, merged) with AsymW4A8Int8Layout; ComfyUI >= PR #15308 head b6578f2ae11ab3dea3156ed68d8724476cda1232 (NOT merged into master at base bdcb886a4705a03cf40f4a7226de9fc7c059fc90); CUDA: PyTorch cu130+, SM >= 8.0; ROCm: triton >= 3.7; eager works anywhere
 
 -- output integrity --
-  sha256          : 107dc998fa620e315219e56f4c1ee2a4761a765891c20cbf60ab0c5037c21e2c
+  sha256          : 85aa5a3135b1b28333f8bb347a31645e87ac00480fc11af84f93982e18994980
   input wan_fixture.safetensors : 4616a6fe714be2a5ebd5b69b98073ecfe4a033b33984eae8a7e2324767c232de
 ==============================================================================

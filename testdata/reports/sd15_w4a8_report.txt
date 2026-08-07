@@ -6,8 +6,8 @@ architecture      : sd15 (confidence low)
 unet prefix       : model.diffusion_model.
 input             : safetensors (testdata/sd15_fixture.safetensors)
 output            : testdata/sd15_fixture_w4a8.safetensors (2.24 MiB)
-elapsed           : 1.765 s
-peak RSS          : 606.92 MiB
+elapsed           : 1.72 s
+peak RSS          : 603.85 MiB
 warnings:
   - low detection confidence; consider --architecture override
 
@@ -47,7 +47,7 @@ warnings:
   [passed                ] scale-validation -- 3 layers OK (fp8 s_rel finite/positive, fp32 s_channel finite/positive)
   [passed                ] deterministic-conversion -- two runs byte-identical
   [passed                ] deterministic-vs-disk -- recomputed packed weight matches the file
-  [passed                ] output-hash -- sha256=fc055bee9eb3180acc31a0d28d2313bcaee544f15dbac1672521290f3c65c312
+  [passed                ] output-hash -- sha256=ad00fa3d928bdb96c6b058a574012dda4af68871feaed82d605caa9558448bc6
   [skipped               ] compat-comfy-kitchen -- comfy-kitchen not installed (skipped)
   [skipped               ] compat-comfyui -- ComfyUI not installed (skipped)
   [passed                ] input-hash -- {"testdata/sd15_fixture.safetensors":"bfe679f92f1c9c0b334ca36f8a4c8756662c2da078eaecab37235003395e0341"}
@@ -56,6 +56,6 @@ warnings:
   comfy-kitchen >= aa1ab2263dc06225d9de6702dfc087313d4bc971 (PR #90, merged) with AsymW4A8Int8Layout; ComfyUI >= PR #15308 head b6578f2ae11ab3dea3156ed68d8724476cda1232 (NOT merged into master at base bdcb886a4705a03cf40f4a7226de9fc7c059fc90); CUDA: PyTorch cu130+, SM >= 8.0; ROCm: triton >= 3.7; eager works anywhere
 
 -- output integrity --
-  sha256          : fc055bee9eb3180acc31a0d28d2313bcaee544f15dbac1672521290f3c65c312
+  sha256          : ad00fa3d928bdb96c6b058a574012dda4af68871feaed82d605caa9558448bc6
   input sd15_fixture.safetensors : bfe679f92f1c9c0b334ca36f8a4c8756662c2da078eaecab37235003395e0341
 ==============================================================================

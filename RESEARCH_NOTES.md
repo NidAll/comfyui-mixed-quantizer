@@ -1,4 +1,4 @@
-# Research notes: W4A8 / W3A8 ComfyUI-compatible quantization
+# Research notes: W4A8 ComfyUI-compatible quantization
 
 ## Exact source revisions
 
@@ -87,23 +87,6 @@ layer config. Non-quantized tensors keep their original names and dtypes.
   checkpoints (`if model_config.quant_config is not None: weight_dtype = None`), so
   int8-packed weights are safe on disk.
 
-## W3A8: independent extension format (this tool's design)
-
-Not supported by any upstream revision (verified: no `w3a8`/`int3`/3-bit references in
-comfy-kitchen@aa1ab22 or ComfyUI@bdcb886). Design:
-
-* format id `asym_w3a8_int8`; same ConvRot framework and int8 decode grid
-* 8-entry symmetric Lloyd-Max codebook (levels=8, 25 iterations, seed-0 subsample)
-* scales identical in structure: fp8_e4m3fn `s_rel [N, K/gs]`, fp32 `s_channel [N]`
-* independent 3-bit packing (8 codes per 3 bytes, little-endian):
-  `b0 = c0|c1<<3|c2<<6; b1 = c2>>2|c3<<1|c4<<4|c5<<7; b2 = c5>>1|c6<<2|c7<<5`
-* `weight` = int8 `[N, K*3//8]`; `weight_codebook` fp32 `[8]`
-* layer config adds `"codebook_size": 8, "packing": "3bit-lsb"`; the extension
-  metadata states that loading requires the `--emit-patch` runtime patch
-* the emitted patch (verified with `git apply --check` against the reference
-  revisions) adds `AsymW3A8Int8Layout` to comfy-kitchen and registers
-  `asym_w3a8_int8` in ComfyUI's `QUANT_ALGOS` + loader.
-
 ## Architecture registry
 
 42 policy families covering all 98 ComfyUI supported-model classes at
@@ -122,8 +105,8 @@ reference MiniMax-H3 W4A8 example (which quantizes exactly
 
 ## Executed tests (evidence)
 
-* `--self-test`: 15/15 pass, including golden-vector bit-exactness vs the reference
-  implementation (2 configs) and end-to-end mini-model conversions for both formats.
+* `--self-test`: 13/13 pass, including golden-vector bit-exactness vs the reference
+  implementation (2 configs) and an end-to-end mini-model conversion.
 * Side-by-side vs comfy-kitchen@aa1ab22 (eager, CPU): bit-exact quantize and
   dequantize on 9 shape/config combinations (group sizes 16/32/64, convrot 16/64/256).
 * Real model: Wan 2.1 T2V 1.3B fp16 (2.64 GiB) → W4A8, 300 layers, output 801 MiB;
@@ -131,10 +114,9 @@ reference MiniMax-H3 W4A8 example (which quantizes exactly
   passed; the ComfyUI loader contract (metadata → comfy_quant → weight/s_rel/
   s_channel/codebook names, dtypes, shapes) was verified against the output.
 * Small structurally-accurate fixtures for 7 families (sd15, sdxl, flux, wan,
-  minimax_h3, hydit, mmdit_sd3): W4A8 and W3A8 conversions all pass standalone
-  validation (W4A8 relL2 0.0728–0.0855, W3A8 relL2 0.1492–0.1496), plus:
-  sharded-directory input, CLI kill/resume, calibration cache write/read,
-  sensitivity-based keep-precision, chunked bounded-memory conversion (2 MiB budget),
-  CUDA device path, bf16 compute, fp16 output cast, include/exclude/keep-precision
-  filters, overwrite/self-overwrite/pickle/requantize guards, metadata-only,
-  validation-only, dry-run, and the emitted W3A8 runtime patch (applies cleanly).
+  minimax_h3, hydit, mmdit_sd3): W4A8 conversions all pass standalone validation
+  (max relL2 0.0728–0.0855), plus: sharded-directory input, CLI kill/resume,
+  calibration cache write/read, sensitivity-based keep-precision, chunked
+  bounded-memory conversion (2 MiB budget), CUDA device path, bf16 compute, fp16
+  output cast, include/exclude/keep-precision filters, overwrite/self-overwrite/
+  pickle/requantize guards, metadata-only, validation-only, and dry-run.

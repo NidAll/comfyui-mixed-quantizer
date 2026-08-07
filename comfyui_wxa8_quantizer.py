@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""comfyui_wxa8_quantizer.py -- standalone W4A8 / W3A8 generative-model checkpoint converter.
+"""comfyui_wxa8_quantizer.py -- standalone W4A8 generative-model checkpoint converter.
 
 Converts supported generative-model checkpoints (safetensors / sharded safetensors /
 HF-style model directories / optionally torch pickles with --trust-pickle) into a
-ComfyUI-compatible W4A8 ("asym_w4a8_int8") checkpoint, or into the independent W3A8
-extension format ("asym_w3a8_int8") defined by this tool.
+ComfyUI-compatible W4A8 ("asym_w4a8_int8") checkpoint.
 
 This utility is fully standalone.  It does not import, require, or execute any
 ComfyUI / comfy-kitchen / ComfyUI-custom-node code at runtime.  Every inspection,
@@ -106,22 +105,10 @@ W4A8 numerical representation ("asym_w4a8_int8", verified against the eager back
   * Group sizes accepted by the CUDA dequant kernel: G in {4, 8, 16} or a
     multiple of 16 (a 16-wide vector spans at most 4 groups).
 
-W3A8 (extension format defined by THIS tool; NOT supported by ComfyUI or
-comfy-kitchen at the research revisions above):
-  * format id "asym_w3a8_int8"; same ConvRot framework; 8-entry symmetric
-    Lloyd-Max codebook; per-group fp8_e4m3fn relative scale; per-channel fp32
-    scale; int8 decode grid; independent 3-bit packing (8 codes per 3 bytes,
-    little-endian bit interleave, see pack_w3 below); qdata shape [N, K*3//8].
-  * This is an independent numerical representation, NOT a renamed W4A8.
-  * Runtime compatibility: none upstream; loading a W3A8 checkpoint requires the
-    optional revision-aware runtime patch emitted by --emit-patch.  That is stated
-    in the output metadata and in every report.
-
 ------------------------------------------------------------------------------
 Usage
 ------------------------------------------------------------------------------
     python comfyui_wxa8_quantizer.py ORIGINAL_MODEL --output OUT --format w4a8
-    python comfyui_wxa8_quantizer.py ORIGINAL_MODEL --output OUT --format w3a8
     python comfyui_wxa8_quantizer.py --self-test
     python comfyui_wxa8_quantizer.py --list-architectures
 
@@ -169,11 +156,9 @@ except Exception as _exc:  # pragma: no cover - import guard
 # Version / revision constants (research record; see module docstring)
 # ---------------------------------------------------------------------------
 CONVERTER_NAME = "comfyui_wxa8_quantizer"
-CONVERTER_VERSION = "1.0.0"
+CONVERTER_VERSION = "1.1.0"
 FORMAT_W4A8 = "asym_w4a8_int8"
-FORMAT_W3A8 = "asym_w3a8_int8"
 FORMAT_W4A8_REVISION = "asym-w4a8-int8-r1"
-FORMAT_W3A8_REVISION = "asym-w3a8-int8-r1"
 METADATA_KEY_QUANT = "_quantization_metadata"     # official key read by ComfyUI
 METADATA_KEY_EXT = "comfy_wxa8"                   # namespaced extension key (never official)
 LAYER_CONF_KEY = "comfy_quant"                    # per-layer blob key used by ComfyUI loader
@@ -879,7 +864,7 @@ def rotate_int8_convrot_weight(weight: torch.Tensor, group_size: int) -> torch.T
 def pick_convrot_group_size(k: int, max_group: int = 256) -> int:
     """Largest power-of-4 divisor of K that is <= max_group (>= 4).
 
-    K % 16 == 0 is guaranteed by the W4A8/W3A8 shape rules, so 4 always divides K.
+    K % 16 == 0 is guaranteed by the W4A8 shape rules, so 4 always divides K.
     """
     for g in (max_group, max_group // 4, max_group // 16, max_group // 64, 4):
         if g >= 4 and k % g == 0:
@@ -889,19 +874,18 @@ def pick_convrot_group_size(k: int, max_group: int = 256) -> int:
 # ---------------------------------------------------------------------------
 # Shape validation (W4A8: port of validate_w4a8_weight_shape / operands)
 # ---------------------------------------------------------------------------
-def validate_w4_shape(k: int, group_size: int, convrot_groupsize: int, bits: int = 4) -> None:
+def validate_w4_shape(k: int, group_size: int, convrot_groupsize: int) -> None:
     if k % 16 != 0:
-        raise PolicyError(f"K={k} must be divisible by 16 for {bits}-bit packing")
+        raise PolicyError(f"K={k} must be divisible by 16 for 4-bit packing")
     if k % group_size != 0:
         raise PolicyError(f"K={k} must be divisible by group_size={group_size}")
     if k % convrot_groupsize != 0:
         raise PolicyError(f"K={k} must be divisible by convrot_groupsize={convrot_groupsize}")
     if group_size < 4:
         raise PolicyError(f"group_size must be >= 4, got {group_size}")
-    grid = 16 if bits == 4 else 8
-    if (grid % group_size != 0) and (group_size % grid != 0):
+    if (16 % group_size != 0) and (group_size % 16 != 0):
         raise PolicyError(
-            f"group_size must divide {grid} or be a multiple of {grid}, got {group_size}")
+            f"group_size must divide 16 or be a multiple of 16, got {group_size}")
     if convrot_groupsize < 4 or (convrot_groupsize & (convrot_groupsize - 1)) != 0 \
             or (math.log(convrot_groupsize, 4) % 1) != 0:
         raise PolicyError(
@@ -909,15 +893,14 @@ def validate_w4_shape(k: int, group_size: int, convrot_groupsize: int, bits: int
 
 
 def w4_weight_is_quantizable(shape: Sequence[int], dtype: torch.dtype,
-                             group_size: int, convrot_groupsize: int,
-                             bits: int = 4) -> Tuple[bool, str]:
+                             group_size: int, convrot_groupsize: int) -> Tuple[bool, str]:
     if len(shape) != 2:
         return False, f"not 2D (shape {tuple(shape)})"
     if dtype not in FLOAT_DTYPES:
         return False, f"not a float dtype ({dtype})"
     k = int(shape[1])
     try:
-        validate_w4_shape(k, group_size, convrot_groupsize, bits)
+        validate_w4_shape(k, group_size, convrot_groupsize)
     except PolicyError as e:
         return False, str(e)
     return True, "ok"
@@ -992,7 +975,7 @@ def quantize_w4a8_weight(weight: torch.Tensor, group_size: int = 16,
     """
     if scale_dtype not in (torch.float32, torch.float8_e4m3fn):
         raise PolicyError(f"scale_dtype must be float32 or float8_e4m3fn, got {scale_dtype}")
-    validate_w4_shape(int(weight.shape[1]), group_size, convrot_groupsize, bits=4)
+    validate_w4_shape(int(weight.shape[1]), group_size, convrot_groupsize)
     rotated = rotate_int8_convrot_weight(weight, convrot_groupsize)
     return _quantize_rotated_w4a8(rotated, group_size, symmetric, scale_dtype, codebook)
 
@@ -1080,7 +1063,7 @@ def dequantize_w4a8_weight(packed: torch.Tensor, s_rel: torch.Tensor,
         raise PolicyError("packed weight must be a 2D int8 tensor")
     n, k_half = packed.shape
     k = k_half * 2
-    validate_w4_shape(k, group_size, convrot_groupsize, bits=4)
+    validate_w4_shape(k, group_size, convrot_groupsize)
     groups = k // group_size
     if tuple(s_rel.shape) != (n, groups):
         raise PolicyError(f"s_rel must have shape {(n, groups)}, got {tuple(s_rel.shape)}")
@@ -1107,169 +1090,32 @@ def dequantize_w4a8_weight(packed: torch.Tensor, s_rel: torch.Tensor,
     return rotate_int8_convrot_weight(weight_rotated, convrot_groupsize).to(output_dtype)
 
 # ---------------------------------------------------------------------------
-# W3A8 -- independent 3-bit extension format (this tool's design; NOT upstream)
-# ---------------------------------------------------------------------------
-def pack_w3(codes: torch.Tensor) -> torch.Tensor:
-    """Pack int32 codes (0..7) [N, K] -> int8 [N, K*3//8] (8 codes / 3 bytes).
-
-    Little-endian 3-bit interleave:
-      byte0 = c0 | c1<<3 | c2<<6
-      byte1 = c2>>2 | c3<<1 | c4<<4 | c5<<7
-      byte2 = c5>>1 | c6<<2 | c7<<5
-    """
-    n, k = codes.shape
-    assert k % 8 == 0, "K must be divisible by 8 for 3-bit packing"
-    c = codes.reshape(n, k // 8, 8).to(torch.int32)
-    c0, c1, c2, c3, c4, c5, c6, c7 = c.unbind(-1)
-    b0 = c0 | (c1 << 3) | (c2 << 6)
-    b1 = (c2 >> 2) | (c3 << 1) | (c4 << 4) | (c5 << 7)
-    b2 = (c5 >> 1) | (c6 << 2) | (c7 << 5)
-    packed = torch.stack([b0, b1, b2], dim=-1).reshape(n, k * 3 // 8)
-    return packed.to(torch.int8).contiguous()
-
-
-def unpack_w3(packed: torch.Tensor) -> torch.Tensor:
-    """int8 [N, K*3//8] -> int32 codes [N, K]."""
-    n, nb = packed.shape
-    assert nb % 3 == 0
-    k = nb * 8 // 3
-    p = packed.to(torch.int32).reshape(n, nb // 3, 3) & 0xFF
-    b0, b1, b2 = p.unbind(-1)
-    c0 = b0 & 0x7
-    c1 = (b0 >> 3) & 0x7
-    c2 = ((b0 >> 6) | (b1 << 2)) & 0x7
-    c3 = (b1 >> 1) & 0x7
-    c4 = (b1 >> 4) & 0x7
-    c5 = ((b1 >> 7) | (b2 << 1)) & 0x7
-    c6 = (b2 >> 2) & 0x7
-    c7 = (b2 >> 5) & 0x7
-    codes = torch.stack([c0, c1, c2, c3, c4, c5, c6, c7], dim=-1).reshape(n, k)
-    return codes
-
-
-def quantize_w3a8_weight(weight: torch.Tensor, group_size: int = 16,
-                         convrot_groupsize: int = 256,
-                         scale_dtype: torch.dtype = torch.float8_e4m3fn,
-                         ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Quantize a floating 2D weight into the W3A8 extension format.
-
-    Returns (packed, s_rel, s_channel, codebook8).  Independent representation:
-    8-entry symmetric Lloyd-Max codebook + fp8 group scales + int8 decode grid.
-    """
-    if scale_dtype not in (torch.float32, torch.float8_e4m3fn):
-        raise PolicyError(f"scale_dtype must be float32 or float8_e4m3fn, got {scale_dtype}")
-    validate_w4_shape(int(weight.shape[1]), group_size, convrot_groupsize, bits=3)
-    rotated = rotate_int8_convrot_weight(weight, convrot_groupsize)
-    return _quantize_rotated_w3a8(rotated, group_size, scale_dtype)
-
-
-def _quantize_rotated_w3a8(weight: torch.Tensor, group_size: int,
-                           scale_dtype: torch.dtype,
-                           ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    n, k = weight.shape
-    groups = k // group_size
-    grouped = weight.float().view(n, groups, group_size)
-
-    # symmetric 8-level Lloyd-Max codebook on normalized weights (data-free)
-    group_scale = grouped.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
-    normalized = grouped / group_scale
-    codebook = fit_codebook(normalized, levels=8)
-    quantized = assign_codes(normalized, codebook)          # 0..7
-    for _ in range(3):
-        qc = codebook[quantized]
-        group_scale = (
-            (grouped * qc).sum(-1, keepdim=True)
-            / (qc * qc).sum(-1, keepdim=True).clamp(min=1e-8)
-        ).clamp(min=1e-8)
-        quantized = assign_codes(grouped / group_scale, codebook)
-
-    shifted = codebook[quantized] * group_scale
-    s_channel = (shifted.abs().amax(dim=(1, 2)) / 127.0).clamp(min=1e-8)
-    s_rel = (group_scale.squeeze(-1) / s_channel.unsqueeze(1)).float().contiguous()
-    if scale_dtype != torch.float32:
-        s_rel = s_rel.to(scale_dtype).contiguous()
-
-    # re-assign codes against the actual int8 decode grid
-    levels = (codebook.view(1, 1, 8) * s_rel.float().unsqueeze(-1)).round_().clamp_(-127, 127)
-    target = grouped / s_channel.view(-1, 1, 1)
-    best = (target - levels[..., 0:1].expand_as(grouped)).abs()
-    indices = torch.zeros_like(grouped, dtype=torch.int32)
-    for index in range(1, 8):
-        distance = (target - levels[..., index:index + 1].expand_as(grouped)).abs()
-        closer = distance < best
-        best = torch.where(closer, distance, best)
-        indices = torch.where(closer, index, indices)
-    codes = indices.reshape(n, k)
-
-    packed = pack_w3(codes)
-    return packed, s_rel, s_channel.float().contiguous(), codebook.float().contiguous()
-
-
-def dequantize_w3a8_weight(packed: torch.Tensor, s_rel: torch.Tensor,
-                           s_channel: torch.Tensor, codebook: torch.Tensor,
-                           group_size: int = 16, convrot_groupsize: int = 256,
-                           output_dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
-    """Decode W3A8 storage back to the physical [N, K] weight."""
-    n, nb = packed.shape
-    if packed.dtype != torch.int8 or packed.dim() != 2:
-        raise PolicyError("packed W3A8 weight must be a 2D int8 tensor")
-    k = nb * 8 // 3
-    if nb % 3 != 0:
-        raise PolicyError("W3A8 packed width must be divisible by 3 bytes")
-    validate_w4_shape(k, group_size, convrot_groupsize, bits=3)
-    groups = k // group_size
-    if tuple(s_rel.shape) != (n, groups):
-        raise PolicyError(f"s_rel must have shape {(n, groups)}, got {tuple(s_rel.shape)}")
-    if tuple(s_channel.shape) != (n,):
-        raise PolicyError(f"s_channel must have shape {(n,)}, got {tuple(s_channel.shape)}")
-    if tuple(codebook.shape) != (8,):
-        raise PolicyError(f"codebook must have shape (8,), got {tuple(codebook.shape)}")
-
-    codes = unpack_w3(packed)
-    values = codebook.to(device=packed.device, dtype=torch.float32)[codes]
-    values = values.view(n, groups, group_size) * s_rel.float().unsqueeze(-1)
-    int8_weight = values.view(n, k).round().clamp_(-127, 127).to(torch.int8)
-    weight_rotated = int8_weight.float().view(n, groups, group_size) * s_channel.float().view(n, 1, 1)
-    weight_rotated = weight_rotated.view(n, k)
-    return rotate_int8_convrot_weight(weight_rotated, convrot_groupsize).to(output_dtype)
-
-
 def quantize_weight_by_format(weight: torch.Tensor, fmt: str, group_size: int,
                               convrot_groupsize: int) -> Dict[str, torch.Tensor]:
-    """Dispatch to W4A8 or W3A8; returns the per-layer output tensors
+    """Quantize with the W4A8 layout; returns the per-layer output tensors
     keyed by suffix ('' for the packed weight, '_s_rel', '_s_channel',
     '_codebook', optional '_correction')."""
-    if fmt == FORMAT_W4A8:
-        packed, s_rel, s_ch, corr, cb = quantize_w4a8_weight(
-            weight, group_size=group_size, convrot_groupsize=convrot_groupsize,
-            symmetric=True, scale_dtype=torch.float8_e4m3fn, codebook=True)
-        out = {"": packed, "_s_rel": s_rel, "_s_channel": s_ch, "_codebook": cb}
-        if corr is not None:
-            out["_correction"] = corr
-        return out
-    elif fmt == FORMAT_W3A8:
-        packed, s_rel, s_ch, cb = quantize_w3a8_weight(
-            weight, group_size=group_size, convrot_groupsize=convrot_groupsize,
-            scale_dtype=torch.float8_e4m3fn)
-        return {"": packed, "_s_rel": s_rel, "_s_channel": s_ch, "_codebook": cb}
-    raise PolicyError(f"unknown quantization format {fmt!r}")
+    if fmt != FORMAT_W4A8:
+        raise PolicyError(f"unknown quantization format {fmt!r}")
+    packed, s_rel, s_ch, corr, cb = quantize_w4a8_weight(
+        weight, group_size=group_size, convrot_groupsize=convrot_groupsize,
+        symmetric=True, scale_dtype=torch.float8_e4m3fn, codebook=True)
+    out = {"": packed, "_s_rel": s_rel, "_s_channel": s_ch, "_codebook": cb}
+    if corr is not None:
+        out["_correction"] = corr
+    return out
 
 
 def dequantize_weight_by_format(tensors: Dict[str, torch.Tensor], fmt: str,
                                 group_size: int, convrot_groupsize: int,
                                 output_dtype: torch.dtype) -> torch.Tensor:
-    if fmt == FORMAT_W4A8:
-        return dequantize_w4a8_weight(
-            tensors[""], tensors["_s_rel"], tensors["_s_channel"],
-            codebook=tensors.get("_codebook"), correction=tensors.get("_correction"),
-            group_size=group_size, convrot_groupsize=convrot_groupsize,
-            output_dtype=output_dtype)
-    elif fmt == FORMAT_W3A8:
-        return dequantize_w3a8_weight(
-            tensors[""], tensors["_s_rel"], tensors["_s_channel"], tensors["_codebook"],
-            group_size=group_size, convrot_groupsize=convrot_groupsize,
-            output_dtype=output_dtype)
-    raise PolicyError(f"unknown quantization format {fmt!r}")
+    if fmt != FORMAT_W4A8:
+        raise PolicyError(f"unknown quantization format {fmt!r}")
+    return dequantize_w4a8_weight(
+        tensors[""], tensors["_s_rel"], tensors["_s_channel"],
+        codebook=tensors.get("_codebook"), correction=tensors.get("_correction"),
+        group_size=group_size, convrot_groupsize=convrot_groupsize,
+        output_dtype=output_dtype)
 
 
 
@@ -2014,7 +1860,7 @@ for _fam, _cls in (("rt_detr_v4", ("RT_DETR_v4",)),
         quantize=(), keep=(), exclude=UNIVERSAL_EXCLUDE,
         runtime_status="unsupported",
         notes="Perception model: ComfyUI loads it through its own node, not through "
-              "the mixed-precision (quantized) loader; W4A8/W3A8 output would not "
+              "the mixed-precision (quantized) loader; W4A8 output would not "
               "be consumable. Conversion refused unless --architecture forces it.",
     ))
 
@@ -2497,8 +2343,7 @@ def classify_tensors(info: CheckpointInfo, detection: DetectionResult,
         # shape / dtype gates
         ok, why = w4_weight_is_quantizable(meta.shape, meta.dtype, group_size,
                                            pick_convrot_group_size(int(meta.shape[1]), policy.convrot_max)
-                                           if len(meta.shape) == 2 else 256,
-                                           bits=4 if fmt == FORMAT_W4A8 else 3)
+                                           if len(meta.shape) == 2 else 256)
         if not ok:
             decisions.append(TensorDecision(name, DecisionKind.KEEP, f"not quantizable: {why}; passthrough"))
             continue
@@ -2569,7 +2414,7 @@ def build_output_entries(info: CheckpointInfo, decisions: List[TensorDecision],
 # ---------------------------------------------------------------------------
 # Calibration (standalone; framework-independent local data)
 # ---------------------------------------------------------------------------
-# Calibration is OPTIONAL.  The W4A8/W3A8 reference formats are calibration-free
+# Calibration is OPTIONAL.  The W4A8 reference format is calibration-free
 # (per-group absmax scales); calibration data is used here only for
 #  (a) activation-aware sensitivity analysis (keep-precision selection) and
 #  (b) provenance reporting.
@@ -2977,40 +2822,9 @@ def _quantize_rotated_w4a8_with_codebook(weight: torch.Tensor, group_size: int,
     return packed, s_rel, s_channel.float().contiguous(), codebook
 
 
-def _quantize_rotated_w3a8_with_codebook(weight: torch.Tensor, group_size: int,
-                                         codebook: torch.Tensor,
-                                         scale_dtype: torch.dtype = torch.float8_e4m3fn,
-                                         ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    n, k = weight.shape
-    groups = k // group_size
-    grouped = weight.float().view(n, groups, group_size)
-    group_scale = grouped.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
-    quantized = assign_codes(grouped / group_scale, codebook)
-    for _ in range(3):
-        qc = codebook[quantized]
-        group_scale = ((grouped * qc).sum(-1, keepdim=True)
-                       / (qc * qc).sum(-1, keepdim=True).clamp(min=1e-8)).clamp(min=1e-8)
-        quantized = assign_codes(grouped / group_scale, codebook)
-    shifted = codebook[quantized] * group_scale
-    s_channel = (shifted.abs().amax(dim=(1, 2)) / 127.0).clamp(min=1e-8)
-    s_rel = (group_scale.squeeze(-1) / s_channel.unsqueeze(1)).float().contiguous()
-    if scale_dtype != torch.float32:
-        s_rel = s_rel.to(scale_dtype).contiguous()
-    levels = (codebook.view(1, 1, 8) * s_rel.float().unsqueeze(-1)).round_().clamp_(-127, 127)
-    target = grouped / s_channel.view(-1, 1, 1)
-    best = (target - levels[..., 0:1].expand_as(grouped)).abs()
-    indices = torch.zeros_like(grouped, dtype=torch.int32)
-    for index in range(1, 8):
-        distance = (target - levels[..., index:index + 1].expand_as(grouped)).abs()
-        closer = distance < best
-        best = torch.where(closer, distance, best)
-        indices = torch.where(closer, index, indices)
-    packed = pack_w3(indices.reshape(n, k))
-    return packed, s_rel, s_channel.float().contiguous(), codebook
-
 
 def _gather_codebook_samples(reader: CheckpointReader, name: str, k: int,
-                             fmt: str, group_size: int, convrot_groupsize: int,
+                             group_size: int, convrot_groupsize: int,
                              sample_size: int, chunk_rows: int,
                              device: Any = "cpu") -> torch.Tensor:
     """Deterministic subsample of normalized rotated weights for codebook fitting.
@@ -3047,7 +2861,7 @@ def _gather_codebook_samples(reader: CheckpointReader, name: str, k: int,
     cat = torch.cat(samples)
     # identical fit to fit_codebook (already subsampled)
     cat = cat.float()
-    codebook = torch.quantile(cat, torch.linspace(0, 1, 16 if fmt == FORMAT_W4A8 else 8, device=cat.device))
+    codebook = torch.quantile(cat, torch.linspace(0, 1, 16, device=cat.device))
     for _ in range(25):
         assignments = (cat.unsqueeze(-1) - codebook).abs().argmin(-1)
         updated = codebook.clone()
@@ -3072,7 +2886,6 @@ def quantize_tensor_bounded(reader: CheckpointReader, name: str, fmt: str,
     meta = reader.info.by_name(name)
     n, k = int(meta.shape[0]), int(meta.shape[1])
     full_bytes = meta.nbytes
-    bits = 4 if fmt == FORMAT_W4A8 else 3
     # working set estimate for the in-memory path: ~12 bytes per element worst case
     work_bytes = full_bytes * (12 // max(meta.dtype.itemsize, 1))
     if work_bytes <= max_mem:
@@ -3093,7 +2906,7 @@ def quantize_tensor_bounded(reader: CheckpointReader, name: str, fmt: str,
                name, human_bytes(full_bytes), human_bytes(max_mem))
     chunk_rows = max(1, int(max_mem / (k * 12)))   # ~12 bytes/elem working set
     chunk_rows = min(chunk_rows, n)
-    codebook = _gather_codebook_samples(reader, name, k, fmt, group_size,
+    codebook = _gather_codebook_samples(reader, name, k, group_size,
                                         convrot_groupsize, 300000, chunk_rows, device="cpu")
     # per-chunk processing
     packed_parts: List[torch.Tensor] = []
@@ -3107,12 +2920,8 @@ def quantize_tensor_bounded(reader: CheckpointReader, name: str, fmt: str,
         if device != "cpu" and device.type == "cuda":
             chunk = chunk.to(device)
         rot = rotate_int8_convrot_weight(chunk, convrot_groupsize)
-        if fmt == FORMAT_W4A8:
-            p, s_rel, s_ch, cb = _quantize_rotated_w4a8_with_codebook(
-                rot, group_size, codebook.to(device=rot.device))
-        else:
-            p, s_rel, s_ch, cb = _quantize_rotated_w3a8_with_codebook(
-                rot, group_size, codebook.to(device=rot.device))
+        p, s_rel, s_ch, cb = _quantize_rotated_w4a8_with_codebook(
+            rot, group_size, codebook.to(device=rot.device))
         packed_parts.append(p.cpu() if device != "cpu" else p)
         s_rel_parts.append(s_rel.cpu() if device != "cpu" else s_rel)
         s_ch_parts.append(s_ch.cpu() if device != "cpu" else s_ch)
@@ -3385,9 +3194,6 @@ def build_quant_metadata(info: CheckpointInfo, plan: ConversionPlan) -> Dict[str
             "convrot": True,
             "convrot_groupsize": d.convrot_groupsize,
         }
-        if plan.fmt == FORMAT_W3A8:
-            layers[d.layer]["codebook_size"] = 8
-            layers[d.layer]["packing"] = "3bit-lsb"
     return {"layers": layers}
 
 
@@ -3407,7 +3213,7 @@ def build_extension_metadata(info: CheckpointInfo, plan: ConversionPlan,
         "converter": CONVERTER_NAME,
         "converter_version": CONVERTER_VERSION,
         "format": plan.fmt,
-        "format_revision": FORMAT_W4A8_REVISION if plan.fmt == FORMAT_W4A8 else FORMAT_W3A8_REVISION,
+        "format_revision": FORMAT_W4A8_REVISION,
         "architecture": d.architecture,
         "detection_confidence": d.confidence,
         "unet_prefix": d.unet_prefix,
@@ -3418,14 +3224,14 @@ def build_extension_metadata(info: CheckpointInfo, plan: ConversionPlan,
             "sha256": input_hashes,
         },
         "quantization": {
-            "weight_bits": 4 if plan.fmt == FORMAT_W4A8 else 3,
+            "weight_bits": 4,
             "activation_bits": 8,
             "weight_quantization": "per-group asymmetric codebook (Lloyd-Max, symmetric)",
             "group_size": quant_layers[0].group_size if quant_layers else None,
             "convrot": True,
             "convrot_groupsize": quant_layers[0].convrot_groupsize if quant_layers else None,
             "scale_dtype": "fp8_e4m3fn",
-            "packing": "int4-nibble-lsb" if plan.fmt == FORMAT_W4A8 else "3bit-lsb (8 codes/3 bytes)",
+            "packing": "int4-nibble-lsb",
             "symmetric": True,
             "n_quantized_layers": len(quant_layers),
             "n_kept_tensors": plan.n_kept,
@@ -3451,7 +3257,7 @@ def build_extension_metadata(info: CheckpointInfo, plan: ConversionPlan,
                 "required_revision": COMFY_KITCHEN_REV,
                 "pr": 90,
                 "merged": True,
-                "layout": "AsymW4A8Int8Layout" if plan.fmt == FORMAT_W4A8 else "AsymW3A8Int8Layout (extension)",
+                "layout": "AsymW4A8Int8Layout",
             },
             "comfyui": {
                 "required_pr": COMFYUI_PR,
@@ -3460,10 +3266,6 @@ def build_extension_metadata(info: CheckpointInfo, plan: ConversionPlan,
                 "note": "ComfyUI PR #15308 (asym_w4a8_int8 loader) is NOT merged into "
                         "master as of base commit " + COMFYUI_BASE,
             },
-            "w3a8_runtime": (
-                "requires the revision-aware runtime patch emitted by --emit-patch; "
-                "no upstream ComfyUI/comfy-kitchen support exists"
-                if plan.fmt == FORMAT_W3A8 else "n/a"),
             "cuda_backend": {
                 "requires": "PyTorch cu130+, SM >= 8.0",
                 "min_sm": list(W4A8_KERNEL_MIN_SM),
@@ -3621,16 +3423,10 @@ class Validator:
                     orig = self.info.by_name(d.name)
                     if orig is not None and reader is not None:
                         orig_t = reader.read_tensor(d.name).float()
-                        if self.plan.fmt == FORMAT_W4A8:
-                            dq = dequantize_w4a8_weight(packed, s_rel, s_ch, codebook=cb,
-                                                        group_size=d.group_size,
-                                                        convrot_groupsize=d.convrot_groupsize,
-                                                        output_dtype=torch.float32)
-                        else:
-                            dq = dequantize_w3a8_weight(packed, s_rel, s_ch, cb,
-                                                        group_size=d.group_size,
-                                                        convrot_groupsize=d.convrot_groupsize,
-                                                        output_dtype=torch.float32)
+                        dq = dequantize_w4a8_weight(packed, s_rel, s_ch, codebook=cb,
+                                                    group_size=d.group_size,
+                                                    convrot_groupsize=d.convrot_groupsize,
+                                                    output_dtype=torch.float32)
                         m = compute_weight_metrics(orig_t, dq)
                         worst[d.layer] = m.rel_l2
                         if m.rel_l2 > self.plan.detection.policy.max_rel_l2:
@@ -3643,12 +3439,8 @@ class Validator:
                             self.check(f"recon-{d.layer[:60]}", True,
                                        f"relL2={m.rel_l2:.4f} snr={m.snr_db:.1f}dB cos={m.cosine:.4f}")
                         # packing round trip
-                        if self.plan.fmt == FORMAT_W4A8:
-                            rt = unpack_w4(packed)
-                            repacked = ((rt[:, 0::2] & 0xF) | ((rt[:, 1::2] & 0xF) << 4)).to(torch.int8)
-                        else:
-                            rt = unpack_w3(packed)
-                            repacked = pack_w3(rt)
+                        rt = unpack_w4(packed)
+                        repacked = ((rt[:, 0::2] & 0xF) | ((rt[:, 1::2] & 0xF) << 4)).to(torch.int8)
                         rt_ok = bool(torch.equal(repacked, packed))
                         self.check(f"pack-rt-{d.layer[:60]}", rt_ok, "pack/unpack round trip")
                 except Exception as e:
@@ -3843,17 +3635,15 @@ def build_report(info: CheckpointInfo, plan: ConversionPlan, env: EnvironmentInf
                  input_hashes: Dict[str, str], output_sha256: str,
                  elapsed: float, warnings: List[str],
                  quant_rows: List[str]) -> Dict[str, Any]:
-    comp = []
-    if plan.fmt == FORMAT_W4A8:
-        comp.append("comfy-kitchen >= %s (PR #90, merged) with AsymW4A8Int8Layout" % COMFY_KITCHEN_REV)
-        comp.append("ComfyUI >= PR #%d head %s (NOT merged into master at base %s)" % (
-            COMFYUI_PR, COMFYUI_PR_HEAD, COMFYUI_BASE))
-        comp.append("CUDA: PyTorch cu130+, SM >= 8.0; ROCm: triton >= 3.7; eager works anywhere")
-    else:
-        comp.append("W3A8 extension: no upstream runtime; requires --emit-patch runtime patch")
+    comp = [
+        "comfy-kitchen >= %s (PR #90, merged) with AsymW4A8Int8Layout" % COMFY_KITCHEN_REV,
+        "ComfyUI >= PR #%d head %s (NOT merged into master at base %s)" % (
+            COMFYUI_PR, COMFYUI_PR_HEAD, COMFYUI_BASE),
+        "CUDA: PyTorch cu130+, SM >= 8.0; ROCm: triton >= 3.7; eager works anywhere",
+    ]
     return {
         "converter": CONVERTER_NAME, "converter_version": CONVERTER_VERSION,
-        "format": plan.fmt, "format_revision": FORMAT_W4A8_REVISION if plan.fmt == FORMAT_W4A8 else FORMAT_W3A8_REVISION,
+        "format": plan.fmt, "format_revision": FORMAT_W4A8_REVISION,
         "architecture": result.architecture, "detection_confidence": result.confidence,
         "unet_prefix": result.unet_prefix,
         "detection_evidence": result.evidence, "detection_hints": result.hints,
@@ -3876,79 +3666,6 @@ def build_report(info: CheckpointInfo, plan: ConversionPlan, env: EnvironmentInf
 
 
 # ---------------------------------------------------------------------------
-# W3A8 runtime compatibility patch (optional; revision-aware)
-# ---------------------------------------------------------------------------
-PATCH_HEADER = """# W3A8 runtime compatibility patch (generated by %s %s)
-# -----------------------------------------------------------------------------
-# Adds AsymW3A8Int8Layout (the "asym_w3a8_int8" 3-bit extension format) to a
-# comfy-kitchen checkout at merge commit aa1ab2263dc06225d9de6702dfc087313d4bc971
-# (PR #90) and registers it with ComfyUI PR #15308's loader (head
-# b6578f2ae11ab3dea3156ed68d8724476cda1232).
-#
-# APPLY WITH:  patch -p1 < %s
-# The converted W3A8 checkpoint is NOT loadable without this patch.
-# -----------------------------------------------------------------------------
-"""
-
-_PATCH_BLOB = """
-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
-"""
-
-
-def emit_w3a8_patch(path: str) -> None:
-    if os.path.exists(path):
-        raise OutputError(f"patch target already exists: {path}")
-    import base64 as _b64, zlib as _zlib
-    body = _zlib.decompress(_b64.b64decode(_PATCH_BLOB)).decode("utf-8")
-    text = PATCH_HEADER % (CONVERTER_NAME, CONVERTER_VERSION, os.path.basename(path)) + body
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text)
-    log().info("wrote W3A8 runtime patch to %s", path)
-
-
-
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -3956,9 +3673,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="comfyui_wxa8_quantizer.py",
         description=(
-            "Standalone W4A8/W3A8 checkpoint converter for ComfyUI-compatible "
-            "generative models. See the module docstring for the verified format "
-            "specification and exact source revisions."),
+            "Standalone W4A8 checkpoint converter for ComfyUI-compatible generative "
+            "models. See the module docstring for the verified format specification "
+            "and exact source revisions."),
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("model", nargs="?", metavar="ORIGINAL_MODEL",
                    help="path to the original checkpoint: a .safetensors file, a "
@@ -3966,9 +3683,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "or (with --trust-pickle) a torch pickle checkpoint")
     p.add_argument("--output", metavar="PATH", default=None,
                    help="output checkpoint path (required for conversion)")
-    p.add_argument("--format", choices=["w4a8", "w3a8"], default=None,
-                   help="quantization format: w4a8 (ComfyUI reference format) or "
-                        "w3a8 (independent 3-bit extension format)")
+    p.add_argument("--format", choices=["w4a8"], default="w4a8",
+                   help="quantization format (only the ComfyUI reference w4a8 "
+                        "format is supported)")
     p.add_argument("--architecture", default="auto",
                    help="auto or an architecture name from --list-architectures")
     p.add_argument("--device", choices=["auto", "cpu", "cuda", "rocm"], default="auto",
@@ -4037,13 +3754,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--yes", action="store_true", help="assume yes for confirmations")
     p.add_argument("--self-test", action="store_true",
                    help="run the embedded engineering self-tests and exit")
-    p.add_argument("--emit-patch", metavar="PATH", default=None,
-                   help="write the optional revision-aware W3A8 runtime patch to PATH")
     return p
 
 
 def _fmt_display(fmt: Optional[str]) -> Optional[str]:
-    return {FORMAT_W4A8: "w4a8", FORMAT_W3A8: "w3a8"}.get(fmt, fmt)
+    return {FORMAT_W4A8: "w4a8"}.get(fmt, fmt)
 
 
 def plan_from_output(output_path: str, detection: DetectionResult,
@@ -4097,7 +3812,6 @@ def run_self_tests() -> int:
     log().info("running embedded self-tests ...")
     tests: List[Tuple[str, Callable[[], str]]] = [
         ("w4-pack-roundtrip", _test_w4_pack_roundtrip),
-        ("w3-pack-roundtrip", _test_w3_pack_roundtrip),
         ("odd-dims", _test_odd_dims),
         ("padding-removal", _test_padding_removal),
         ("scale-calculations", _test_scale_calculations),
@@ -4110,7 +3824,6 @@ def run_self_tests() -> int:
         ("resume-state-recovery", _test_resume),
         ("atomic-output", _test_atomic),
         ("end-to-end-mini-model-w4a8", _test_e2e_mini_model_w4a8),
-        ("end-to-end-mini-model-w3a8", _test_e2e_mini_model_w3a8),
     ]
     failed = 0
     try:
@@ -4176,17 +3889,6 @@ def _test_w4_pack_roundtrip() -> str:
     return "K=16..256 round trips"
 
 
-def _test_w3_pack_roundtrip() -> str:
-    torch.manual_seed(2)
-    for k in (16, 32, 48, 128, 256):
-        codes = torch.randint(0, 8, (7, k), dtype=torch.int32)
-        packed = pack_w3(codes)
-        assert packed.shape == (7, k * 3 // 8), packed.shape
-        rt = unpack_w3(packed)
-        assert torch.equal(rt, codes), f"K={k} mismatch"
-    return "K=16..256 round trips (8 codes/3 bytes)"
-
-
 def _test_odd_dims() -> str:
     torch.manual_seed(3)
     # odd N, K=48 (divisible by 16 but not by 32)
@@ -4196,13 +3898,7 @@ def _test_odd_dims() -> str:
     dq = dequantize_w4a8_weight(p, s_rel, s_ch, codebook=cb, group_size=16,
                                 convrot_groupsize=16, output_dtype=torch.float32)
     assert dq.shape == (17, 48)
-    # W3A8 with K=48
-    p3, sr3, sc3, cb3 = quantize_w3a8_weight(w, group_size=16, convrot_groupsize=16)
-    assert p3.shape == (17, 18)
-    dq3 = dequantize_w3a8_weight(p3, sr3, sc3, cb3, group_size=16,
-                                 convrot_groupsize=16, output_dtype=torch.float32)
-    assert dq3.shape == (17, 48)
-    return "N=17, K=48 (w4 + w3)"
+    return "N=17, K=48 (w4)"
 
 
 def _test_padding_removal() -> str:
@@ -4482,25 +4178,10 @@ def _test_e2e_mini_model_w4a8() -> str:
     return f"{plan.n_quantized} quantized layers; metadata embedded; file reopens"
 
 
-def _test_e2e_mini_model_w3a8() -> str:
-    d = _tmpdir()
-    out = os.path.join(d, "out_w3a8.safetensors")
-    args, plan, info, det = _run_mini_convert(out, FORMAT_W3A8)
-    with safe_open(out, framework="pt") as st:
-        qm = json.loads(st.metadata()["_quantization_metadata"])
-        assert len(qm["layers"]) == plan.n_quantized
-        layer = plan.quantized_layers()[0].layer
-        w = st.get_tensor(layer + ".weight")
-        k = info.by_name(plan.quantized_layers()[0].name).shape[1]
-        assert w.dtype == torch.int8 and w.shape[1] == k * 3 // 8, (w.shape, k)
-        assert st.get_tensor(layer + ".weight_codebook").shape == (8,)
-    return f"{plan.n_quantized} quantized layers; 3-bit packing verified"
-
-
 def _selftest_args(out: str, fmt: str, resume: bool = False, overwrite: bool = False,
                    extra: Optional[Dict[str, Any]] = None) -> argparse.Namespace:
     ns = argparse.Namespace(
-        output=out, format="w4a8" if fmt == FORMAT_W4A8 else "w3a8",
+        output=out, format="w4a8",
         architecture="auto", device="cpu", compute_dtype="auto", output_dtype="auto",
         group_size=None, calibration_source=None, calibration_samples=None,
         calibration_cache=None, seed=0, include=[], exclude=[], keep_precision=[], min_numel_override=None,
@@ -4508,7 +4189,7 @@ def _selftest_args(out: str, fmt: str, resume: bool = False, overwrite: bool = F
         streaming=True, resume=resume, overwrite=overwrite, dry_run=False,
         inspect=False, validate=False, validation_only=False, metadata_only=False,
         report=None, log_level="warning", json_log=None, trust_pickle=False,
-        yes=True, self_test=False, emit_patch=None, model=None)
+        yes=True, self_test=False, model=None)
     if extra:
         for k, v in extra.items():
             setattr(ns, k, v)
@@ -4533,8 +4214,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         print()
         print("W4A8 = reference 'asym_w4a8_int8' format (comfy-kitchen PR #90, "
               "ComfyUI PR #15308).")
-        print("W3A8 = independent 3-bit extension format defined by this tool "
-              "(requires the --emit-patch runtime patch).")
         return 0
 
     if args.self_test:
@@ -4611,7 +4290,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.validation_only:
         if not args.output or not os.path.exists(args.output):
             parser.error("--validation-only requires an existing --output file")
-        fmt = FORMAT_W4A8 if args.format in (None, "w4a8") else FORMAT_W3A8
+        fmt = FORMAT_W4A8
         plan = plan_from_output(args.output, detection, fmt)
         validator = Validator(info, plan, args.output, args, env)
         summary = validator.run(reader=CheckpointReader(info))
@@ -4621,18 +4300,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         _write_reports(args, report)
         return 0 if summary["n_failed"] == 0 else 2
 
-    if args.format is None:
-        parser.error("--format is required (w4a8 or w3a8)")
-    fmt = FORMAT_W4A8 if args.format == "w4a8" else FORMAT_W3A8
-
-    # the W3A8 runtime patch is an independent deliverable: emit it before any
-    # conversion work (it does not depend on the checkpoint)
-    if args.emit_patch:
-        if fmt == FORMAT_W3A8:
-            emit_w3a8_patch(args.emit_patch)
-        else:
-            log().info("--emit-patch is only needed for the w3a8 format; skipping")
-        args.emit_patch = None
+    fmt = FORMAT_W4A8
 
     if args.output is None:
         parser.error("--output is required")

@@ -24,17 +24,16 @@ JSON string, shape:
 * This is the exact shape produced by the reference tooling and consumed by ComfyUI's
   `comfy/utils.py::convert_old_quants`, which converts it into per-layer
   `{layer}.comfy_quant` JSON blobs that `comfy/ops.py::_load_quantized_module`
-  (PR #15308) reads. For W3A8 the same structure is used with
-  `"format": "asym_w3a8_int8"` plus `"codebook_size": 8` and `"packing": "3bit-lsb"`.
+  (PR #15308) reads.
 
 ### Per-layer tensors (verified names)
 
 | key | dtype | shape | meaning |
 |---|---|---|---|
-| `{layer}.weight` | int8 | `[N, K/2]` (w4) / `[N, K*3//8]` (w3) | packed codes |
+| `{layer}.weight` | int8 | `[N, K/2]` | packed int4 codes |
 | `{layer}.weight_s_rel` | fp8_e4m3fn | `[N, K/group_size]` | per-group relative scale |
 | `{layer}.weight_s_channel` | fp32 | `[N]` | per-output-channel scale |
-| `{layer}.weight_codebook` | fp32 | `[16]` (w4) / `[8]` (w3) | Lloyd-Max codebook |
+| `{layer}.weight_codebook` | fp32 | `[16]` | Lloyd-Max codebook |
 
 All other tensors (biases, norms, embeddings, convs, positionals, heads, buffers)
 pass through under their original names and dtypes.
@@ -102,7 +101,6 @@ pass through under their original names and dtypes.
       "merged": false,
       "note": "ComfyUI PR #15308 is NOT merged into master as of bdcb886a..."
     },
-    "w3a8_runtime": "requires the revision-aware runtime patch emitted by --emit-patch...",
     "cuda_backend": {"requires": "PyTorch cu130+, SM >= 8.0", "min_sm": [8, 0]},
     "triton_backend": {"requires": "triton >= 3.7 (ROCm)"}
   },

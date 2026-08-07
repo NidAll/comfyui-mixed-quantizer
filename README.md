@@ -1,8 +1,8 @@
 # comfyui_wxa8_quantizer.py
 
 A single-file converter that turns supported generative-model checkpoints into
-**W4A8** (`asym_w4a8_int8`) or **W3A8** (`asym_w3a8_int8`) quantized checkpoints for
-use with compatible ComfyUI / comfy-kitchen versions.
+**W4A8** (`asym_w4a8_int8`) quantized checkpoints for use with compatible ComfyUI /
+comfy-kitchen versions.
 
 The script is standalone. It does **not** import, require, or execute any ComfyUI or
 comfy-kitchen code at runtime. Every inspection, detection, quantization, packing,
@@ -34,19 +34,13 @@ cp comfyui_wxa8_quantizer.py /somewhere/on/your/PATH/
 ## Basic usage
 
 ```bash
-# W4A8 (the reference ComfyUI format)
 python comfyui_wxa8_quantizer.py ORIGINAL_MODEL \
     --output QUANTIZED_MODEL \
     --format w4a8
-
-# W3A8 (independent 3-bit extension format defined by this tool)
-python comfyui_wxa8_quantizer.py ORIGINAL_MODEL \
-    --output QUANTIZED_MODEL \
-    --format w3a8
 ```
 
-Only the original model path, the output path and the format are required. All other
-parameters have architecture-specific defaults.
+Only the original model path and the output path are required (`--format` defaults
+to `w4a8`). All other parameters have architecture-specific defaults.
 
 ## Supported inputs
 
@@ -64,7 +58,7 @@ Pickle inputs are always refused without `--trust-pickle`.
 
 | option | meaning |
 |---|---|
-| `--format {w4a8,w3a8}` | quantization format (required) |
+| `--format {w4a8}` | quantization format (default w4a8) |
 | `--architecture auto\|NAME` | architecture override (`--list-architectures`) |
 | `--device auto\|cpu\|cuda\|rocm` | quantization compute device; `auto` = CPU (deterministic, memory-bounded) |
 | `--compute-dtype auto\|fp32\|fp16\|bf16` | precision of the quantization math (default fp32, matches the reference) |
@@ -92,7 +86,6 @@ Pickle inputs are always refused without `--trust-pickle`.
 | `--trust-pickle` | allow pickle inputs (unsafe for untrusted files) |
 | `--yes` | assume yes |
 | `--self-test` | run the embedded engineering self-tests |
-| `--emit-patch PATH` | write the optional revision-aware W3A8 runtime patch |
 
 ## Examples
 
@@ -101,9 +94,9 @@ Pickle inputs are always refused without `--trust-pickle`.
 python comfyui_wxa8_quantizer.py sd_xl_base_1.0.safetensors \
     --output sd_xl_base_1.0_w4a8.safetensors --format w4a8 --validate
 
-# Convert a sharded/HF-style directory to W3A8
+# Convert a sharded/HF-style directory
 python comfyui_wxa8_quantizer.py ./model_dir \
-    --output model_dir_w3a8.safetensors --format w3a8 --report w3a8_report.txt
+    --output model_dir_w4a8.safetensors --format w4a8 --report w4a8_report.txt
 
 # Sensitivity-based fallbacks with local calibration activations
 python comfyui_wxa8_quantizer.py model.safetensors \
@@ -114,10 +107,6 @@ python comfyui_wxa8_quantizer.py model.safetensors \
 # Resume an interrupted conversion
 python comfyui_wxa8_quantizer.py model.safetensors \
     --output model_w4a8.safetensors --format w4a8 --resume
-
-# Emit the W3A8 runtime compatibility patch (see RESEARCH_NOTES.md)
-python comfyui_wxa8_quantizer.py model.safetensors \
-    --output model_w3a8.safetensors --format w3a8 --emit-patch w3a8_runtime.patch
 ```
 
 ## Embedded self-tests
@@ -126,14 +115,14 @@ python comfyui_wxa8_quantizer.py model.safetensors \
 python comfyui_wxa8_quantizer.py --self-test
 ```
 
-Covers W4/W3 packing round trips, odd dimensions, scale calculations, deterministic
+Covers W4 packing round trips, odd dimensions, scale calculations, deterministic
 conversion, metadata generation, registry behavior (all 98 ComfyUI model classes
 covered by 42 policy families), golden-vector bit-exactness against the reference
 implementation, malformed checkpoints, unsupported tensors, resume-state recovery,
-atomic output writing, and end-to-end mini-model conversions. These are engineering
-tests, not full-model quality validation.
+atomic output writing, and an end-to-end mini-model conversion. These are
+engineering tests, not full-model quality validation.
 
-## Output format (W4A8)
+## Output format
 
 Per quantized layer `{layer}` (the full state-dict key, e.g.
 `model.diffusion_model.blocks.0.attn.qkv_proj`):
@@ -152,17 +141,8 @@ Non-quantized tensors pass through unchanged (or cast by `--output-dtype`).
 
 See [METADATA_SPEC.md](METADATA_SPEC.md) for the full specification and
 [RESEARCH_NOTES.md](RESEARCH_NOTES.md) for the verified reference behavior and the
-runtime prerequisites. ComfyUI PR #15308 is **not merged** into ComfyUI master at the
-research revision; see the compatibility section there.
-
-## W3A8
-
-W3A8 is an independent 3-bit extension format defined by this tool (8-entry symmetric
-Lloyd-Max codebook, fp8 group scales, 3-bit LSB packing with 8 codes per 3 bytes).
-It is **not** a renamed W4A8. No upstream ComfyUI or comfy-kitchen revision supports
-it; loading W3A8 checkpoints requires the revision-aware runtime patch produced by
-`--emit-patch` (verified to apply cleanly against the reference revisions). The output
-metadata and every report state this explicitly.
+runtime prerequisites. ComfyUI PR #15308 is **not merged** into ComfyUI master at
+the research revision; see the compatibility section there.
 
 ## Security
 

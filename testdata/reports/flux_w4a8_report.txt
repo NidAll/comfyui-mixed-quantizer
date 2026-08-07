@@ -6,8 +6,8 @@ architecture      : flux (confidence medium)
 unet prefix       : model.diffusion_model.
 input             : safetensors (testdata/flux_fixture.safetensors)
 output            : testdata/flux_fixture_w4a8.safetensors (28.29 MiB)
-elapsed           : 14.512 s
-peak RSS          : 1.00 GiB
+elapsed           : 14.059 s
+peak RSS          : 1.01 GiB
 
 -- detection evidence --
   + double_blocks.0.img_attn.norm.key_norm.weight
@@ -87,7 +87,7 @@ peak RSS          : 1.00 GiB
   [passed                ] scale-validation -- 16 layers OK (fp8 s_rel finite/positive, fp32 s_channel finite/positive)
   [passed                ] deterministic-conversion -- two runs byte-identical
   [passed                ] deterministic-vs-disk -- recomputed packed weight matches the file
-  [passed                ] output-hash -- sha256=13a88def2a7d1d0210759fb3d0c6610c271ed2ba839eaf9882341238a23c2246
+  [passed                ] output-hash -- sha256=c59dc5c0e49190dadfbf6a0267eed7c87ebf5f847b7ea2bfc4a6fa7a994b939e
   [skipped               ] compat-comfy-kitchen -- comfy-kitchen not installed (skipped)
   [skipped               ] compat-comfyui -- ComfyUI not installed (skipped)
   [passed                ] input-hash -- {"testdata/flux_fixture.safetensors":"7498407638a346a6e593fc57cdf8a3b9f6ee064d411c76c0ae6acd06d78c289f"}
@@ -96,6 +96,6 @@ peak RSS          : 1.00 GiB
   comfy-kitchen >= aa1ab2263dc06225d9de6702dfc087313d4bc971 (PR #90, merged) with AsymW4A8Int8Layout; ComfyUI >= PR #15308 head b6578f2ae11ab3dea3156ed68d8724476cda1232 (NOT merged into master at base bdcb886a4705a03cf40f4a7226de9fc7c059fc90); CUDA: PyTorch cu130+, SM >= 8.0; ROCm: triton >= 3.7; eager works anywhere
 
 -- output integrity --
-  sha256          : 13a88def2a7d1d0210759fb3d0c6610c271ed2ba839eaf9882341238a23c2246
+  sha256          : c59dc5c0e49190dadfbf6a0267eed7c87ebf5f847b7ea2bfc4a6fa7a994b939e
   input flux_fixture.safetensors : 7498407638a346a6e593fc57cdf8a3b9f6ee064d411c76c0ae6acd06d78c289f
 ==============================================================================
