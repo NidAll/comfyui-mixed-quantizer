@@ -31,7 +31,7 @@ Reference implementation (authoritative, merged):
 
   * ComfyUI PR #15308  "Support asym w4a8_int" (OPEN / NOT MERGED at research time)
         https://github.com/Comfy-Org/ComfyUI/pull/15308
-        head commit : b6578f2ae11ab3dea3156ed68d8724476cda1232
+        head commit : 8c3a2b27c37bd34e87b58846baf962407c92843c
         base commit: bdcb886a4705a03cf40f4a7226de9fc7c059fc90 (2026-08-06, ComfyUI master)
         files studied:
           comfy/ops.py        (_load_quantized_module: pops weight_s_rel / weight_s_channel
@@ -98,7 +98,7 @@ W4A8 numerical representation ("asym_w4a8_int8", verified against the eager back
   * Runtime prerequisites (state explicitly in metadata/reports):
        - comfy-kitchen >= merge commit aa1ab2263dc06225d9de6702dfc087313d4bc971
          (PR #90; AsymW4A8Int8Layout registered; eager/triton/CUDA backends)
-       - ComfyUI >= PR #15308 head b6578f2ae11ab3dea3156ed68d8724476cda1232
+       - ComfyUI >= PR #15308 head 8c3a2b27c37bd34e87b58846baf962407c92843c
          (NOT merged into ComfyUI master as of bdcb886a4705a03cf40f4a7226de9fc7c059fc90)
        - CUDA backend requires PyTorch cu130+ and SM >= 8.0; Triton >= 3.7 for
          ROCm; pure-torch eager works on CPU/CUDA/ROCm for dequant + linear.
@@ -156,7 +156,7 @@ except Exception as _exc:  # pragma: no cover - import guard
 # Version / revision constants (research record; see module docstring)
 # ---------------------------------------------------------------------------
 CONVERTER_NAME = "comfyui_wxa8_quantizer"
-CONVERTER_VERSION = "1.1.1"
+CONVERTER_VERSION = "1.1.2"
 FORMAT_W4A8 = "asym_w4a8_int8"
 FORMAT_W4A8_REVISION = "asym-w4a8-int8-r1"
 METADATA_KEY_QUANT = "_quantization_metadata"     # official key read by ComfyUI
@@ -164,7 +164,7 @@ METADATA_KEY_EXT = "comfy_wxa8"                   # namespaced extension key (ne
 LAYER_CONF_KEY = "comfy_quant"                    # per-layer blob key used by ComfyUI loader
 COMFY_KITCHEN_REV = "aa1ab2263dc06225d9de6702dfc087313d4bc971"   # PR #90 merge commit
 COMFYUI_PR = 15308
-COMFYUI_PR_HEAD = "b6578f2ae11ab3dea3156ed68d8724476cda1232"
+COMFYUI_PR_HEAD = "8c3a2b27c37bd34e87b58846baf962407c92843c"
 COMFYUI_BASE = "bdcb886a4705a03cf40f4a7226de9fc7c059fc90"
 W4A8_KERNEL_MIN_SM = (8, 0)
 TRITON_MIN_VERSION = (3, 7)

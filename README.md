@@ -26,6 +26,7 @@ documented in the [Research basis](#research-basis) section below.
 * [Security](#security)
 * [Known limitations](#known-limitations)
 * [Research basis](#research-basis)
+* [patches/](patches/comfyui_w4a8_loader.patch)
 * [License](#license)
 
 ## Features
@@ -393,8 +394,21 @@ macos.
 * comfy-kitchen ≥ `aa1ab2263dc06225d9de6702dfc087313d4bc971` (PR #90, merged) with
   `AsymW4A8Int8Layout` registered; eager works on CPU/CUDA/ROCm; Triton ≥ 3.7 for
   ROCm; the compiled CUDA backend requires PyTorch cu130+ and SM ≥ 8.0.
-* ComfyUI ≥ PR #15308 head `b6578f2ae11ab3dea3156ed68d8724476cda1232`, not merged
-  into ComfyUI master as of base commit `bdcb886a...`.
+* ComfyUI PR #15308 is **not merged** (open as of 2026-08-07, head
+  `8c3a2b27c37bd34e87b58846baf962407c92843c`), so the loader support must be
+  applied manually. The repository ships the exact patch:
+  `patches/comfyui_w4a8_loader.patch` (targets ComfyUI v0.30.0, verified with
+  `git apply --check` and compile-checked). Apply from the ComfyUI root:
+
+  ```bash
+  git apply patches/comfyui_w4a8_loader.patch
+  ```
+
+  On Windows with a plain checkout, run the same command from `C:\Comfyui\ComfyUI`
+  after copying the patch file there. If your checkout has drifted (forks, extra
+  commits), `patch -p1 --fuzz=3 < comfyui_w4a8_loader.patch` handles it. Restart
+  ComfyUI afterwards; the startup log should list `asym_w4a8_int8` among the
+  native ops.
 * `weight_dtype` (majority-dtype detection) is explicitly bypassed for quantized
   checkpoints in ComfyUI, so int8-packed weights are safe on disk.
 
