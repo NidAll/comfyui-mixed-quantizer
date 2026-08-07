@@ -1,13 +1,13 @@
 ==============================================================================
-comfyui_wxa8_quantizer 1.1.0 -- conversion report
+comfyui_wxa8_quantizer 1.1.3 -- conversion report
 ==============================================================================
 format            : asym_w4a8_int8 (asym-w4a8-int8-r1)
 architecture      : lumina2 (confidence medium)
 unet prefix       : model.diffusion_model.
 input             : safetensors (sickOllie_zTurbo.safetensors)
 output            : sickOllie_zTurbo_w4a8.safetensors (3.42 GiB)
-elapsed           : 245.982 s
-peak RSS          : 8.21 GiB
+elapsed           : 258.114 s
+peak RSS          : 7.47 GiB
 
 -- detection evidence --
   + cap_embedder.1.weight
@@ -253,15 +253,15 @@ peak RSS          : 8.21 GiB
   [passed                ] scale-validation -- 64 layers OK (fp8 s_rel finite/positive, fp32 s_channel finite/positive)
   [skipped               ] deterministic-vs-disk -- skipped: conversion ran on cuda (codebook subsample is device-dependent); determinism verified on CPU
   [passed                ] deterministic-conversion -- two runs byte-identical
-  [passed                ] output-hash -- sha256=4942f69c0cfa2e0fdff2de49be8e239d6fb4b6dda41bcf58cec9cace2bf74666
-  [skipped               ] compat-comfy-kitchen -- comfy-kitchen not installed (skipped)
+  [passed                ] output-hash -- sha256=55e902fa43bafd638e3eaa3b288488c98bcac9a217f059b06fe45d6bedbb7a73
+  [passed                ] compat-comfy-kitchen -- installed comfy-kitchen: version unknown, AsymW4A8Int8Layout registered: True
   [skipped               ] compat-comfyui -- ComfyUI not installed (skipped)
   [passed                ] input-hash -- {"sickOllie_zTurbo.safetensors":"e446e62051d00594a188dc2a615481228029060bfc1b253b5c09235511f67303"}
 
 -- compatibility requirements --
-  comfy-kitchen >= aa1ab2263dc06225d9de6702dfc087313d4bc971 (PR #90, merged) with AsymW4A8Int8Layout; ComfyUI >= PR #15308 head b6578f2ae11ab3dea3156ed68d8724476cda1232 (NOT merged into master at base bdcb886a4705a03cf40f4a7226de9fc7c059fc90); CUDA: PyTorch cu130+, SM >= 8.0; ROCm: triton >= 3.7; eager works anywhere
+  comfy-kitchen >= aa1ab2263dc06225d9de6702dfc087313d4bc971 (PR #90, merged) with AsymW4A8Int8Layout; ComfyUI >= PR #15308 head 8c3a2b27c37bd34e87b58846baf962407c92843c (NOT merged into master at base bdcb886a4705a03cf40f4a7226de9fc7c059fc90); CUDA: PyTorch cu130+, SM >= 8.0; ROCm: triton >= 3.7; eager works anywhere
 
 -- output integrity --
-  sha256          : 4942f69c0cfa2e0fdff2de49be8e239d6fb4b6dda41bcf58cec9cace2bf74666
+  sha256          : 55e902fa43bafd638e3eaa3b288488c98bcac9a217f059b06fe45d6bedbb7a73
   input sickOllie_zTurbo.safetensors : e446e62051d00594a188dc2a615481228029060bfc1b253b5c09235511f67303
 ==============================================================================
