@@ -1,4 +1,4 @@
-# comfyui_wxa8_quantizer.py
+# Comfyui_w4a8_quantizer
 
 A single-file converter that turns supported generative-model checkpoints into
 **W4A8** (`asym_w4a8_int8`) quantized checkpoints for use with compatible ComfyUI /
