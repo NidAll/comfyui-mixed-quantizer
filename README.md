@@ -42,9 +42,10 @@ documented in the [Research basis](#research-basis) section below.
   revision, each with its own quantize / keep / exclude rules and validation
   thresholds. Unknown or ambiguous models are refused unless `--architecture` is
   given.
-* Bounded-memory conversion. Tensors are streamed one at a time, larger tensors are
-  quantized in chunks under a configurable memory budget, and the output is written
-  to a temp file and atomically renamed. Interrupted runs resume from a state file.
+* Bounded-memory conversion and validation. Quantized layers and retained tensors
+  (including dtype casts) are processed in bounded row/byte chunks, and output is
+  written to a temp file and atomically renamed. Interrupted runs resume from a
+  checksummed state file.
 * Calibration support from local activation data (`.npz` / `.pt` / `.npy` or a
   directory). Calibration is optional and used for sensitivity analysis, which can
   fall back to original precision for sensitive layers. The reference format itself
@@ -52,8 +53,11 @@ documented in the [Research basis](#research-basis) section below.
 * Standalone validation that reopens the output, checks inventories, shapes, dtypes,
   metadata, packing round trips and scales, measures reconstruction error against
   the original weights, verifies determinism, and hashes both input and output.
-* Embedded self-tests (13 checks) covering the packing, scales, metadata, registry,
-  resume and atomic-write paths.
+  Volatile timing and peak-memory measurements stay in the report, so identical
+  CPU conversions in the same environment can produce byte-identical checkpoints.
+* Embedded self-tests (19 checks) covering packing, dtype selection, real activation
+  calibration, metadata, safe detection, malformed inputs, sensitivity planning,
+  checksummed resume, and atomic-write paths.
 
 ## Requirements
 
@@ -110,12 +114,12 @@ Pickle inputs are always refused without `--trust-pickle`.
 | `--output-dtype auto\|fp16\|bf16` | cast passthrough float tensors (auto = keep original) |
 | `--group-size NUMBER` | per-group quantization size (default: architecture policy, 16) |
 | `--calibration-source PATH` | local calibration activations (.npz/.pt/.npy or directory) |
-| `--calibration-samples N` | cap calibration rows per layer |
-| `--calibration-cache PATH` | read/write calibration statistics cache |
+| `--calibration-samples N` | cap recorded calibration rows per layer (default 64) |
+| `--calibration-cache PATH` | read/write a compressed, safe activation-row cache |
 | `--seed N` | reproducibility seed (recorded; codebook subsampling is seed-0 like the reference) |
 | `--include/--exclude/--keep-precision PATTERN` | regex filters on tensor names |
 | `--sensitivity-threshold N` | keep layers at original precision above an error score |
-| `--error-threshold N` | per-layer reconstruction relL2 bound (fallback to keep-precision) |
+| `--error-threshold N` | hard relL2 fallback during a sensitivity/calibration prepass (default: architecture policy) |
 | `--max-memory SIZE` | per-tensor working-memory budget (larger tensors are chunked) |
 | `--streaming` | bounded-memory streaming (default for safetensors) |
 | `--resume` | resume an interrupted conversion from its state file |
@@ -123,7 +127,7 @@ Pickle inputs are always refused without `--trust-pickle`.
 | `--dry-run` | detect, plan and report, write nothing |
 | `--inspect` | dump input inventory + detection evidence, exit |
 | `--list-architectures` | print the embedded architecture registry |
-| `--validate` | full standalone validation after conversion (sampled layers, hashes, optional runtime-compat probe) |
+| `--validate` | full standalone validation after conversion (all quantized layers, hashes, optional static runtime-compat probe) |
 | `--validation-only` | validate an existing output against the original model |
 | `--metadata-only` | generate metadata + report only |
 | `--report PATH` | write human-readable report (+ `PATH.json`) |
@@ -178,11 +182,18 @@ The safetensors header carries two metadata blocks:
   `comfy/utils.py::convert_old_quants` converts this into per-layer `comfy_quant`
   blobs that the PR #15308 loader reads.
 * `__metadata__["comfy_wxa8"]` (namespaced extension, never official): converter
-  name and version, format revision, detected architecture and confidence, source
-  file hashes, quantization parameters, calibration provenance, sensitivity
-  results, reproducibility settings, compatibility requirements (exact revisions),
-  output sha256, validation summary, and warnings. Per-layer metrics and exclusion
-  reasons are kept out of the header and written to the JSON report instead.
+  schema `comfy_wxa8/v1`, converter name and version, format revision, detected
+  architecture and confidence, source whole-file hashes under portable file labels
+  (no machine-specific absolute paths), quantization parameters, runtime activation
+  quantization, compute dtype, calibration provenance, sensitivity results,
+  reproducibility settings, compatibility requirements (exact revisions), stable
+  tensor-payload sha256, validation summary, and warnings. The full output file
+  sha256 is written to the report because a file cannot embed its own hash. Per-layer
+  metrics and every exclusion/retention reason are written to the JSON report instead
+  of expanding the safetensors header.
+
+Other valid string-valued safetensors metadata from the source is preserved; the
+converter only replaces its official quantization key and `comfy_wxa8` namespace.
 
 ## Architecture support
 
@@ -208,12 +219,15 @@ with the runtime status of each family.
 
 ## Compatibility matrix
 
-All runs below used `comfyui_wxa8_quantizer.py 1.1.1` on torch 2.13.0+cu130 /
-safetensors 0.8.0 (CPU quantization; the CUDA path was also exercised). "Executed"
+Fixture rows were rerun with `comfyui_wxa8_quantizer.py 1.2.0` on torch 2.13.0 /
+safetensors 0.8.0 using CPU quantization. The real-model and CUDA rows are retained
+from the documented 1.1.x runs because those checkpoints and a GPU are not stored in
+this repository. "Executed"
 means the conversion finished and the output passed the standalone validation suite
 (reopen, inventory, shapes, dtypes, metadata, pack round trips, scale checks,
 reconstruction error vs the original weights, deterministic checks, output hash).
-relL2 = per-layer weight reconstruction error (max over sampled layers).
+relL2 = per-layer weight reconstruction error (maximum over all quantized layers
+when `--validate` was used).
 
 ### W4A8 (`asym_w4a8_int8`) conversions
 
@@ -224,30 +238,32 @@ relL2 = per-layer weight reconstruction error (max over sampled layers).
 | flux | Flux, FluxInpaint, FluxSchnell, LongCat, Ovis | fixture (23 tensors) | pass | 0.0729 |
 | wan | Wan2.1/2.2 (20 classes) | fixture (31 tensors) | pass | 0.0728 |
 | wan | Wan2.1 T2V 1.3B (real, 2.64 GiB) | 300 layers | pass (full validation) | 0.0730 |
-| minimax_h3 | MiniMaxH3 | fixture (28 tensors, prefix-less) | pass | 0.0728 |
+| minimax_h3 | MiniMaxH3 | fixture (30 tensors, prefix-less) | pass | 0.0728 |
 | hydit | HunyuanDiT, HunyuanDiT1 | fixture (12 tensors) | pass | 0.0728 |
 | mmdit_sd3 | SD3 (and SD3.5 family) | fixture (15 tensors) | pass | 0.0729 |
 | lumina2 | Lumina2, ZImage, ZImagePixelSpace | fixture (real naming, 35 tensors) | pass | 0.0727 |
 | lumina2 | Z-Image Turbo (real, sickOllie_zTurbo 11.46 GiB, bf16) | 170 layers, 3.42 GiB out | pass (full validation, cuda) | 0.0730 |
 | (runtime) | real ComfyUI v0.30.0 + loader patch + comfy-kitchen 0.2.27 load | zimage + minimax_h3 outputs | pass (QuantizedTensor, AsymW4A8Int8Layout) | - |
 | (input form) | sharded directory | hydit fixture split in 2 shards | pass | 0.0728 |
-| (input form) | bounded-memory chunked path (2 MiB budget) | minimax_h3 fixture | pass | 0.0855 |
+| (input form) | bounded-memory chunked path (32 MiB budget) | Wan + MiniMax H3 fixtures | pass | 0.0729 |
 
 ### Feature tests (executed)
 
 | feature | result |
 |---|---|
-| embedded self-tests (`--self-test`) | 13/13 pass |
+| embedded self-tests (`--self-test`) | 19/19 pass |
 | golden vectors vs comfy-kitchen reference (packed/fp8 byte-exact, fp32 within 1e-4) | pass (2 configs) |
 | side-by-side bit-exactness vs reference (9 shape/config combos, quantize + dequantize) | pass |
-| CLI kill + `--resume` recovery | pass (deterministic-vs-disk verified) |
-| calibration (npz), `--calibration-samples`, cache write/read | pass |
-| `--sensitivity-threshold` keep-precision | pass |
+| CLI interruption + `--resume` recovery | pass before and after tensor finalization; option drift and completed-tensor corruption rejected |
+| calibration (npz), direct activation rows, compressed cache write/read | pass |
+| `--sensitivity-threshold` keep-precision | pass; output inventory frozen after prepass |
 | `--device cuda` | pass (deterministic-vs-disk documented skip) |
 | `--compute-dtype bf16`, `--output-dtype fp16` | pass |
 | `--include/--exclude/--keep-precision` filters | pass |
 | `--dry-run`, `--inspect`, `--metadata-only`, `--validation-only` | pass |
-| overwrite / self-overwrite / pickle / requantize guards | pass (refused as designed) |
+| overwrite / hardlink self-overwrite / auxiliary-path collision / pickle / requantize guards | pass (refused as designed) |
+| odd-byte bool/u8 passthrough tensors | pass |
+| nested BF16 pickle state dict and unindexed shard tensor | pass |
 | ComfyUI loader contract (names/dtypes/shapes/metadata) on output | pass |
 
 ### Not executed or unsupported
@@ -261,7 +277,7 @@ relL2 = per-layer weight reconstruction error (max over sampled layers).
   discovered as files, but their state-dict naming is not converted to ComfyUI
   naming; detection fails safely and requests `--architecture`.
 * The remaining families (stable_cascade, stable_audio, aura_flow, mochi, ltxv,
-  ace_step, cosmos, cosmos_predict2, anima, lumina2, pixeldit, hunyuan3d,
+  ace_step, cosmos, cosmos_predict2, anima, pixeldit, hunyuan3d,
   triposplat, hidream, chroma, seedvr2, omnigen2, ideogram4, krea2, mage_flow,
   qwen_image, joyimage, kandinsky5, cogvideox, ernie_image, sd20, sdxl_refiner,
   svd) have explicit policy profiles and detection signatures, but were not
@@ -272,22 +288,25 @@ relL2 = per-layer weight reconstruction error (max over sampled layers).
 
 `--validate` runs the full standalone validation after conversion: output reopen,
 tensor inventory, shape and dtype preservation, metadata checks, packing round
-trips, scale validation, reconstruction error (relL2, SNR, cosine) on sampled
-layers, deterministic re-quantization, output sha256, and an optional probe of any
-installed comfy-kitchen / ComfyUI versions. `--validation-only` runs the same suite
-against an existing output.
+trips, scale validation on every layer, reconstruction error (relL2, SNR, cosine)
+on every quantized layer, deterministic re-quantization, tensor-payload and full-file
+sha256, and an optional static probe of installed comfy-kitchen / ComfyUI source.
+The probe never imports either project. Reconstruction and scale checks also use
+bounded row chunks when a layer exceeds `--max-memory`. `--validation-only` runs
+the same full suite against an existing output.
 
 ```bash
 python comfyui_wxa8_quantizer.py --self-test
 ```
 
-The embedded self-tests cover W4 packing round trips, odd dimensions, scale
-calculations, deterministic conversion, metadata generation, registry behavior
-(all 98 ComfyUI model classes covered by 42 policy families), golden-vector
-bit-exactness against the reference implementation, malformed checkpoints,
-unsupported tensors, resume-state recovery, atomic output writing, and an
-end-to-end mini-model conversion. These are engineering tests, not full-model
-quality validation.
+The embedded self-tests cover W4 packing round trips, odd dimensions and odd-byte
+tensors, scale calculations, compute-dtype selection, real activation rows,
+standalone environment inspection, metadata generation, registry behavior (all 98
+ComfyUI model classes covered by 42 policy families), fail-closed ambiguity,
+golden-vector bit-exactness, malformed checkpoints, input variants, sensitivity
+output planning, checksummed resume, atomic output writing, and an end-to-end
+mini-model conversion. These are engineering tests, not full-model quality
+validation.
 
 ## Troubleshooting
 
@@ -304,16 +323,22 @@ an `AsymW4A8Int8Layout` QuantizedTensor and no warning is emitted.
 ## Security
 
 The model, metadata, configuration files, paths and calibration data are treated as
-untrusted. Pickle loading is opt-in only, safetensors headers are size- and
-offset-validated before any data access, output paths are checked against input
-files, outputs are written to a temp file and atomically renamed, and no subprocesses
-or network access are used during conversion.
+untrusted. Pickle loading is opt-in only. Safetensors headers reject duplicate keys,
+negative dimensions, negative or overlapping offsets, holes, trailing data and size
+mismatches before tensor access. Shard-index traversal is rejected. Output, report,
+log, state and cache paths cannot alias source files or each other. Temp files use
+exclusive no-follow opens, resume records bind the temp inode and checksum completed
+tensors, source and calibration files are hashed around processing, compressed
+calibration inputs are expansion-bounded, and publication uses fsync plus atomic
+replacement. A new requested output is withheld until validation passes; failed
+overwrites leave the previous target intact. No subprocesses or network access are
+used.
 
 ## Known limitations
 
 1. **ComfyUI runtime support is conditional.** W4A8 loading requires comfy-kitchen ≥
    `aa1ab2263dc06225d9de6702dfc087313d4bc971` (merged) AND ComfyUI PR #15308 head
-   `b6578f2ae11ab3dea3156ed68d8724476cda1232` (not merged into ComfyUI master at the
+   `8c3a2b27c37bd34e87b58846baf962407c92843c` (not merged into ComfyUI master at the
    research revision). Standalone validation does not prove runtime compatibility;
    use `--validate` for the optional installed-version probe.
 2. **Only 2D linear weights are quantized.** The reference format requires 2D,
@@ -324,17 +349,19 @@ or network access are used during conversion.
 3. **Detection is heuristic.** It mirrors ComfyUI's `detect_unet_config` signatures
    at the research revision, but ambiguous or unknown checkpoints are refused unless
    `--architecture` is supplied.
-4. **Determinism is device-scoped.** The codebook subsample uses a fixed-seed
-   generator on the quantization device; CPU and CUDA produce different (both valid)
-   outputs. `--device auto` = CPU. The chunked bounded-memory path draws its
-   subsample with the same seed but over chunk boundaries, so it can differ slightly
-   from the in-memory path (validated: relL2 0.0855 vs 0.0728 on the same fixture).
+4. **Determinism is backend-scoped.** The in-memory path uses a fixed-seed generator
+   on the quantization device; CPU and CUDA can produce different (both valid)
+   outputs. `--device auto` = CPU. The bounded path fits its codebook on CPU while
+   preserving quantization-group normalization and reference sample order. A reduced
+   memory budget can reduce the sample count below 300,000; this is recorded through
+   the memory settings and can change bytes while remaining format-compatible (32
+   MiB fixture relL2 0.0729 versus 0.0728 in-memory).
 5. **Pickle inputs are loaded fully into RAM** (`--trust-pickle` required) and cannot
    be streamed; only convert pickle checkpoints you trust and that fit in memory.
 6. **Calibration is optional and used for sensitivity analysis only.** The reference
    format is calibration-free (per-group absmax scales); the converter never claims
-   production calibration from synthetic data, and `_quantization_metadata` records
-   calibration provenance (or "calibration-free").
+   production calibration from synthetic data. Real activation rows, source hashes
+   and coverage are recorded in the `comfy_wxa8` extension (or "calibration-free").
 7. **Reference drift**: comfy-kitchen/ComfyUI may change the format in the future;
    the converter pins its behavior to the revisions below and records
    `format_revision` in the output metadata.
@@ -346,7 +373,8 @@ The format specification was verified against these exact revisions:
 | artifact | revision | note |
 |---|---|---|
 | comfy-kitchen PR #90 "Add optimized w4a8 with int8 codebook" | **MERGED**, merge commit `aa1ab2263dc06225d9de6702dfc087313d4bc971` (2026-08-06); head `b812819a97ac11d01f4a3a16ba47dd38de3b2519` | the reference W4A8 implementation |
-| ComfyUI PR #15308 "Support asym w4a8_int" | **OPEN, NOT MERGED** at research time; head `b6578f2ae11ab3dea3156ed68d8724476cda1232`; base `bdcb886a4705a03cf40f4a7226de9fc7c059fc90` (2026-08-06) | the ComfyUI loader support |
+| ComfyUI PR #15308 "Support asym w4a8_int" | **OPEN, NOT MERGED** when checked 2026-08-07; head `8c3a2b27c37bd34e87b58846baf962407c92843c`; base `bdcb886a4705a03cf40f4a7226de9fc7c059fc90` | the ComfyUI loader support |
+| comfy-kitchen PR #96 | merge commit `3d16bed29c91a3d9d1abdc0574c87a5ba2b1ef33` | later frozen-LUT and row-chunked producer changes; this converter intentionally retains the PR #90 numerical contract while emitting the same runtime layout |
 | Reference serialized example | `Kijai/MiniMax-H3-experimental/minimax_h3_fl2va_pruned_w4a8_mixed.safetensors` (12.5 GB, header inspected) | produced by the PR author |
 | ComfyUI master (research base) | `bdcb886a4705a03cf40f4a7226de9fc7c059fc90` | used for the architecture registry (98 supported-model classes) |
 
@@ -386,6 +414,10 @@ Files studied in ComfyUI@bdcb886 (+ PR #15308 diff): `comfy/ops.py`
 7. Runtime decode (CUDA / Triton / eager are bit-identical):
    `out8 = round(clamp(cb[code] * s_rel[n, k//G], -127, 127))`, then
    `W_rot = out8 * s_channel`, then un-rotate (H is symmetric).
+8. Runtime A8 path: ConvRot is applied to each incoming activation row, followed
+   by dynamic symmetric int8 quantization with fp32 scale
+   `max(abs(row))/127` (minimum `1e-30`), nearest rounding and clamp to
+   `[-128, 127]`. The int8 activation and decoded int8 weight accumulate in int32.
 
 The asymmetric-correction variant (`{layer}.weight_correction [K/gs, N]`) exists in
 comfy-kitchen but the ComfyUI loader does not consume it. The converter always uses

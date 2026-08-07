@@ -1,13 +1,13 @@
 ==============================================================================
-comfyui_wxa8_quantizer 1.0.0 -- conversion report
+comfyui_wxa8_quantizer 1.2.0 -- conversion report
 ==============================================================================
 format            : asym_w4a8_int8 (asym-w4a8-int8-r1)
 architecture      : mmdit_sd3 (confidence high)
 unet prefix       : model.diffusion_model.
 input             : safetensors (testdata/mmdit_sd3_fixture.safetensors)
-output            : testdata/mmdit_sd3_fixture_w4a8.safetensors (7.67 MiB)
-elapsed           : 4.679 s
-peak RSS          : 639.88 MiB
+output            : testdata/mmdit_sd3_w4a8.safetensors (7.67 MiB)
+elapsed           : 4.96 s
+peak RSS          : 343.45 MiB
 
 -- detection evidence --
   + joint_blocks.0.context_block.attn.qkv.weight
@@ -43,47 +43,51 @@ peak RSS          : 639.88 MiB
   [passed                ] output-inventory -- missing=[] extra=[]
   [passed                ] shape-preservation
   [passed                ] dtype-check
-  [passed                ] metadata-present -- 12 layers recorded
+  [passed                ] metadata-present -- present
   [passed                ] extension-metadata-present -- present
-  [passed                ] metadata-layer-inventory -- layer set mismatch: []
-  [passed                ] metadata-layer-conf -- format field mismatch
-  [passed                ] recon-model.diffusion_model.joint_blocks.0.context_block.attn.qkv -- relL2=0.0727 snr=22.8dB cos=0.9974
-  [passed                ] pack-rt-model.diffusion_model.joint_blocks.0.context_block.attn.qkv -- pack/unpack round trip
-  [passed                ] recon-model.diffusion_model.joint_blocks.1.context_block.attn.qkv -- relL2=0.0726 snr=22.8dB cos=0.9974
-  [passed                ] pack-rt-model.diffusion_model.joint_blocks.1.context_block.attn.qkv -- pack/unpack round trip
-  [passed                ] recon-model.diffusion_model.joint_blocks.0.x_block.mlp.fc1 -- relL2=0.0724 snr=22.8dB cos=0.9974
-  [passed                ] pack-rt-model.diffusion_model.joint_blocks.0.x_block.mlp.fc1 -- pack/unpack round trip
-  [passed                ] recon-model.diffusion_model.joint_blocks.0.x_block.mlp.fc2 -- relL2=0.0728 snr=22.8dB cos=0.9974
-  [passed                ] pack-rt-model.diffusion_model.joint_blocks.0.x_block.mlp.fc2 -- pack/unpack round trip
-  [passed                ] recon-model.diffusion_model.joint_blocks.1.x_block.mlp.fc1 -- relL2=0.0726 snr=22.8dB cos=0.9974
-  [passed                ] pack-rt-model.diffusion_model.joint_blocks.1.x_block.mlp.fc1 -- pack/unpack round trip
-  [passed                ] recon-model.diffusion_model.joint_blocks.1.x_block.mlp.fc2 -- relL2=0.0729 snr=22.7dB cos=0.9974
-  [passed                ] pack-rt-model.diffusion_model.joint_blocks.1.x_block.mlp.fc2 -- pack/unpack round trip
-  [passed                ] recon-model.diffusion_model.joint_blocks.0.x_block.attn.qkv -- relL2=0.0725 snr=22.8dB cos=0.9974
-  [passed                ] pack-rt-model.diffusion_model.joint_blocks.0.x_block.attn.qkv -- pack/unpack round trip
-  [passed                ] recon-model.diffusion_model.joint_blocks.1.x_block.attn.qkv -- relL2=0.0725 snr=22.8dB cos=0.9974
-  [passed                ] pack-rt-model.diffusion_model.joint_blocks.1.x_block.attn.qkv -- pack/unpack round trip
+  [passed                ] extension-metadata-schema -- required fields, revision and architecture
+  [passed                ] metadata-source-hash -- source content hashes match
+  [passed                ] tensor-payload-hash -- sha256=5c8cf75399e6b92d509dc5b62c361af3bbf617bbd14a3cf06b13e0fa54b9b584
+  [passed                ] metadata-layer-inventory -- 12 layers match
+  [passed                ] metadata-layer-conf -- format/group/ConvRot fields valid
   [passed                ] recon-model.diffusion_model.joint_blocks.0.context_block.attn.proj -- relL2=0.0722 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-model.diffusion_model.joint_blocks.0.context_block.attn.proj -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.joint_blocks.0.context_block.attn.qkv -- relL2=0.0727 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.joint_blocks.0.context_block.attn.qkv -- pack/unpack round trip
   [passed                ] recon-model.diffusion_model.joint_blocks.0.x_block.attn.proj -- relL2=0.0725 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-model.diffusion_model.joint_blocks.0.x_block.attn.proj -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.joint_blocks.0.x_block.attn.qkv -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.joint_blocks.0.x_block.attn.qkv -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.joint_blocks.0.x_block.mlp.fc1 -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.joint_blocks.0.x_block.mlp.fc1 -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.joint_blocks.0.x_block.mlp.fc2 -- relL2=0.0728 snr=22.8dB cos=0.9973
+  [passed                ] pack-rt-model.diffusion_model.joint_blocks.0.x_block.mlp.fc2 -- pack/unpack round trip
   [passed                ] recon-model.diffusion_model.joint_blocks.1.context_block.attn.proj -- relL2=0.0725 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-model.diffusion_model.joint_blocks.1.context_block.attn.proj -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.joint_blocks.1.context_block.attn.qkv -- relL2=0.0726 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.joint_blocks.1.context_block.attn.qkv -- pack/unpack round trip
   [passed                ] recon-model.diffusion_model.joint_blocks.1.x_block.attn.proj -- relL2=0.0725 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-model.diffusion_model.joint_blocks.1.x_block.attn.proj -- pack/unpack round trip
-  [passed                ] reconstruction-error-bound -- max sampled relL2 0.0729 (policy bound 0.25)
-  [passed                ] scale-validation -- 12 layers OK (fp8 s_rel finite/positive, fp32 s_channel finite/positive)
+  [passed                ] recon-model.diffusion_model.joint_blocks.1.x_block.attn.qkv -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.joint_blocks.1.x_block.attn.qkv -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.joint_blocks.1.x_block.mlp.fc1 -- relL2=0.0726 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.joint_blocks.1.x_block.mlp.fc1 -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.joint_blocks.1.x_block.mlp.fc2 -- relL2=0.0729 snr=22.7dB cos=0.9973
+  [passed                ] pack-rt-model.diffusion_model.joint_blocks.1.x_block.mlp.fc2 -- pack/unpack round trip
+  [passed                ] reconstruction-error-bound -- max full relL2 0.0729 (policy bound 0.25)
+  [passed                ] scale-validation -- 12 layers OK (fp8 s_rel finite/nonnegative, fp32 s_channel finite/positive)
   [passed                ] deterministic-conversion -- two runs byte-identical
   [passed                ] deterministic-vs-disk -- recomputed packed weight matches the file
-  [passed                ] output-hash -- sha256=28ac4175b80bbca49a92e1d6e5ceaa4f1fec43068409c65d6ef7b0b86c1fd0d5
+  [passed                ] output-hash -- sha256=50fdedbfde2bde89a21c26365e7ab354132c0d7039a29797ef1b91401d28ce1d
   [skipped               ] compat-comfy-kitchen -- comfy-kitchen not installed (skipped)
   [skipped               ] compat-comfyui -- ComfyUI not installed (skipped)
-  [passed                ] input-hash -- {"testdata/mmdit_sd3_fixture.safetensors":"5cb8a1fa05fbf582dd15f0610fb99300531168615766a2eee2e8d5b5a184eadc"}
+  [passed                ] input-hash -- {"mmdit_sd3_fixture.safetensors":"a4cb0240e5afa4078da963105acda303b5e6858d069e7f55231ff92bc9a4c464"}
+  [passed                ] final-publication -- final file reopens; embedded tensor payload hash matches
 
 -- compatibility requirements --
-  comfy-kitchen >= aa1ab2263dc06225d9de6702dfc087313d4bc971 (PR #90, merged) with AsymW4A8Int8Layout; ComfyUI >= PR #15308 head b6578f2ae11ab3dea3156ed68d8724476cda1232 (NOT merged into master at base bdcb886a4705a03cf40f4a7226de9fc7c059fc90); CUDA: PyTorch cu130+, SM >= 8.0; ROCm: triton >= 3.7; eager works anywhere
+  comfy-kitchen >= aa1ab2263dc06225d9de6702dfc087313d4bc971 (PR #90, merged) with AsymW4A8Int8Layout; ComfyUI >= PR #15308 head 8c3a2b27c37bd34e87b58846baf962407c92843c (NOT merged into master at base bdcb886a4705a03cf40f4a7226de9fc7c059fc90); CUDA: PyTorch cu130+, SM >= 8.0; ROCm: triton >= 3.7; eager works anywhere
 
 -- output integrity --
-  sha256          : 28ac4175b80bbca49a92e1d6e5ceaa4f1fec43068409c65d6ef7b0b86c1fd0d5
-  input mmdit_sd3_fixture.safetensors : 5cb8a1fa05fbf582dd15f0610fb99300531168615766a2eee2e8d5b5a184eadc
+  sha256          : 50fdedbfde2bde89a21c26365e7ab354132c0d7039a29797ef1b91401d28ce1d
+  input mmdit_sd3_fixture.safetensors : a4cb0240e5afa4078da963105acda303b5e6858d069e7f55231ff92bc9a4c464
 ==============================================================================

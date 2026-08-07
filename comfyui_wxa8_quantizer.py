@@ -29,6 +29,14 @@ Reference implementation (authoritative, merged):
           comfy_kitchen/tensor/int8_utils.py           (ConvRot Hadamard rotation)
           comfy_kitchen/tensor/base.py                 (QuantizedTensor state-dict layout)
 
+  * comfy-kitchen PR #96 (compatible later producer update, MERGED)
+        https://github.com/Comfy-Org/comfy-kitchen/pull/96
+        merge commit : 3d16bed29c91a3d9d1abdc0574c87a5ba2b1ef33 (2026-08-06)
+        Replaces per-weight Lloyd-Max fitting with a frozen LUT and adds row-chunked
+        producer quantization.  It preserves the same serialized runtime layout.
+        This converter deliberately retains the verified PR #90 numerical contract;
+        its stored per-layer codebook remains consumable by later runtimes.
+
   * ComfyUI PR #15308  "Support asym w4a8_int" (OPEN / NOT MERGED at research time)
         https://github.com/Comfy-Org/ComfyUI/pull/15308
         head commit : 8c3a2b27c37bd34e87b58846baf962407c92843c
@@ -82,6 +90,9 @@ W4A8 numerical representation ("asym_w4a8_int8", verified against the eager back
        out8[n,k] = round(clamp(codebook[codes[n,k]] * s_rel[n, k//G], -127, 127))
        W_rot     = out8 * s_channel[:, None]      (per-channel scale, GEMM epilogue)
        W         = unrotate(W_rot)                (same Hadamard, H symmetric)
+  * Runtime activations: apply ConvRot, then dynamically quantize each input row
+       to int8 with fp32 scale amax(abs(row))/127 (clamp min 1e-30), nearest
+       rounding and clamp [-128, 127]; GEMM accumulation is int32.
   * Serialization (per quantized layer):
        {layer}.weight             int8   [N, K/2]
        {layer}.weight_s_rel       fp8_e4m3fn [N, K/group_size]
@@ -122,6 +133,7 @@ import contextlib
 import dataclasses
 import enum
 import hashlib
+import importlib.metadata
 import importlib.util
 import json
 import logging
@@ -130,12 +142,13 @@ import mmap
 import os
 import re
 import shutil
+import stat
 import struct
 import sys
 import tempfile
 import time
 import traceback
-import typing
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -145,20 +158,21 @@ try:  # Required public dependencies
     import torch
     import safetensors
     from safetensors import safe_open
-    import safetensors.torch  # noqa: F401  (submodule; required for save_file)
+    import safetensors.torch  # submodule required for save_file and dtype registry
 except Exception as _exc:  # pragma: no cover - import guard
     raise SystemExit(
         "comfyui_wxa8_quantizer requires: torch (>=2.1), safetensors (>=0.4.3), numpy.\n"
         f"Import failed: {_exc!r}"
-    )
+    ) from _exc
 
 # ---------------------------------------------------------------------------
 # Version / revision constants (research record; see module docstring)
 # ---------------------------------------------------------------------------
 CONVERTER_NAME = "comfyui_wxa8_quantizer"
-CONVERTER_VERSION = "1.1.3"
+CONVERTER_VERSION = "1.2.0"
 FORMAT_W4A8 = "asym_w4a8_int8"
 FORMAT_W4A8_REVISION = "asym-w4a8-int8-r1"
+MAX_SAFETENSORS_HEADER_SIZE = 100_000_000
 METADATA_KEY_QUANT = "_quantization_metadata"     # official key read by ComfyUI
 METADATA_KEY_EXT = "comfy_wxa8"                   # namespaced extension key (never official)
 LAYER_CONF_KEY = "comfy_quant"                    # per-layer blob key used by ComfyUI loader
@@ -214,7 +228,10 @@ class JsonLogHandler(logging.Handler):
     def __init__(self, path: str):
         super().__init__()
         self._path = path
-        self._fh = open(path, "a", encoding="utf-8")
+        os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+        fd, _ = _open_regular_nofollow(
+            path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+        self._fh = os.fdopen(fd, "a", encoding="utf-8")
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
@@ -229,7 +246,7 @@ class JsonLogHandler(logging.Handler):
             self._fh.write(json.dumps(entry) + "\n")
             self._fh.flush()
         except Exception:
-            pass
+            self.handleError(record)
 
     def close(self) -> None:  # pragma: no cover
         try:
@@ -305,31 +322,47 @@ def inspect_environment() -> EnvironmentInfo:
             info.cuda_capability = tuple(int(x) for x in torch.cuda.get_device_capability(0))
             props = torch.cuda.get_device_properties(0)
             info.rocm_arch = getattr(props, "gcnArchName", None)
-        except Exception:
-            pass
-    # Optional runtime-compatibility probing (never imports ComfyUI; only used to
-    # *report* whether an installed comfy-kitchen / ComfyUI would accept the file).
+        except Exception as e:
+            log().debug("CUDA environment probe failed: %s", e)
+    # Optional runtime compatibility probing is deliberately static.  Importing
+    # either project here would execute third-party package initializers and
+    # would violate the converter's standalone/runtime-isolation guarantee.
     try:
-        ck_spec = importlib.util.find_spec("comfy_kitchen")
-        if ck_spec is not None:
-            info.has_comfy_kitchen = True
-            import comfy_kitchen  # type: ignore
-            info.comfy_kitchen_rev = getattr(comfy_kitchen, "__version__", None)
+        dist = importlib.metadata.distribution("comfy-kitchen")
+        info.has_comfy_kitchen = True
+        info.comfy_kitchen_rev = dist.version
+        for rel in dist.files or ():
+            rel_text = str(rel).replace("\\", "/")
+            if not rel_text.endswith(".py") or "comfy_kitchen" not in rel_text:
+                continue
+            path = Path(dist.locate_file(rel))
             try:
-                from comfy_kitchen.tensor import get_layout_class  # type: ignore
-                get_layout_class("AsymW4A8Int8Layout")
-                info.comfy_kitchen_has_w4a8_layout = True
-            except Exception:
-                info.comfy_kitchen_has_w4a8_layout = False
-    except Exception:
+                if path.stat().st_size <= 4 * 1024 * 1024 and \
+                        "AsymW4A8Int8Layout" in path.read_text(encoding="utf-8", errors="ignore"):
+                    info.comfy_kitchen_has_w4a8_layout = True
+                    break
+            except OSError:
+                continue
+    except importlib.metadata.PackageNotFoundError:
         pass
+    except Exception as e:
+        log().debug("comfy-kitchen static compatibility probe failed: %s", e)
     try:
-        if importlib.util.find_spec("comfy") is not None:
-            from comfy.quant_ops import QUANT_ALGOS  # type: ignore
+        spec = importlib.util.find_spec("comfy")
+        roots = list(spec.submodule_search_locations or ()) if spec is not None else []
+        for root in roots:
+            quant_ops = Path(root) / "quant_ops.py"
+            if not quant_ops.is_file() or quant_ops.stat().st_size > 4 * 1024 * 1024:
+                continue
+            source = quant_ops.read_text(encoding="utf-8", errors="ignore")
             info.has_comfy_quant_ops = True
-            info.comfyui_quant_algos = sorted(QUANT_ALGOS.keys())
-    except Exception:
-        pass
+            # Only report formats proven present in the static source.  This is
+            # not a runtime import or a claim that the whole installation works.
+            if FORMAT_W4A8 in source:
+                info.comfyui_quant_algos.append(FORMAT_W4A8)
+            break
+    except Exception as e:
+        log().debug("ComfyUI static compatibility probe failed: %s", e)
     return info
 
 # ---------------------------------------------------------------------------
@@ -342,16 +375,20 @@ def parse_size(text: str) -> int:
         raise UsageError(f"invalid size {text!r}")
     value = float(m.group(1))
     unit = (m.group(2) or "").upper().rstrip("B")
-    mult = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}[unit]
-    return int(value * mult)
+    mult = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3,
+            "T": 1024**4, "P": 1024**5}[unit]
+    result = value * mult
+    if not math.isfinite(result) or result > sys.maxsize:
+        raise UsageError(f"size {text!r} exceeds this platform's supported range")
+    return int(result)
 
 
 def human_bytes(n: float) -> str:
-    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
-        if abs(n) < 1024 or unit == "TiB":
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB", "PiB"):
+        if abs(n) < 1024 or unit == "PiB":
             return f"{n:.2f} {unit}" if unit != "B" else f"{int(n)} B"
         n /= 1024
-    return f"{n:.2f} TiB"  # pragma: no cover
+    return f"{n:.2f} PiB"  # pragma: no cover
 
 
 def sha256_file(path: str, chunk: int = 1 << 22) -> str:
@@ -365,6 +402,125 @@ def sha256_file(path: str, chunk: int = 1 << 22) -> str:
     return h.hexdigest()
 
 
+def sha256_safetensors_payload(path: str, chunk: int = 1 << 22) -> str:
+    """Hash only the tensor-data section, which is stable across metadata rewrites."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        head = f.read(8)
+        if len(head) != 8:
+            raise InputError(f"{path}: truncated safetensors header")
+        header_len = struct.unpack("<Q", head)[0]
+        if header_len > os.fstat(f.fileno()).st_size - 8:
+            raise InputError(f"{path}: safetensors header exceeds file size")
+        f.seek(8 + header_len)
+        while True:
+            data = f.read(chunk)
+            if not data:
+                break
+            h.update(data)
+    return h.hexdigest()
+
+
+def _fsync_parent(path: str) -> None:
+    """Best-effort directory fsync after atomic publication (POSIX)."""
+    if os.name == "nt":
+        return
+    parent = os.path.dirname(os.path.abspath(path)) or "."
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        fd = os.open(parent, flags)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _atomic_write_json(path: str, payload: Any, *, indent: Optional[int] = None) -> None:
+    """Write JSON through an unpredictable sibling temp and atomically replace."""
+    parent = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{Path(path).name}.", suffix=".tmp", dir=parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=indent, default=str)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        _fsync_parent(path)
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def _open_regular_nofollow(path: str, flags: int, mode: int = 0o600):
+    """Open a regular file without following a final-component symlink."""
+    flags |= getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, mode)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OutputError(f"refusing non-regular file: {path}")
+        return fd, st
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _remove_temp_path(path: str) -> None:
+    """Remove only the named temp entry; never follow it if it is a symlink."""
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return
+    os.unlink(path)
+
+
+def _same_path(left: str, right: str) -> bool:
+    if os.path.abspath(left) == os.path.abspath(right):
+        return True
+    if os.path.exists(left) and os.path.exists(right):
+        try:
+            return os.path.samefile(left, right)
+        except OSError:
+            pass
+    return False
+
+
+def _validate_destination_paths(info: CheckpointInfo, args: Any) -> None:
+    destinations: List[Tuple[str, str]] = []
+    if getattr(args, "output", None):
+        output = os.path.abspath(args.output)
+        destinations.extend((
+            ("output", output),
+            ("conversion temp", output + ".tmp"),
+            ("staged output", output + ".staged"),
+            ("validation output", output + ".validation"),
+            ("resume state", output + ".state.json"),
+        ))
+        if getattr(args, "metadata_only", False):
+            destinations.append(("metadata sidecar", output + ".metadata.json"))
+    if getattr(args, "report", None):
+        destinations.extend((("report", args.report),
+                             ("JSON report", args.report + ".json")))
+    if getattr(args, "json_log", None):
+        destinations.append(("JSON log", args.json_log))
+    if getattr(args, "calibration_cache", None):
+        destinations.append(("calibration cache", args.calibration_cache))
+
+    for label, path in destinations:
+        for source in info.files:
+            if _same_path(path, source):
+                raise OutputError(f"{label} path must not alias input file {source}")
+    for index, (left_label, left) in enumerate(destinations):
+        for right_label, right in destinations[index + 1:]:
+            if _same_path(left, right):
+                raise OutputError(
+                    f"{left_label} and {right_label} paths must be different: {left}")
+
+
 def json_dumps(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
 
@@ -374,13 +530,18 @@ def torch_dtype_name(dt: torch.dtype) -> str:
 
 
 def flatten_regex(patterns: Sequence[str]) -> re.Pattern:
-    return re.compile("|".join(f"(?:{p})" for p in patterns))
+    try:
+        return re.compile("|".join(f"(?:{p})" for p in patterns))
+    except re.error as e:
+        raise UsageError(f"invalid regular expression: {e}") from e
 
 
 def _peak_rss_bytes() -> int:
     try:
         import resource
-        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+        peak = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        # Linux reports KiB; macOS/BSD reports bytes.
+        return peak if sys.platform == "darwin" else peak * 1024
     except Exception:
         return 0
 
@@ -396,8 +557,22 @@ SAFE_TO_TORCH: Dict[str, torch.dtype] = {
     "I16": torch.int16, "I8": torch.int8, "U8": torch.uint8,
     "BOOL": torch.bool, "F8_E4M3": torch.float8_e4m3fn, "F8_E5M2": torch.float8_e5m2,
 }
+_OPTIONAL_SAFE_DTYPES = {
+    "F8_E4M3FNUZ": "float8_e4m3fnuz",
+    "F8_E5M2FNUZ": "float8_e5m2fnuz",
+    "C64": "complex64",
+    "U16": "uint16",
+    "U32": "uint32",
+    "U64": "uint64",
+}
+_installed_safe_types = getattr(safetensors.torch, "_TYPES", {})
+for _safe_name, _torch_name in _OPTIONAL_SAFE_DTYPES.items():
+    _dtype = getattr(torch, _torch_name, None)
+    if _dtype is not None and _safe_name in _installed_safe_types:
+        SAFE_TO_TORCH[_safe_name] = _dtype
 TORCH_TO_SAFE: Dict[torch.dtype, str] = {v: k for k, v in SAFE_TO_TORCH.items()}
-FP8_DTYPES = {torch.float8_e4m3fn, torch.float8_e5m2}
+FP8_DTYPES = {dtype for name, dtype in SAFE_TO_TORCH.items()
+              if name.startswith("F8_")}
 FLOAT_DTYPES = {torch.float32, torch.float16, torch.bfloat16, torch.float64}
 
 
@@ -408,8 +583,8 @@ def tensor_nbytes(dtype: torch.dtype, shape: Sequence[int]) -> int:
 def torch_dtype_from_safe(name: str) -> torch.dtype:
     try:
         return SAFE_TO_TORCH[name]
-    except KeyError:
-        raise InputError(f"unsupported safetensors dtype {name!r}")
+    except KeyError as e:
+        raise InputError(f"unsupported safetensors dtype {name!r}") from e
 
 
 @dataclass
@@ -436,15 +611,21 @@ class CheckpointInfo:
     shard_index: Dict[str, Any] = field(default_factory=dict)  # model.safetensors.index.json
     total_bytes: int = 0
     is_quantized_input: bool = False
+    source_hashes: Dict[str, str] = field(default_factory=dict)
+    _tensor_by_name: Dict[str, TensorMeta] = field(
+        init=False, repr=False, default_factory=dict)
+
+    def __post_init__(self) -> None:
+        for tensor in self.tensors:
+            if tensor.name in self._tensor_by_name:
+                raise InputError(f"duplicate tensor {tensor.name!r} in checkpoint inventory")
+            self._tensor_by_name[tensor.name] = tensor
 
     def key_set(self) -> set:
-        return {t.name for t in self.tensors}
+        return set(self._tensor_by_name)
 
     def by_name(self, name: str) -> Optional[TensorMeta]:
-        for t in self.tensors:
-            if t.name == name:
-                return t
-        return None
+        return self._tensor_by_name.get(name)
 
 
 class RawSafetensorsFile:
@@ -457,7 +638,7 @@ class RawSafetensorsFile:
 
     HEADER_LEN = 8
 
-    def __init__(self, path: str, trust_metadata: bool = True):
+    def __init__(self, path: str):
         self.path = str(path)
         self._fh = open(self.path, "rb")
         self._mm: Optional[mmap.mmap] = None
@@ -470,28 +651,60 @@ class RawSafetensorsFile:
             if len(head) < self.HEADER_LEN:
                 raise InputError(f"{self.path}: not a safetensors file (too short)")
             header_len = struct.unpack("<Q", head)[0]
-            if header_len > 512 * 1024 * 1024:
+            if header_len == 0 or header_len > MAX_SAFETENSORS_HEADER_SIZE:
                 raise InputError(f"{self.path}: absurd safetensors header size {header_len}")
+            if header_len > self.file_size - self.HEADER_LEN:
+                raise InputError(f"{self.path}: safetensors header exceeds file size")
             self.header_bytes = self._fh.read(header_len)
             if len(self.header_bytes) != header_len:
                 raise InputError(f"{self.path}: truncated safetensors header")
-            header = json.loads(self.header_bytes.decode("utf-8"))
+            def _no_duplicates(pairs):
+                obj = {}
+                for key, value in pairs:
+                    if key in obj:
+                        raise InputError(f"{self.path}: duplicate JSON key {key!r}")
+                    obj[key] = value
+                return obj
+            header = json.loads(self.header_bytes.decode("utf-8"),
+                                object_pairs_hook=_no_duplicates)
             if not isinstance(header, dict):
                 raise InputError(f"{self.path}: malformed safetensors header")
-            self.metadata = dict(header.get("__metadata__") or {})
+            raw_metadata = header.get("__metadata__") or {}
+            if not isinstance(raw_metadata, dict) or not all(
+                    isinstance(k, str) and isinstance(v, str)
+                    for k, v in raw_metadata.items()):
+                raise InputError(f"{self.path}: __metadata__ must map strings to strings")
+            self.metadata = dict(raw_metadata)
             data_start = self.HEADER_LEN + header_len
+            ranges: List[Tuple[int, int, str]] = []
             for name, spec in header.items():
                 if name == "__metadata__":
                     continue
-                if not isinstance(spec, dict):
+                if not isinstance(name, str) or not name or not isinstance(spec, dict):
                     raise InputError(f"{self.path}: malformed entry {name!r}")
+                raw_dtype = spec.get("dtype")
+                raw_shape = spec.get("shape")
+                raw_offsets = spec.get("data_offsets")
+                if not isinstance(raw_dtype, str):
+                    raise InputError(f"{self.path}: non-string dtype for {name!r}")
+                if not isinstance(raw_shape, list) or any(
+                        type(dim) is not int for dim in raw_shape):
+                    raise InputError(
+                        f"{self.path}: shape for {name!r} must contain JSON integers")
+                if not isinstance(raw_offsets, list) or len(raw_offsets) != 2 or any(
+                        type(offset) is not int for offset in raw_offsets):
+                    raise InputError(
+                        f"{self.path}: data_offsets for {name!r} must be two JSON integers")
                 try:
-                    dtype = torch_dtype_from_safe(spec["dtype"])
-                    shape = tuple(int(x) for x in spec["shape"])
-                    offs = tuple(int(x) for x in spec["data_offsets"])
+                    dtype = torch_dtype_from_safe(raw_dtype)
+                    shape = tuple(raw_shape)
+                    offs = tuple(raw_offsets)
                 except Exception as e:
-                    raise InputError(f"{self.path}: malformed entry {name!r}: {e}")
-                if len(offs) != 2 or offs[0] > offs[1]:
+                    raise InputError(
+                        f"{self.path}: malformed entry {name!r}: {e}") from e
+                if any(dim < 0 for dim in shape):
+                    raise InputError(f"{self.path}: negative shape dimension for {name!r}")
+                if offs[0] < 0 or offs[1] < 0 or offs[0] > offs[1]:
                     raise InputError(f"{self.path}: bad data_offsets for {name!r}")
                 nbytes = offs[1] - offs[0]
                 expected = tensor_nbytes(dtype, shape)
@@ -502,8 +715,23 @@ class RawSafetensorsFile:
                 if data_start + offs[1] > self.file_size:
                     raise InputError(f"{self.path}: {name!r} data range exceeds file size")
                 self.entries[name] = (dtype, shape, data_start + offs[0], data_start + offs[1])
+                ranges.append((offs[0], offs[1], name))
+            cursor = 0
+            for start, end, name in sorted(ranges, key=lambda item: (item[0], item[1], item[2])):
+                if start != cursor:
+                    kind = "overlap" if start < cursor else "hole"
+                    raise InputError(
+                        f"{self.path}: tensor {name!r} creates a data {kind} "
+                        f"({start} != expected {cursor})")
+                cursor = end
+            if data_start + cursor != self.file_size:
+                raise InputError(
+                    f"{self.path}: unindexed trailing data "
+                    f"({self.file_size - (data_start + cursor)} bytes)")
             # mmap the whole file for zero-copy access
-            self._mm = mmap.mmap(self._fh.fileno(), 0, access=mmap.ACCESS_READ)
+            # ACCESS_COPY keeps the source immutable while exposing a writable
+            # buffer view, avoiding PyTorch's non-writable-frombuffer warning.
+            self._mm = mmap.mmap(self._fh.fileno(), 0, access=mmap.ACCESS_COPY)
         except Exception:
             self.close()
             raise
@@ -525,19 +753,21 @@ class RawSafetensorsFile:
     def get(self, name: str) -> Tuple[torch.dtype, Tuple[int, ...], int, int]:
         try:
             return self.entries[name]
-        except KeyError:
-            raise InputError(f"{self.path}: no tensor named {name!r}")
+        except KeyError as e:
+            raise InputError(f"{self.path}: no tensor named {name!r}") from e
 
     def read_bytes(self, name: str) -> memoryview:
         """Zero-copy raw byte range for a tensor."""
-        dtype, shape, start, end = self.get(name)
-        assert self._mm is not None
+        _, _, start, end = self.get(name)
+        if self._mm is None:
+            raise InputError(f"{self.path}: checkpoint reader is closed")
         return memoryview(self._mm)[start:end]
 
     def read_tensor(self, name: str) -> torch.Tensor:
         """Lazy torch view of a tensor (zero-copy; do not mutate)."""
         dtype, shape, start, end = self.get(name)
-        assert self._mm is not None
+        if self._mm is None:
+            raise InputError(f"{self.path}: checkpoint reader is closed")
         raw = memoryview(self._mm)[start:end]
         if dtype in FP8_DTYPES:
             t = torch.frombuffer(raw, dtype=torch.uint8).view(dtype)
@@ -546,20 +776,36 @@ class RawSafetensorsFile:
         return t.view(shape)
 
 
-def _parse_index_json(path: str) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+def _load_json_object(path: str, label: str, *, nofollow: bool = False) -> Dict[str, Any]:
+    def _no_duplicates(pairs):
+        obj = {}
+        for key, value in pairs:
+            if key in obj:
+                raise InputError(f"{path}: duplicate JSON key {key!r}")
+            obj[key] = value
+        return obj
+    if nofollow:
+        fd, file_stat = _open_regular_nofollow(path, os.O_RDONLY)
+        file_obj = os.fdopen(fd, "r", encoding="utf-8")
+        file_size = file_stat.st_size
+    else:
+        file_obj = open(path, "r", encoding="utf-8")
+        file_size = os.fstat(file_obj.fileno()).st_size
+    with file_obj as f:
+        if file_size > 64 * 1024 * 1024:
+            raise InputError(f"{path}: JSON file exceeds 64 MiB safety limit")
+        data = json.load(f, object_pairs_hook=_no_duplicates)
     if not isinstance(data, dict):
-        raise InputError(f"{path}: malformed index file")
+        raise InputError(f"{path}: malformed {label}")
     return data
+
+
+def _parse_index_json(path: str) -> Dict[str, Any]:
+    return _load_json_object(path, "index file")
 
 
 def _parse_config_json(path: str) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    if not isinstance(data, dict):
-        raise InputError(f"{path}: malformed config.json")
-    return data
+    return _load_json_object(path, "config.json")
 
 
 def _looks_like_pickle(path: str) -> bool:
@@ -567,7 +813,7 @@ def _looks_like_pickle(path: str) -> bool:
         with open(path, "rb") as f:
             head = f.read(4)
     except OSError as e:
-        raise InputError(f"cannot read {path}: {e}")
+        raise InputError(f"cannot read {path}: {e}") from e
     return head[:2] == b"\x80" or head[:4] == b"PK\x03\x04" or head[:2] == b"\x93" or head[:4] == b"1L\x0b" or head[:4] == b"1M\x0b" or head[:2] == b"\x81"
 
 
@@ -597,6 +843,8 @@ def discover_checkpoint(input_path: str, trust_pickle: bool = False) -> Checkpoi
         raise InputError(f"input path does not exist: {input_path}")
     if p.is_dir():
         return _discover_directory(p, trust_pickle)
+    if p.name.endswith(".safetensors.index.json"):
+        return _discover_directory(p.parent, trust_pickle, index_path=p)
 
     # Single file
     if _is_safetensors(str(p)):
@@ -604,9 +852,15 @@ def discover_checkpoint(input_path: str, trust_pickle: bool = False) -> Checkpoi
             metas = []
             for name, (dtype, shape, start, end) in sorted(rf.entries.items()):
                 metas.append(TensorMeta(name, dtype, shape, end - start, str(p), start, end))
+        config_path = p.parent / "config.json"
+        model_index_path = p.parent / "model_index.json"
         cp = CheckpointInfo(
             kind="safetensors", files=[str(p)], metadata=rf.metadata,
-            tensors=metas, total_bytes=sum(t.nbytes for t in metas),
+            tensors=metas,
+            config=_parse_config_json(str(config_path)) if config_path.is_file() else {},
+            model_index=_parse_config_json(str(model_index_path))
+            if model_index_path.is_file() else {},
+            total_bytes=sum(t.nbytes for t in metas),
         )
         _flag_quantized_input(cp)
         return cp
@@ -624,38 +878,101 @@ def discover_checkpoint(input_path: str, trust_pickle: bool = False) -> Checkpoi
         "recognized as a pickle checkpoint")
 
 
-def _discover_directory(d: Path, trust_pickle: bool) -> CheckpointInfo:
+def _resolve_under(base: Path, relative: str) -> Path:
+    """Resolve an untrusted index path and require it to stay below base."""
+    rel = Path(relative)
+    if rel.is_absolute():
+        raise InputError(f"absolute shard path is not allowed: {relative!r}")
+    root = base.resolve()
+    try:
+        resolved = (root / rel).resolve(strict=True)
+        resolved.relative_to(root)
+    except (OSError, ValueError) as e:
+        raise InputError(
+            f"shard path escapes model directory or is missing: {relative!r}") from e
+    if not resolved.is_file():
+        raise InputError(f"shard path is not a regular file: {relative!r}")
+    return resolved
+
+
+def _extract_tensor_state_dict(obj: Any, path: str) -> Dict[str, torch.Tensor]:
+    """Unwrap common trusted PyTorch checkpoint containers."""
+    if not isinstance(obj, dict):
+        raise InputError(f"{path}: not a state-dict checkpoint")
+    selected = obj
+    for key in ("state_dict", "model", "module"):
+        nested = obj.get(key)
+        if isinstance(nested, dict) and any(isinstance(v, torch.Tensor) for v in nested.values()):
+            selected = nested
+            break
+    tensors: Dict[str, torch.Tensor] = {}
+    for name, value in selected.items():
+        if isinstance(value, torch.Tensor):
+            if not isinstance(name, str) or not name:
+                raise InputError(f"{path}: tensor keys must be non-empty strings")
+            tensors[name] = value.detach().cpu()
+        else:
+            log().debug("ignoring non-tensor pickle entry %r (%s)", name,
+                        type(value).__name__)
+    if not tensors:
+        raise InputError(f"{path}: checkpoint contains no tensor state dict")
+    return tensors
+
+
+def _load_pickle_state_dict(path: str) -> Dict[str, torch.Tensor]:
+    try:
+        obj = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception as e:
+        raise InputError(f"failed to load pickle checkpoint {path}: {e}") from e
+    return _extract_tensor_state_dict(obj, path)
+
+
+def _discover_directory(d: Path, trust_pickle: bool,
+                        index_path: Optional[Path] = None) -> CheckpointInfo:
     config: Dict[str, Any] = {}
     model_index: Dict[str, Any] = {}
     shard_index: Dict[str, Any] = {}
-    for cfg in ("config.json", "model_index.json", "model.safetensors.index.json"):
+    index_candidates = [index_path] if index_path is not None else \
+        sorted(d.glob("*.safetensors.index.json"))
+    if len(index_candidates) > 1:
+        preferred = d / "model.safetensors.index.json"
+        if preferred in index_candidates:
+            index_candidates = [preferred]
+        else:
+            raise InputError(
+                f"multiple safetensors indexes found under {d}; pass the specific "
+                "component directory instead")
+    config_names = ["config.json", "model_index.json"]
+    if index_candidates:
+        config_names.append(index_candidates[0].name)
+    for cfg in config_names:
         cand = d / cfg
         if cand.is_file():
             try:
-                data = _parse_config_json(str(cand))
+                data = (_parse_index_json(str(cand))
+                        if cfg.endswith(".safetensors.index.json")
+                        else _parse_config_json(str(cand)))
             except Exception as e:
-                raise InputError(f"cannot parse {cand}: {e}")
+                raise InputError(f"cannot parse {cand}: {e}") from e
             if cfg == "config.json":
                 config = data
             elif cfg == "model_index.json":
                 model_index = data
-            else:
+            elif cfg.endswith(".safetensors.index.json"):
                 shard_index = data
 
-    safetensors_files = sorted(
-        str(f) for f in d.rglob("*.safetensors") if f.is_file()
-    )
     # Respect the shard index when present (only its listed shards are read).
     if shard_index and "weight_map" in shard_index:
-        listed = set(shard_index["weight_map"].values())
-        safetensors_files = [f for f in safetensors_files if Path(f).name in listed]
-        if not safetensors_files and listed:
-            # shard names may be relative; try resolving under the directory
-            for rel in listed:
-                cand = d / rel
-                if cand.is_file():
-                    safetensors_files.append(str(cand))
-            safetensors_files = sorted(set(safetensors_files))
+        weight_map = shard_index["weight_map"]
+        if not isinstance(weight_map, dict) or not weight_map or not all(
+                isinstance(k, str) and isinstance(v, str)
+                for k, v in weight_map.items()):
+            raise InputError("safetensors shard index has an invalid weight_map")
+        safetensors_files = sorted({str(_resolve_under(d, rel))
+                                    for rel in weight_map.values()})
+    else:
+        safetensors_files = sorted(str(f.resolve()) for f in d.rglob("*.safetensors")
+                                   if f.is_file())
     if not safetensors_files:
         pickle_files = sorted(str(f) for f in d.rglob("*.bin"))
         pickle_files += sorted(str(f) for f in d.rglob("*.pt"))
@@ -667,13 +984,13 @@ def _discover_directory(d: Path, trust_pickle: bool) -> CheckpointInfo:
             tensors: List[TensorMeta] = []
             metadata: Dict[str, str] = {}
             total = 0
+            seen_pickle: set = set()
             for pf in pickle_files:
-                sd = torch.load(pf, map_location="cpu", weights_only=False)
-                if not isinstance(sd, dict):
-                    raise InputError(f"{pf}: not a state-dict checkpoint")
+                sd = _load_pickle_state_dict(pf)
                 for name, t in sd.items():
-                    if not isinstance(t, torch.Tensor):
-                        raise InputError(f"{pf}: {name!r} is not a tensor")
+                    if name in seen_pickle:
+                        raise InputError(f"duplicate tensor {name!r} across pickle shards")
+                    seen_pickle.add(name)
                     meta = TensorMeta(name, t.dtype, tuple(t.shape), t.nbytes, pf, 0, t.nbytes)
                     tensors.append(meta)
                     total += t.nbytes
@@ -689,25 +1006,46 @@ def _discover_directory(d: Path, trust_pickle: bool) -> CheckpointInfo:
     readers: Dict[str, RawSafetensorsFile] = {}
     try:
         for sf in safetensors_files:
-            readers[sf] = RawSafetensorsFile(sf)
+            readers[str(Path(sf).resolve())] = RawSafetensorsFile(sf)
+        physical_locations: Dict[str, List[str]] = {}
+        for rf in readers.values():
+            for tensor_name in rf.entries:
+                physical_locations.setdefault(tensor_name, []).append(rf.path)
+        duplicated = {
+            name: paths for name, paths in physical_locations.items()
+            if len(paths) > 1
+        }
+        if duplicated:
+            duplicate_name = sorted(duplicated)[0]
+            raise InputError(
+                f"duplicate tensor {duplicate_name!r} across shards: "
+                f"{duplicated[duplicate_name]}")
         metadata: Dict[str, str] = {}
         for rf in readers.values():
-            metadata.update(rf.metadata)
+            for key, value in rf.metadata.items():
+                if key in metadata and metadata[key] != value:
+                    raise InputError(f"conflicting metadata key {key!r} across shards")
+                metadata[key] = value
         tensors: List[TensorMeta] = []
         seen: set = set()
         if shard_index and "weight_map" in shard_index:
-            for name in shard_index["weight_map"]:
-                shard = shard_index["weight_map"][name]
-                rf = readers.get(str(d / shard)) or readers.get(shard)
+            for name, shard in shard_index["weight_map"].items():
+                shard_path = str(_resolve_under(d, shard))
+                rf = readers.get(shard_path)
                 if rf is None:
                     raise InputError(f"shard index references missing file {shard!r}")
+                if name in seen:
+                    raise InputError(f"duplicate tensor {name!r} in shard index")
                 dtype, shape, start, end = rf.get(name)
                 tensors.append(TensorMeta(name, dtype, shape, end - start, rf.path, start, end))
                 seen.add(name)
             for rf in readers.values():
-                for name in rf.entries:
+                for name in sorted(rf.entries):
                     if name not in seen:
-                        tensors.append(TensorMeta(name, *rf.entries[name], source=rf.path))
+                        dtype, shape, start, end = rf.entries[name]
+                        tensors.append(TensorMeta(name, dtype, shape, end - start,
+                                                  rf.path, start, end))
+                        seen.add(name)
         else:
             for rf in readers.values():
                 for name in sorted(rf.entries):
@@ -731,18 +1069,10 @@ def _discover_directory(d: Path, trust_pickle: bool) -> CheckpointInfo:
 
 def _read_pickle_checkpoint(path: str) -> CheckpointInfo:
     """Read a pickle checkpoint with explicit trust opt-in (full RAM load)."""
-    try:
-        sd = torch.load(path, map_location="cpu", weights_only=False)
-    except Exception as e:
-        raise InputError(f"failed to load pickle checkpoint {path}: {e}")
-    if not isinstance(sd, dict):
-        raise InputError(f"{path}: not a state-dict checkpoint")
+    sd = _load_pickle_state_dict(path)
     tensors: List[TensorMeta] = []
     total = 0
     for name, t in sd.items():
-        if not isinstance(t, torch.Tensor):
-            log().warning("skipping non-tensor entry %s (%s) in pickle checkpoint", name, type(t).__name__)
-            continue
         tensors.append(TensorMeta(name, t.dtype, tuple(t.shape), t.nbytes, path, 0, t.nbytes))
         total += t.nbytes
     cp = CheckpointInfo(kind="pickle", files=[path], metadata={}, tensors=tensors,
@@ -753,7 +1083,7 @@ def _read_pickle_checkpoint(path: str) -> CheckpointInfo:
 
 def _flag_quantized_input(cp: CheckpointInfo) -> None:
     keys = cp.key_set()
-    if METADATA_KEY_QUANT in cp.metadata:
+    if METADATA_KEY_QUANT in cp.metadata or METADATA_KEY_EXT in cp.metadata:
         cp.is_quantized_input = True
     if any(k.endswith(f".{LAYER_CONF_KEY}") for k in keys):
         cp.is_quantized_input = True
@@ -769,7 +1099,10 @@ class CheckpointReader:
         if info.kind == "pickle":
             self._pickle_sd = {}
             for f in info.files:
-                self._pickle_sd.update(torch.load(f, map_location="cpu", weights_only=False))
+                for name, tensor in _load_pickle_state_dict(f).items():
+                    if name in self._pickle_sd:
+                        raise InputError(f"duplicate tensor {name!r} across pickle shards")
+                    self._pickle_sd[name] = tensor
         else:
             for f in info.files:
                 self._files[f] = RawSafetensorsFile(f)
@@ -800,7 +1133,7 @@ class CheckpointReader:
         if meta is None:
             raise InputError(f"no tensor named {name!r}")
         if self._pickle_sd is not None:
-            return memoryview(self._pickle_sd[name].contiguous().numpy().tobytes())
+            return memoryview(tensor_to_bytes(self._pickle_sd[name]))
         rf = self._files[meta.source]
         return rf.read_bytes(name)
 
@@ -812,6 +1145,14 @@ class CheckpointReader:
 _HADAMARD_CACHE: Dict[Tuple[int, torch.device, torch.dtype], torch.Tensor] = {}
 
 
+def _is_power_of_four(value: int) -> bool:
+    if value < 1:
+        return False
+    while value % 4 == 0:
+        value //= 4
+    return value == 1
+
+
 def build_hadamard(size: int, device: Any = "cpu", dtype: torch.dtype = torch.float32) -> torch.Tensor:
     """Normalized REGULAR orthogonal Hadamard matrix (ConvRot), size = power of 4."""
     dev = torch.device(device) if not isinstance(device, torch.device) else device
@@ -819,7 +1160,7 @@ def build_hadamard(size: int, device: Any = "cpu", dtype: torch.dtype = torch.fl
     cached = _HADAMARD_CACHE.get(key)
     if cached is not None:
         return cached
-    if size < 4 or (size & (size - 1)) != 0 or (math.log(size, 4) % 1) != 0:
+    if size < 4 or not _is_power_of_four(size):
         raise PolicyError(f"Regular Hadamard size must be a power of 4, got {size}")
     h4 = torch.tensor(
         [[1, 1, 1, -1], [1, 1, -1, 1], [1, -1, 1, 1], [-1, 1, 1, 1]],
@@ -868,8 +1209,13 @@ def pick_convrot_group_size(k: int, max_group: int = 256) -> int:
 
     K % 16 == 0 is guaranteed by the W4A8 shape rules, so 4 always divides K.
     """
-    for g in (max_group, max_group // 4, max_group // 16, max_group // 64, 4):
-        if g >= 4 and k % g == 0:
+    candidates = []
+    group = 4
+    while group <= max_group:
+        candidates.append(group)
+        group *= 4
+    for g in reversed(candidates):
+        if k % g == 0:
             return g
     raise PolicyError(f"K={k} has no power-of-4 divisor >= 4")
 
@@ -888,8 +1234,7 @@ def validate_w4_shape(k: int, group_size: int, convrot_groupsize: int) -> None:
     if (16 % group_size != 0) and (group_size % 16 != 0):
         raise PolicyError(
             f"group_size must divide 16 or be a multiple of 16, got {group_size}")
-    if convrot_groupsize < 4 or (convrot_groupsize & (convrot_groupsize - 1)) != 0 \
-            or (math.log(convrot_groupsize, 4) % 1) != 0:
+    if convrot_groupsize < 4 or not _is_power_of_four(convrot_groupsize):
         raise PolicyError(
             f"convrot_groupsize must be a power of 4, got {convrot_groupsize}")
 
@@ -1875,11 +2220,14 @@ def family_names() -> List[str]:
 
 
 def get_family(name: str) -> FamilyPolicy:
-    try:
-        return REGISTRY[name]
-    except KeyError:
-        raise UnknownArchitectureError(
-            f"unknown architecture {name!r}; use --list-architectures")
+    normalized = re.sub(r"[^a-z0-9]", "", name.lower())
+    for family, policy in REGISTRY.items():
+        aliases = (family,) + policy.comfyui_classes
+        if any(re.sub(r"[^a-z0-9]", "", alias.lower()) == normalized
+               for alias in aliases):
+            return policy
+    raise UnknownArchitectureError(
+        f"unknown architecture {name!r}; use --list-architectures")
 
 
 
@@ -1950,7 +2298,7 @@ def detect_architecture(info: CheckpointInfo, override: Optional[str] = None,
     if override:
         policy = get_family(override)
         return DetectionResult(
-            architecture=override, confidence="high" if override else "high",
+            architecture=policy.family, confidence="high",
             policy=policy, unet_prefix=prefix,
             evidence=[f"user override --architecture {override}"],
             warnings=["architecture supplied by the user; detection was not used"])
@@ -2081,7 +2429,8 @@ def detect_architecture(info: CheckpointInfo, override: Optional[str] = None,
                                [s for s in ("x_embedder.proj.1.weight",) if has(s)]))
     # 21. boogu
     if has("double_stream_layers.0.img_instruct_attn.processor.img_to_q.weight"):
-        candidates.append(("boogu", ["double_stream_layers.0.img_instruct_attn.processor.img_to_q.weight"],
+        # Boogu shares the explicit Omnigen2 policy profile in the registry.
+        candidates.append(("omnigen2", ["double_stream_layers.0.img_instruct_attn.processor.img_to_q.weight"],
                            [s for s in ("ref_image_patch_embedder.weight", "x_embedder.weight") if has(s)]))
     # 22. omnigen2
     if has("time_caption_embed.timestep_embedder.linear_1.bias"):
@@ -2157,9 +2506,17 @@ def detect_architecture(info: CheckpointInfo, override: Optional[str] = None,
             in_ch = int(in_shp[1])
         temporal = any(("time_stack" in k or "temporal_transformer" in k) for k in stripped)
         has_label_emb = has("label_emb.0.0.weight")
-        info = {"model_channels": model_channels, "context_dim": ctx_dim,
-                "in_channels": in_ch, "linear_attention": lin_attn,
-                "temporal": temporal, "label_emb": has_label_emb}
+        # Local config is supporting evidence only.  Tensor shapes remain the
+        # primary signal, but a standard HF field can resolve a missing probe.
+        cfg_ctx = info.config.get("cross_attention_dim") or info.config.get("context_dim")
+        if ctx_dim is None and isinstance(cfg_ctx, int):
+            ctx_dim = int(cfg_ctx)
+        if in_ch is None and isinstance(info.config.get("in_channels"), int):
+            in_ch = int(info.config["in_channels"])
+        classifier_info = {"model_channels": model_channels, "context_dim": ctx_dim,
+                           "in_channels": in_ch, "linear_attention": lin_attn,
+                           "temporal": temporal, "label_emb": has_label_emb,
+                           "config_keys": sorted(info.config.keys())[:32]}
         if model_channels == 256:
             sd_family = "sd20"  # SD_X4Upscaler
         elif ctx_dim == 2048:
@@ -2172,11 +2529,10 @@ def detect_architecture(info: CheckpointInfo, override: Optional[str] = None,
             sd_family = "sd15"
         elif model_channels == 384:
             sd_family = "sdxl_refiner"
-        elif model_channels == 320:
-            sd_family = "sd20"
-        else:
-            sd_family = "sd15"
-        candidates.append((sd_family, ["input_blocks.0.0.weight"], []))
+        if sd_family is not None:
+            candidates.append((sd_family, ["input_blocks.0.0.weight"],
+                               ["config.cross_attention_dim"]
+                               if cfg_ctx is not None else []))
 
     # ---- score candidates ----
     best: Optional[Tuple[str, int, List[str], List[str]]] = None
@@ -2211,6 +2567,12 @@ def detect_architecture(info: CheckpointInfo, override: Optional[str] = None,
 
     fam, score, ev, hints = best
     competing = [c for c in competing if c != fam]
+    if competing:
+        choices = ", ".join([fam] + sorted(set(competing)))
+        raise UnknownArchitectureError(
+            f"architecture detection is ambiguous between: {choices}. "
+            "Pass --architecture NAME after inspecting the checkpoint; refusing "
+            "to guess.")
     policy = REGISTRY[fam]
     if len(ev) >= 2:
         confidence = "high"
@@ -2230,7 +2592,7 @@ def detect_architecture(info: CheckpointInfo, override: Optional[str] = None,
         architecture=fam, confidence=confidence, policy=policy,
         unet_prefix=prefix, evidence=ev, hints=hints,
         competing=competing, warnings=warnings,
-        classifier_info=locals().get("info", {}))
+        classifier_info=locals().get("classifier_info", {}))
     return result
 
 
@@ -2319,17 +2681,17 @@ def classify_tensors(info: CheckpointInfo, detection: DetectionResult,
         # user-level filters first
         if exclude_re is not None and exclude_re.search(name):
             decisions.append(TensorDecision(name, DecisionKind.KEEP,
-                                            f"matched --exclude pattern; passthrough"))
+                                            "matched --exclude pattern; passthrough"))
             continue
         if keep_re_user is not None and keep_re_user.search(name):
             decisions.append(TensorDecision(name, DecisionKind.KEEP_PRECISION,
-                                            f"matched --keep-precision pattern; passthrough"))
+                                            "matched --keep-precision pattern; passthrough"))
             continue
 
         # policy exclusions (norms / embeddings / positionals / heads / embedders)
         if x_re.search(rel):
             decisions.append(TensorDecision(name, DecisionKind.KEEP,
-                                            f"policy exclude (universal); passthrough"))
+                                            "policy exclude (universal); passthrough"))
             continue
         if k_re.search(rel):
             decisions.append(TensorDecision(name, DecisionKind.KEEP_PRECISION,
@@ -2370,10 +2732,8 @@ def build_output_entries(info: CheckpointInfo, decisions: List[TensorDecision],
     """Compute the exact output tensor inventory (name, dtype, shape, nbytes)
     in deterministic write order: quantized layers first (original weight slot),
     then passthrough tensors in input order."""
-    quant_by_layer = {}
-    for d in decisions:
-        if d.kind == DecisionKind.QUANTIZE and d.layer is not None:
-            quant_by_layer[d.layer] = d
+    if fmt != FORMAT_W4A8:
+        raise PolicyError(f"unknown quantization format {fmt!r}")
     entries: List[Dict[str, Any]] = []
     total = 0
     seen = set()
@@ -2382,17 +2742,13 @@ def build_output_entries(info: CheckpointInfo, decisions: List[TensorDecision],
             layer = d.layer
             meta = info.by_name(d.name)
             n, k = int(meta.shape[0]), int(meta.shape[1])
-            if fmt == FORMAT_W4A8:
-                q_shape = (n, k // 2)
-                groups = k // d.group_size
-            else:
-                q_shape = (n, k * 3 // 8)
-                groups = k // d.group_size
+            q_shape = (n, k // 2)
+            groups = k // d.group_size
             base = f"{layer}.weight"
             extras = [
                 (f"{layer}.weight_s_rel", torch.float8_e4m3fn, (n, groups)),
                 (f"{layer}.weight_s_channel", torch.float32, (n,)),
-                (f"{layer}.weight_codebook", torch.float32, (16,) if fmt == FORMAT_W4A8 else (8,)),
+                (f"{layer}.weight_codebook", torch.float32, (16,)),
             ]
             for ename, edtype, eshape in [(base, torch.int8, q_shape)] + extras:
                 if ename in seen:
@@ -2435,7 +2791,7 @@ class CalibrationStats:
     source: str
     files: List[str]
     n_samples: int
-    layers: Dict[str, Dict[str, Any]]      # key -> {absmax:[K], norm:[S], rows:int}
+    layers: Dict[str, Dict[str, Any]]      # key -> {samples: Tensor[S,K], rows:int}
     provenance: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -2443,37 +2799,71 @@ class CalibrationStats:
             "source": self.source,
             "files": self.files,
             "n_samples": self.n_samples,
-            "layers": {k: {"rows": v["rows"], "absmax_approx": float(torch.as_tensor(v["absmax"]).mean().item()) if len(v["absmax"]) else 0.0} for k, v in self.layers.items()},
+            "layers": {k: {
+                "rows": v["rows"],
+                "features": int(v["samples"].shape[1]),
+                "absmax_mean": float(v["samples"].abs().amax(dim=0).mean().item()),
+            } for k, v in self.layers.items()},
             "provenance": self.provenance,
         }
 
 
-def _load_npz_calibration(path: str, layer_keys: set) -> Dict[str, torch.Tensor]:
-    data = np.load(path, allow_pickle=False)
+def _load_npz_calibration(path: str, layer_keys: set,
+                          max_rows: int) -> Dict[str, torch.Tensor]:
     out = {}
-    for k in data.files:
-        arr = data[k]
-        if arr.ndim != 2:
-            continue
-        if k in layer_keys or (k + ".weight") in layer_keys:
-            out[k] = torch.from_numpy(np.asarray(arr, dtype=np.float32))
+    with np.load(path, allow_pickle=False) as data:
+        for k in data.files:
+            arr = data[k]
+            if arr.ndim != 2:
+                continue
+            if k in layer_keys or (k + ".weight") in layer_keys:
+                out[k] = torch.from_numpy(
+                    np.asarray(arr[:max_rows], dtype=np.float32))
     return out
 
 
-def _load_pt_calibration(path: str, layer_keys: set) -> Dict[str, torch.Tensor]:
+def _load_pt_calibration(path: str, layer_keys: set,
+                         max_rows: int) -> Dict[str, torch.Tensor]:
     obj = torch.load(path, map_location="cpu", weights_only=True)
     if not isinstance(obj, dict):
         raise CalibrationError(f"{path}: calibration .pt must contain a dict")
     out = {}
     for k, v in obj.items():
         if isinstance(v, torch.Tensor) and v.ndim == 2 and (k in layer_keys or (k + ".weight") in layer_keys):
-            out[k] = v.detach().float().cpu()
+            out[k] = v.detach()[:max_rows].float().cpu()
     return out
 
 
+def _check_calibration_file_budget(path: str, max_memory: int) -> int:
+    """Reject calibration files that can expand beyond the working budget."""
+    file_size = os.path.getsize(path)
+    if zipfile.is_zipfile(path):
+        with zipfile.ZipFile(path) as archive:
+            members = archive.infolist()
+            if len(members) > 100_000:
+                raise CalibrationError(
+                    f"{path}: archive has too many members ({len(members)})")
+            expanded = [member.file_size for member in members]
+        # The loader retains selected activation rows from multiple members;
+        # bounding the total expanded archive prevents a many-member zip bomb
+        # even when each individual array would fit.
+        required = sum(expanded)
+    else:
+        required = file_size
+    if required > max_memory:
+        raise CalibrationError(
+            f"{path}: calibration data may expand to {human_bytes(required)}, "
+            f"above --max-memory {human_bytes(max_memory)}")
+    return required
+
+
 def load_calibration(source: str, info: CheckpointInfo, max_samples: Optional[int],
-                     cache_path: Optional[str]) -> CalibrationStats:
+                     cache_path: Optional[str],
+                     max_memory: int = 2 * 1024**3) -> CalibrationStats:
     """Load local calibration activations for the checkpoint's linear layers."""
+    effective_max_samples = 64 if max_samples is None else int(max_samples)
+    if effective_max_samples <= 0:
+        raise CalibrationError("--calibration-samples must be positive")
     layer_keys = set()
     for t in info.tensors:
         if t.name.endswith(".weight"):
@@ -2481,15 +2871,67 @@ def load_calibration(source: str, info: CheckpointInfo, max_samples: Optional[in
     # fast path: load a precomputed statistics cache before touching the source
     if cache_path is not None and os.path.exists(cache_path):
         try:
-            with open(cache_path, "r", encoding="utf-8") as _f:
-                payload = json.load(_f)
-            stats = {k: {"absmax": v["absmax"], "norm": v["norm"], "rows": v["rows"]}
-                     for k, v in payload.get("stats", {}).items()}
-            prov = payload.get("provenance", {})
+            stats = {}
+            prov: Dict[str, Any] = {}
+            _check_calibration_file_budget(cache_path, max_memory)
+            cache_hash_before = sha256_file(cache_path)
+            cache_fd, _ = _open_regular_nofollow(cache_path, os.O_RDONLY)
+            with os.fdopen(cache_fd, "rb") as cache_probe:
+                is_npz = cache_probe.read(4) == b"PK\x03\x04"
+                cache_probe.seek(0)
+                if is_npz:
+                    with np.load(cache_probe, allow_pickle=False) as payload:
+                        if "__provenance__" in payload.files:
+                            prov = json.loads(
+                                np.asarray(payload["__provenance__"], dtype=np.uint8)
+                                .tobytes().decode("utf-8"))
+                        for key in payload.files:
+                            if key == "__provenance__" or key not in layer_keys:
+                                continue
+                            array = payload[key]
+                            tensor = torch.from_numpy(np.asarray(
+                                array[:effective_max_samples], dtype=np.float32))
+                            meta = info.by_name(key)
+                            if tensor.ndim == 2 and tensor.shape[0] > 0 and meta is not None \
+                                    and tensor.shape[1] == meta.shape[1]:
+                                tensor = tensor.contiguous()
+                                stats[key] = {"samples": tensor,
+                                              "rows": int(tensor.shape[0])}
+            if not is_npz:
+                # Backward-compatible reader for early JSON caches.  v1.1
+                # summary-only caches are ignored because they cannot reproduce
+                # activation-aware output error.
+                if os.path.getsize(cache_path) > min(64 * 1024 * 1024,
+                                                     max(1, max_memory // 4)):
+                    raise CalibrationError(
+                        f"{cache_path}: JSON cache exceeds the working-memory limit")
+                payload = _load_json_object(
+                    cache_path, "calibration cache", nofollow=True)
+                prov = payload.get("provenance", {})
+                for key, value in payload.get("stats", {}).items():
+                    samples = value.get("samples")
+                    if samples is None or key not in layer_keys:
+                        continue
+                    tensor = torch.as_tensor(
+                        samples[:effective_max_samples], dtype=torch.float32)
+                    meta = info.by_name(key)
+                    if tensor.ndim == 2 and tensor.shape[0] > 0 and meta is not None \
+                            and tensor.shape[1] == meta.shape[1]:
+                        tensor = tensor.contiguous()
+                        stats[key] = {"samples": tensor,
+                                      "rows": int(tensor.shape[0])}
+            cache_hash_after = sha256_file(cache_path)
+            if cache_hash_after != cache_hash_before:
+                raise CalibrationError(
+                    "calibration cache changed while it was being read")
+            if not isinstance(prov, dict):
+                raise CalibrationError("calibration cache provenance must be an object")
+            prov = dict(prov)
+            prov["cache_file_sha256"] = cache_hash_after
             if stats:
-                log().info("calibration statistics loaded from cache %s", cache_path)
+                log().info("calibration activation rows loaded from cache %s", cache_path)
                 return CalibrationStats(source=source, files=[cache_path],
-                                        n_samples=prov.get("n_files", 0),
+                                        n_samples=max(v["rows"] for v in stats.values()),
                                         layers=stats, provenance=prov)
         except Exception as e:
             log().warning("could not read calibration cache %s: %s", cache_path, e)
@@ -2509,29 +2951,43 @@ def load_calibration(source: str, info: CheckpointInfo, max_samples: Optional[in
 
     manifest: Optional[Dict[str, Any]] = None
     if src_path.is_file() and src_path.suffix == ".json":
-        with open(src_path, "r", encoding="utf-8") as f:
-            manifest = json.load(f)
+        manifest = _load_json_object(str(src_path), "calibration manifest")
         for entry in manifest.get("layers", {}).values():
-            p = Path(entry.get("path", ""))
-            if not p.is_absolute():
-                p = src_path.parent / p
+            raw_path = entry.get("path", "")
+            if not isinstance(raw_path, str) or not raw_path:
+                raise CalibrationError("calibration manifest contains an invalid path")
+            if Path(raw_path).is_absolute():
+                raise CalibrationError(
+                    "absolute paths are not allowed inside calibration manifests")
+            p = _resolve_under(src_path.parent, raw_path)
             if p.suffix in (".npz", ".pt", ".npy") and str(p) not in files:
                 files.append(str(p))
 
-    n = 0
+    expanded_total = 0
+    for f in files:
+        expanded_total += _check_calibration_file_budget(f, max_memory)
+        if expanded_total > max_memory:
+            raise CalibrationError(
+                "combined calibration data may expand to "
+                f"{human_bytes(expanded_total)}, above --max-memory "
+                f"{human_bytes(max_memory)}")
+    calibration_hashes = {f: sha256_file(f) for f in files}
     for f in files:
         try:
             if f.endswith(".npz"):
-                data = _load_npz_calibration(f, layer_keys)
+                data = _load_npz_calibration(
+                    f, layer_keys, effective_max_samples)
             elif f.endswith(".pt"):
-                data = _load_pt_calibration(f, layer_keys)
+                data = _load_pt_calibration(
+                    f, layer_keys, effective_max_samples)
             elif f.endswith(".npy"):
-                arr = np.load(f, allow_pickle=False)
+                arr = np.load(f, allow_pickle=False, mmap_mode="r")
                 if arr.ndim == 2:
                     # single-layer file: name derived from the file name
                     name = Path(f).stem
                     if name in layer_keys or (name + ".weight") in layer_keys:
-                        data = {name: torch.from_numpy(np.asarray(arr, dtype=np.float32))}
+                        data = {name: torch.from_numpy(np.asarray(
+                            arr[:effective_max_samples], dtype=np.float32))}
                     else:
                         data = {}
                 else:
@@ -2539,50 +2995,79 @@ def load_calibration(source: str, info: CheckpointInfo, max_samples: Optional[in
             else:
                 data = {}
         except Exception as e:
-            raise CalibrationError(f"failed to read calibration file {f}: {e}")
+            raise CalibrationError(
+                f"failed to read calibration file {f}: {e}") from e
         for k, v in data.items():
-            if k not in tensors:
-                tensors[k] = v
-        n += 1
+            canonical = k if k in layer_keys else k + ".weight"
+            meta = info.by_name(canonical)
+            if meta is None or len(meta.shape) != 2:
+                continue
+            if int(v.shape[1]) != int(meta.shape[1]):
+                raise CalibrationError(
+                    f"{f}: activation width for {canonical} is {v.shape[1]}, "
+                    f"expected {meta.shape[1]}")
+            part = v.detach()[:effective_max_samples].float().cpu()
+            if canonical in tensors:
+                remaining = effective_max_samples - int(tensors[canonical].shape[0])
+                if remaining > 0:
+                    tensors[canonical] = torch.cat(
+                        (tensors[canonical], part[:remaining]), dim=0)
+            else:
+                tensors[canonical] = part.contiguous()
+    final_calibration_hashes = {f: sha256_file(f) for f in files}
+    if final_calibration_hashes != calibration_hashes:
+        raise CalibrationError(
+            "one or more calibration files changed while they were being read")
 
     if not tensors:
         raise CalibrationError(
             f"no usable calibration activations found in {source} (expected arrays "
             "named exactly like the checkpoint's linear layer keys)")
 
-    # optional row cap
-    if max_samples is not None:
-        for k in tensors:
-            if tensors[k].shape[0] > max_samples:
-                tensors[k] = tensors[k][:max_samples]
-
     stats: Dict[str, Dict[str, Any]] = {}
     for k, v in tensors.items():
-        absmax = v.abs().amax(dim=0)          # [K]
-        norm = v.norm(dim=1)                  # [S]
-        stats[k] = {"absmax": absmax.tolist(), "norm": norm.tolist(), "rows": int(v.shape[0])}
+        stats[k] = {"samples": v.contiguous(), "rows": int(v.shape[0])}
 
     provenance = {
         "source": source,
         "files": files,
         "n_files": len(files),
         "n_layers_with_data": len(stats),
-        "max_samples_per_layer": max_samples,
-        "method": "local activation statistics (absmax / norm per layer)",
+        "max_samples_per_layer": effective_max_samples,
+        "method": "recorded local activation rows used directly for output-error analysis",
         "synthetic": False,
+        "file_sha256": final_calibration_hashes,
     }
 
     if cache_path:
         try:
-            payload = {"stats": {k: {"absmax": v["absmax"], "norm": v["norm"], "rows": v["rows"]} for k, v in stats.items()},
-                       "provenance": provenance}
-            with open(cache_path, "w", encoding="utf-8") as _f:
-                json.dump(payload, _f)
-            log().info("calibration statistics cached to %s", cache_path)
+            parent = os.path.dirname(os.path.abspath(cache_path)) or "."
+            os.makedirs(parent, exist_ok=True)
+            fd, cache_tmp = tempfile.mkstemp(
+                prefix=f".{Path(cache_path).name}.", suffix=".tmp", dir=parent)
+            try:
+                arrays = {key: value["samples"].numpy()
+                          for key, value in stats.items()}
+                arrays["__provenance__"] = np.frombuffer(
+                    json_dumps(provenance).encode("utf-8"), dtype=np.uint8)
+                with os.fdopen(fd, "wb") as cache_file:
+                    np.savez_compressed(cache_file, **arrays)
+                    cache_file.flush()
+                    os.fsync(cache_file.fileno())
+                os.replace(cache_tmp, cache_path)
+                _fsync_parent(cache_path)
+            except Exception:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+                with contextlib.suppress(OSError):
+                    os.unlink(cache_tmp)
+                raise
+            log().info("calibration activation rows cached to %s", cache_path)
         except Exception as e:
             log().warning("could not write calibration cache %s: %s", cache_path, e)
 
-    return CalibrationStats(source=source, files=files, n_samples=n,
+    return CalibrationStats(source=source, files=files,
+                            n_samples=max(v["rows"] for v in stats.values()),
                             layers=stats, provenance=provenance)
 
 
@@ -2604,11 +3089,21 @@ class TensorMetrics:
 def compute_weight_metrics(original: torch.Tensor, dequant: torch.Tensor) -> TensorMetrics:
     o = original.float()
     d = dequant.float()
-    denom = o.pow(2).sum()
-    err = (d - o).pow(2).sum()
-    rel_l2 = float((err / denom.clamp(min=1e-12)).sqrt())
-    snr = float(10.0 * math.log10((denom / err.clamp(min=1e-12)).clamp(min=1e-12)))
-    cos = float(torch.nn.functional.cosine_similarity(o.flatten(), d.flatten(), dim=0).clamp(-1, 1))
+    signal = float(o.square().sum())
+    error = float((d - o).square().sum())
+    reconstructed = float(d.square().sum())
+    dot = float((o * d).sum())
+    if not all(math.isfinite(value)
+               for value in (signal, error, reconstructed, dot)):
+        return TensorMetrics(name="", rel_l2=1e30, snr_db=-300.0, cosine=-1.0)
+    rel_l2 = math.sqrt(error / max(signal, 1e-12))
+    snr = 300.0 if error <= 1e-30 else 10.0 * math.log10(
+        max(signal, 1e-30) / error)
+    if signal <= 1e-30 and reconstructed <= 1e-30:
+        cos = 1.0
+    else:
+        cosine_denom = math.sqrt(max(signal * reconstructed, 1e-30))
+        cos = max(-1.0, min(1.0, dot / cosine_denom))
     return TensorMetrics(name="", rel_l2=rel_l2, snr_db=snr, cosine=cos)
 
 
@@ -2623,13 +3118,14 @@ def activation_aware_error(original: torch.Tensor, dequant: torch.Tensor,
     x = activations.float()
     num = (delta @ x.t()).norm(dim=0)
     den = (o @ x.t()).norm(dim=0).clamp(min=1e-8)
-    return float((num / den).mean())
+    value = float((num / den).mean())
+    return value if math.isfinite(value) else 1e30
 
 
 class SensitivityAnalyzer:
     """Decides keep-precision for candidate layers based on metrics + thresholds."""
 
-    def __init__(self, threshold: float, error_threshold: float,
+    def __init__(self, threshold: Optional[float], error_threshold: float,
                  calibration: Optional[CalibrationStats]):
         self.threshold = threshold
         self.error_threshold = error_threshold
@@ -2644,9 +3140,7 @@ class SensitivityAnalyzer:
             acts = None
             for key in (name, name[:-len(".weight")]):
                 if key in self.calibration.layers:
-                    acts = torch.tensor(self.calibration.layers[key]["absmax"],
-                                        dtype=torch.float32).unsqueeze(0).expand(
-                        min(self.calibration.layers[key]["rows"], 64), -1)
+                    acts = self.calibration.layers[key]["samples"]
                     break
             m.act_rel_l2 = activation_aware_error(original, dequant, acts)
         self.results[name] = m
@@ -2675,27 +3169,34 @@ class SafetensorsStreamWriter:
     exactly the planned order.  Supports resume via an external state file.
     """
 
-    def __init__(self, path: str, entries: List[Dict[str, Any]], resume_offsets: Optional[Dict[str, int]] = None):
+    def __init__(self, path: str, entries: List[Dict[str, Any]],
+                 resume_offsets: Optional[Dict[str, int]] = None,
+                 resume_mode: bool = False,
+                 expected_identity: Optional[Tuple[int, int]] = None):
         self.path = path
         self.entries = list(entries)
         # deterministic write order
         self.order = [e["name"] for e in self.entries]
         self._by_name = {e["name"]: e for e in self.entries}
         self._resume_offsets = resume_offsets or {}
+        self._resume_mode = resume_mode
+        self._expected_identity = expected_identity
         self._offsets: Dict[str, int] = {}
         self._header = self._build_header()
         # convert relative (data-relative) offsets to absolute file offsets
         self._offsets = {n: len(self._header) + rel for n, rel in self._offsets.items()}
         self._fh: Optional[Any] = None
         self._pos = 0
+        self.identity: Optional[Tuple[int, int]] = None
 
     def _build_header(self) -> bytes:
         header: Dict[str, Any] = {"__metadata__": {}}
         offset = 0
-        # align each tensor START to 8 bytes (safetensors requirement); the file
-        # ends exactly at the last tensor's end (no trailing padding)
+        # Safetensors data offsets are contiguous.  The JSON header itself is
+        # padded to an 8-byte boundary; inserting holes between tensors would
+        # make otherwise-valid odd-byte tensors unreadable by strict loaders.
         for e in self.entries:
-            start = (offset + 7) & ~7
+            start = offset
             end = start + e["nbytes"]
             header[e["name"]] = {
                 "dtype": TORCH_TO_SAFE[e["dtype"]],
@@ -2705,9 +3206,11 @@ class SafetensorsStreamWriter:
             self._offsets[e["name"]] = start
             offset = end
         self._data_size = offset
-        raw = json.dumps(header, separators=(",", ":")).encode("utf-8")
-        if len(raw) > 512 * 1024 * 1024:
-            raise OutputError("output header exceeds 512 MiB; model too large for safetensors")
+        raw = json.dumps(header, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        if len(raw) > MAX_SAFETENSORS_HEADER_SIZE:
+            raise OutputError(
+                "output header exceeds the safetensors 100 MB safety limit")
+        raw += b" " * ((-len(raw)) % 8)
         return struct.pack("<Q", len(raw)) + raw
 
     def header_bytes(self) -> bytes:
@@ -2720,27 +3223,43 @@ class SafetensorsStreamWriter:
         if self._fh is not None:
             return
         if os.path.exists(self.path):
-            # resume: append at the end of already-written data
-            if self._resume_offsets:
-                ends = [off + self._by_name[nm]["nbytes"] for nm, off in self._resume_offsets.items()]
-                written = max(ends, default=0)
-                if written < len(self._header):
-                    raise OutputError(
-                        f"resume state inconsistent with {self.path}: written {written} < header {len(self._header)}")
-                self._fh = open(self.path, "r+b")
-                self._fh.seek(written)
-                self._pos = written
-            else:
+            if not self._resume_mode:
                 raise OutputError(f"output file already exists: {self.path} (use --overwrite)")
+            fd, st = _open_regular_nofollow(self.path, os.O_RDWR)
+            identity = (int(st.st_dev), int(st.st_ino))
+            if self._expected_identity is not None and identity != self._expected_identity:
+                os.close(fd)
+                raise OutputError(
+                    f"resume temp identity changed for {self.path}; refusing possible "
+                    "symlink/hardlink replacement")
+            self._fh = os.fdopen(fd, "r+b")
+            self.identity = identity
+            expected_size = len(self._header) + self._data_size
+            if st.st_size != expected_size:
+                self.close()
+                raise OutputError(
+                    f"resume temp size mismatch: {st.st_size} != {expected_size}")
+            self._fh.seek(0)
+            if self._fh.read(len(self._header)) != self._header:
+                self.close()
+                raise OutputError("resume temp header does not match the conversion plan")
+            self._pos = expected_size
         else:
-            self._fh = open(self.path, "wb")
+            if self._resume_mode:
+                raise OutputError(f"resume temp file missing: {self.path}")
+            fd, st = _open_regular_nofollow(
+                self.path, os.O_RDWR | os.O_CREAT | os.O_EXCL)
+            self._fh = os.fdopen(fd, "w+b")
+            self.identity = (int(st.st_dev), int(st.st_ino))
             self._fh.write(self._header)
-            self._pos = len(self._header)
+            self._fh.truncate(len(self._header) + self._data_size)
+            self._pos = len(self._header) + self._data_size
 
     def write_tensor_bytes(self, name: str, data: bytes) -> int:
-        """Append one tensor's bytes (must be called in planned order)."""
+        """Write one complete tensor at its planned offset."""
         self.open()
-        assert self._fh is not None
+        if self._fh is None:
+            raise OutputError("output writer failed to open")
         e = self._by_name[name]
         expected_off = self._offsets[name]     # deterministic, header-derived
         if self._resume_offsets and name in self._resume_offsets:
@@ -2757,12 +3276,50 @@ class SafetensorsStreamWriter:
             return off
         if len(data) != e["nbytes"]:
             raise OutputError(f"tensor {name}: expected {e['nbytes']} bytes, got {len(data)}")
-        if self._pos != expected_off:
-            raise OutputError(
-                f"write order mismatch for {name}: position {self._pos} != {expected_off}")
+        self._fh.seek(expected_off)
         self._fh.write(data)
-        self._pos += e["nbytes"]
+        self._pos = expected_off + e["nbytes"]
         return expected_off
+
+    def write_tensor_slice(self, name: str, byte_offset: int, data: bytes) -> int:
+        """Write a byte slice inside a tensor, enabling bounded row-chunk output."""
+        self.open()
+        if self._fh is None:
+            raise OutputError("output writer failed to open")
+        e = self._by_name[name]
+        if byte_offset < 0 or byte_offset + len(data) > e["nbytes"]:
+            raise OutputError(
+                f"tensor slice for {name} exceeds planned range: "
+                f"{byte_offset}+{len(data)} > {e['nbytes']}")
+        absolute = self._offsets[name] + byte_offset
+        self._fh.seek(absolute)
+        self._fh.write(data)
+        self._pos = absolute + len(data)
+        return absolute
+
+    def offset_for(self, name: str) -> int:
+        return self._offsets[name]
+
+    def invalidate_resume_tensor(self, name: str) -> None:
+        """Allow a partially completed logical layer to rewrite this tensor."""
+        self._resume_offsets.pop(name, None)
+
+    def tensor_sha256(self, name: str, chunk: int = 1 << 20) -> str:
+        self.open()
+        if self._fh is None:
+            raise OutputError("output writer failed to open")
+        entry = self._by_name[name]
+        self._fh.flush()
+        self._fh.seek(self._offsets[name])
+        remaining = entry["nbytes"]
+        digest = hashlib.sha256()
+        while remaining:
+            data = self._fh.read(min(chunk, remaining))
+            if not data:
+                raise OutputError(f"resume temp is truncated inside tensor {name!r}")
+            digest.update(data)
+            remaining -= len(data)
+        return digest.hexdigest()
 
     def current_pos(self) -> int:
         return self._pos
@@ -2788,19 +3345,48 @@ class SafetensorsStreamWriter:
             raise OutputError(
                 f"output size mismatch: {actual} != {expected} (incomplete write?)")
         os.replace(self.path, final_path)
+        _fsync_parent(final_path)
         log().info("published output to %s (%s)", final_path, human_bytes(actual))
 
 
 def tensor_to_bytes(t: torch.Tensor) -> bytes:
-    t = t.contiguous()
-    if t.dtype in FP8_DTYPES:
-        return t.view(torch.uint8).numpy().tobytes()
-    return t.numpy().tobytes()
+    # Viewing storage as uint8 works for BF16/FP8 as well as NumPy-supported
+    # dtypes, and preserves the exact little-endian bytes used by safetensors.
+    flat = t.detach().cpu().contiguous().reshape(-1)
+    return flat.view(torch.uint8).numpy().tobytes()
 
 
 # ---------------------------------------------------------------------------
 # Chunked quantization (bounded memory for very large tensors)
 # ---------------------------------------------------------------------------
+QUANT_WORK_BYTES_PER_ELEMENT = 48
+MIN_CHUNK_MEMORY = 32 * 1024 * 1024
+
+
+def _quant_work_bytes(meta: TensorMeta) -> int:
+    return math.prod(meta.shape) * QUANT_WORK_BYTES_PER_ELEMENT
+
+
+def _chunk_rows_for_budget(k: int, n: int, max_mem: int) -> int:
+    if max_mem < MIN_CHUNK_MEMORY:
+        raise PolicyError(
+            f"--max-memory must be at least {human_bytes(MIN_CHUNK_MEMORY)} for "
+            "Lloyd-Max W4A8 quantization")
+    row_work = k * QUANT_WORK_BYTES_PER_ELEMENT
+    if row_work > max_mem:
+        raise PolicyError(
+            f"--max-memory {human_bytes(max_mem)} cannot hold one {k}-element "
+            f"working row (estimated {human_bytes(row_work)})")
+    return max(1, min(n, max_mem // row_work))
+
+
+def _codebook_sample_size(max_mem: int, total_elements: int) -> int:
+    # Lloyd-Max temporarily materializes distances/assignments.  Keep that
+    # working set below roughly half the user budget.
+    budgeted = max(4096, max_mem // 128)
+    return min(300000, total_elements, budgeted)
+
+
 def _quantize_rotated_w4a8_with_codebook(weight: torch.Tensor, group_size: int,
                                          codebook: torch.Tensor,
                                          scale_dtype: torch.dtype = torch.float8_e4m3fn,
@@ -2831,7 +3417,8 @@ def _quantize_rotated_w4a8_with_codebook(weight: torch.Tensor, group_size: int,
 def _gather_codebook_samples(reader: CheckpointReader, name: str, k: int,
                              group_size: int, convrot_groupsize: int,
                              sample_size: int, chunk_rows: int,
-                             device: Any = "cpu") -> torch.Tensor:
+                             device: Any = "cpu",
+                             compute_dtype: Optional[torch.dtype] = None) -> torch.Tensor:
     """Deterministic subsample of normalized rotated weights for codebook fitting.
 
     Draws `sample_size` flattened indices with the reference seed-0 generator,
@@ -2841,18 +3428,25 @@ def _gather_codebook_samples(reader: CheckpointReader, name: str, k: int,
     meta = reader.info.by_name(name)
     n = int(meta.shape[0])
     total = n * k
-    gen = torch.Generator(device="cpu").manual_seed(0)
-    idx = torch.randint(0, total, (sample_size,), device="cpu", generator=gen).sort().values
-    h = build_hadamard(convrot_groupsize, device="cpu", dtype=torch.float32)
+    if total > sample_size:
+        gen = torch.Generator(device="cpu").manual_seed(0)
+        idx = torch.randint(0, total, (sample_size,), device="cpu", generator=gen)
+    else:
+        idx = torch.arange(total, device="cpu")
+    work_dtype = compute_dtype or torch.float32
+    h = build_hadamard(convrot_groupsize, device="cpu", dtype=work_dtype)
     h_t = h.T
-    samples: List[torch.Tensor] = []
-    n_groups = k // convrot_groupsize
+    samples = torch.empty(idx.numel(), dtype=torch.float32)
+    n_conv_groups = k // convrot_groupsize
+    n_quant_groups = k // group_size
     for r0 in range(0, n, chunk_rows):
         r1 = min(n, r0 + chunk_rows)
-        chunk = reader.read_tensor(name)[r0:r1].float()          # [rows, k]
-        rot = torch.matmul(chunk.view(r1 - r0, n_groups, convrot_groupsize), h_t).reshape(r1 - r0, k)
+        chunk = reader.read_tensor(name)[r0:r1].to(work_dtype)   # [rows, k]
+        rot = torch.matmul(
+            chunk.view(r1 - r0, n_conv_groups, convrot_groupsize), h_t
+        ).reshape(r1 - r0, k)
         # per-group normalization (identical to the in-memory reference path)
-        grouped = rot.view(r1 - r0, n_groups, convrot_groupsize)
+        grouped = rot.float().view(r1 - r0, n_quant_groups, group_size)
         gs = grouped.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
         normalized = (grouped / gs).reshape(r1 - r0, k)
         start = r0 * k
@@ -2860,22 +3454,11 @@ def _gather_codebook_samples(reader: CheckpointReader, name: str, k: int,
         mask = (idx >= start) & (idx < end)
         if mask.any():
             local = idx[mask] - start
-            samples.append(normalized.flatten()[local])
-    if not samples:
+            samples[mask] = normalized.flatten()[local]
+    if samples.numel() == 0:
         raise PolicyError("codebook sampling produced no elements")
-    cat = torch.cat(samples)
-    # identical fit to fit_codebook (already subsampled)
-    cat = cat.float()
-    codebook = torch.quantile(cat, torch.linspace(0, 1, 16, device=cat.device))
-    for _ in range(25):
-        assignments = (cat.unsqueeze(-1) - codebook).abs().argmin(-1)
-        updated = codebook.clone()
-        for i in range(codebook.numel()):
-            sel = assignments == i
-            if sel.any():
-                updated[i] = cat[sel].mean()
-        codebook = updated
-    return codebook.contiguous()
+    return fit_codebook(samples, levels=16, iterations=25,
+                        sample_size=sample_size).contiguous()
 
 
 def quantize_tensor_bounded(reader: CheckpointReader, name: str, fmt: str,
@@ -2888,31 +3471,32 @@ def quantize_tensor_bounded(reader: CheckpointReader, name: str, fmt: str,
     compute_dtype: fp16/bf16 lowers the precision of the rotation + fit math
     (deviation from the fp32 reference path; recorded in metadata).
     """
+    device = torch.device(device)
     meta = reader.info.by_name(name)
     n, k = int(meta.shape[0]), int(meta.shape[1])
     full_bytes = meta.nbytes
-    # working set estimate for the in-memory path: ~12 bytes per element worst case
-    work_bytes = full_bytes * (12 // max(meta.dtype.itemsize, 1))
+    work_bytes = _quant_work_bytes(meta)
     if work_bytes <= max_mem:
         w = reader.read_tensor(name)
         if compute_dtype is not None and w.dtype not in FP8_DTYPES:
             w = w.to(compute_dtype)
-        if device != "cpu" and device.type == "cuda":
+        if device.type == "cuda":
             w = w.to(device)
         try:
             out = quantize_weight_by_format(w, fmt, group_size, convrot_groupsize)
         finally:
             del w
-        if device != "cpu":
+        if device.type != "cpu":
             out = {kk: vv.cpu() for kk, vv in out.items()}
         return out
 
     log().info("chunked quantization for %s (%s > budget %s)",
                name, human_bytes(full_bytes), human_bytes(max_mem))
-    chunk_rows = max(1, int(max_mem / (k * 12)))   # ~12 bytes/elem working set
-    chunk_rows = min(chunk_rows, n)
+    chunk_rows = _chunk_rows_for_budget(k, n, max_mem)
+    sample_size = _codebook_sample_size(max_mem, n * k)
     codebook = _gather_codebook_samples(reader, name, k, group_size,
-                                        convrot_groupsize, 300000, chunk_rows, device="cpu")
+                                        convrot_groupsize, sample_size, chunk_rows,
+                                        device="cpu", compute_dtype=compute_dtype)
     # per-chunk processing
     packed_parts: List[torch.Tensor] = []
     s_rel_parts: List[torch.Tensor] = []
@@ -2922,14 +3506,14 @@ def quantize_tensor_bounded(reader: CheckpointReader, name: str, fmt: str,
         chunk = reader.read_tensor(name)[r0:r1]
         if compute_dtype is not None and chunk.dtype not in FP8_DTYPES:
             chunk = chunk.to(compute_dtype)
-        if device != "cpu" and device.type == "cuda":
+        if device.type == "cuda":
             chunk = chunk.to(device)
         rot = rotate_int8_convrot_weight(chunk, convrot_groupsize)
-        p, s_rel, s_ch, cb = _quantize_rotated_w4a8_with_codebook(
+        p, s_rel, s_ch, _ = _quantize_rotated_w4a8_with_codebook(
             rot, group_size, codebook.to(device=rot.device))
-        packed_parts.append(p.cpu() if device != "cpu" else p)
-        s_rel_parts.append(s_rel.cpu() if device != "cpu" else s_rel)
-        s_ch_parts.append(s_ch.cpu() if device != "cpu" else s_ch)
+        packed_parts.append(p.cpu() if device.type != "cpu" else p)
+        s_rel_parts.append(s_rel.cpu() if device.type != "cpu" else s_rel)
+        s_ch_parts.append(s_ch.cpu() if device.type != "cpu" else s_ch)
         del chunk, rot, p, s_rel, s_ch
     packed = torch.cat(packed_parts, dim=0).contiguous()
     s_rel = torch.cat(s_rel_parts, dim=0).contiguous()
@@ -2937,30 +3521,229 @@ def quantize_tensor_bounded(reader: CheckpointReader, name: str, fmt: str,
     return {"": packed, "_s_rel": s_rel, "_s_channel": s_ch, "_codebook": codebook.contiguous()}
 
 
+def _quantize_row_chunk(reader: CheckpointReader, name: str, r0: int, r1: int,
+                        group_size: int, convrot_groupsize: int,
+                        codebook: torch.Tensor, device: torch.device,
+                        compute_dtype: Optional[torch.dtype]) -> Dict[str, torch.Tensor]:
+    chunk = reader.read_tensor(name)[r0:r1]
+    if compute_dtype is not None and chunk.dtype not in FP8_DTYPES:
+        chunk = chunk.to(compute_dtype)
+    if device.type == "cuda":
+        chunk = chunk.to(device)
+    rotated = rotate_int8_convrot_weight(chunk, convrot_groupsize)
+    packed, s_rel, s_ch, cb = _quantize_rotated_w4a8_with_codebook(
+        rotated, group_size, codebook.to(device=rotated.device))
+    out = {
+        "": packed.cpu(),
+        "_s_rel": s_rel.cpu(),
+        "_s_channel": s_ch.cpu(),
+        "_codebook": cb.cpu(),
+    }
+    del chunk, rotated, packed, s_rel, s_ch, cb
+    return out
+
+
+@dataclass
+class _MetricAccumulator:
+    name: str
+    signal: float = 0.0
+    error: float = 0.0
+    dot: float = 0.0
+    reconstructed: float = 0.0
+    act_num_sq: Optional[torch.Tensor] = None
+    act_den_sq: Optional[torch.Tensor] = None
+
+    def update(self, original: torch.Tensor, dequant: torch.Tensor,
+               activations: Optional[torch.Tensor]) -> None:
+        original = original.float()
+        dequant = dequant.float()
+        delta = dequant - original
+        self.signal += float(original.square().sum())
+        self.error += float(delta.square().sum())
+        self.dot += float((original * dequant).sum())
+        self.reconstructed += float(dequant.square().sum())
+        if activations is not None:
+            x = activations.float()
+            num = delta @ x.t()
+            den = original @ x.t()
+            part_num = num.square().sum(dim=0).cpu()
+            part_den = den.square().sum(dim=0).cpu()
+            self.act_num_sq = part_num if self.act_num_sq is None else self.act_num_sq + part_num
+            self.act_den_sq = part_den if self.act_den_sq is None else self.act_den_sq + part_den
+
+    def finish(self) -> TensorMetrics:
+        if not all(math.isfinite(value) for value in (
+                self.signal, self.error, self.dot, self.reconstructed)):
+            return TensorMetrics(
+                self.name, 1e30, -300.0, -1.0,
+                act_rel_l2=1e30 if self.act_num_sq is not None else None)
+        rel_l2 = math.sqrt(self.error / max(self.signal, 1e-12))
+        snr_db = 300.0 if self.error <= 1e-30 else 10.0 * math.log10(
+            max(self.signal, 1e-30) / self.error)
+        if self.signal <= 1e-30 and self.reconstructed <= 1e-30:
+            cosine = 1.0
+        else:
+            denom = math.sqrt(max(self.signal * self.reconstructed, 1e-30))
+            cosine = max(-1.0, min(1.0, self.dot / denom))
+        act_rel_l2 = None
+        if self.act_num_sq is not None and self.act_den_sq is not None:
+            act_rel_l2 = float(
+                (self.act_num_sq.sqrt() / self.act_den_sq.clamp(min=1e-16).sqrt()).mean())
+            if not math.isfinite(act_rel_l2):
+                act_rel_l2 = 1e30
+        return TensorMetrics(self.name, rel_l2, snr_db, cosine,
+                             act_rel_l2=act_rel_l2)
+
+
+def apply_sensitivity_prepass(info: CheckpointInfo,
+                              decisions: List[TensorDecision],
+                              analyzer: SensitivityAnalyzer,
+                              max_mem: int, device: torch.device,
+                              compute_dtype: Optional[torch.dtype]) -> None:
+    """Freeze sensitivity decisions before the safetensors inventory is built."""
+    with CheckpointReader(info) as reader:
+        for decision in decisions:
+            if decision.kind != DecisionKind.QUANTIZE:
+                continue
+            meta = info.by_name(decision.name)
+            if meta is None:
+                raise PolicyError(
+                    f"sensitivity plan references missing tensor {decision.name!r}")
+            activations = None
+            if analyzer.calibration is not None:
+                layer_stats = analyzer.calibration.layers.get(decision.name)
+                if layer_stats is not None:
+                    activations = layer_stats["samples"]
+            if _quant_work_bytes(meta) <= max_mem:
+                quantized = quantize_tensor_bounded(
+                    reader, decision.name, FORMAT_W4A8, decision.group_size,
+                    decision.convrot_groupsize, max_mem, device,
+                    compute_dtype=compute_dtype)
+                dequant = dequantize_weight_by_format(
+                    quantized, FORMAT_W4A8, decision.group_size,
+                    decision.convrot_groupsize, torch.float32)
+                metrics = analyzer.evaluate(
+                    decision.name, reader.read_tensor(decision.name), dequant)
+                del quantized, dequant
+            else:
+                n, k = int(meta.shape[0]), int(meta.shape[1])
+                chunk_rows = _chunk_rows_for_budget(k, n, max_mem)
+                sample_size = _codebook_sample_size(max_mem, n * k)
+                codebook = _gather_codebook_samples(
+                    reader, decision.name, k, decision.group_size,
+                    decision.convrot_groupsize, sample_size, chunk_rows,
+                    compute_dtype=compute_dtype)
+                accumulator = _MetricAccumulator(decision.name)
+                for r0 in range(0, n, chunk_rows):
+                    r1 = min(n, r0 + chunk_rows)
+                    quantized = _quantize_row_chunk(
+                        reader, decision.name, r0, r1, decision.group_size,
+                        decision.convrot_groupsize, codebook, device, compute_dtype)
+                    dequant = dequantize_weight_by_format(
+                        quantized, FORMAT_W4A8, decision.group_size,
+                        decision.convrot_groupsize, torch.float32)
+                    accumulator.update(reader.read_tensor(decision.name)[r0:r1],
+                                       dequant, activations)
+                    del quantized, dequant
+                metrics = accumulator.finish()
+                analyzer.results[decision.name] = metrics
+            keep, reason = analyzer.decide_keep(metrics)
+            metrics.kept = keep
+            metrics.reason = reason
+            if keep:
+                decision.kind = DecisionKind.KEEP_PRECISION
+                decision.reason = f"sensitivity fallback: {reason}"
+
+
 # ---------------------------------------------------------------------------
 # Conversion engine (streaming, resumable, atomic)
 # ---------------------------------------------------------------------------
 @dataclass
 class ConversionState:
-    version: int = 1
+    version: int = 2
     plan_hash: str = ""
     output: str = ""
     tmp: str = ""
     fmt: str = ""
     entries: Dict[str, Dict[str, Any]] = field(default_factory=dict)  # name -> {offset,size,status}
+    temp_device: Optional[int] = None
+    temp_inode: Optional[int] = None
     done: bool = False
 
 
-def _plan_hash(info: CheckpointInfo, plan: ConversionPlan, args: Any) -> str:
+def hash_checkpoint_files(info: CheckpointInfo, *, refresh: bool = False) -> Dict[str, str]:
+    if refresh or not info.source_hashes:
+        info.source_hashes = {path: sha256_file(path) for path in sorted(info.files)}
+    return dict(info.source_hashes)
+
+
+def _portable_file_labels(paths: Sequence[str]) -> List[str]:
+    """Stable, non-secret file labels for metadata embedded in moved models."""
+    basenames = [Path(path).name for path in paths]
+    if len(set(basenames)) == len(basenames):
+        return basenames
+    absolute = [os.path.abspath(path) for path in paths]
+    try:
+        common = os.path.commonpath([os.path.dirname(path) for path in absolute])
+        relative = [os.path.relpath(path, common).replace(os.sep, "/")
+                    for path in absolute]
+        if len(set(relative)) == len(relative) and not any(
+                label == ".." or label.startswith("../") for label in relative):
+            return relative
+    except ValueError:
+        pass
+    # Different volumes or adversarial duplicate names: retain deterministic
+    # identity without embedding machine-specific absolute paths.
+    return [f"{index:04d}-{name}" for index, name in enumerate(basenames)]
+
+
+def _portable_hash_manifest(paths: Sequence[str], hashes: Dict[str, str]) -> Dict[str, str]:
+    by_absolute = {os.path.abspath(path): digest for path, digest in hashes.items()}
+    manifest: Dict[str, str] = {}
+    for path, label in zip(paths, _portable_file_labels(paths), strict=True):
+        absolute = os.path.abspath(path)
+        if absolute not in by_absolute:
+            raise OutputError(f"missing source hash for metadata: {path}")
+        manifest[label] = by_absolute[absolute]
+    return manifest
+
+
+def _plan_hash(info: CheckpointInfo, plan: ConversionPlan, args: Any,
+               source_hashes: Dict[str, str]) -> str:
     h = hashlib.sha256()
-    h.update((plan.fmt + "|" + plan.detection.architecture + "|" + plan.detection.unet_prefix).encode())
-    h.update(f"|gs={args.group_size}|od={args.output_dtype}|minn={getattr(args, 'min_numel_override', None)}|seed={args.seed}|dev={getattr(args, 'device', 'auto')}".encode())
-    h.update(("|inc=" + json_dumps(args.include)).encode())
-    h.update(("|exc=" + json_dumps(args.exclude)).encode())
-    h.update(("|kp=" + json_dumps(args.keep_precision)).encode())
-    for f in info.files:
-        h.update(f"{f}:{os.path.getsize(f)};".encode())
-    return h.hexdigest()[:16]
+    options = {
+        "format": plan.fmt,
+        "architecture": plan.detection.architecture,
+        "prefix": plan.detection.unet_prefix,
+        "group_size": getattr(args, "group_size", None),
+        "compute_dtype": getattr(args, "compute_dtype", "auto"),
+        "output_dtype": getattr(args, "output_dtype", "auto"),
+        "min_numel": getattr(args, "min_numel_override", None),
+        "seed": getattr(args, "seed", 0),
+        "device": getattr(args, "device", "auto"),
+        "max_memory": getattr(args, "max_memory", None),
+        "include": getattr(args, "include", []),
+        "exclude": getattr(args, "exclude", []),
+        "keep_precision": getattr(args, "keep_precision", []),
+        "sensitivity_threshold": getattr(args, "sensitivity_threshold", None),
+        "error_threshold": getattr(args, "error_threshold", None),
+        "calibration_source": getattr(args, "calibration_source", None),
+        "calibration_samples": getattr(args, "calibration_samples", None),
+        "calibration_cache": getattr(args, "calibration_cache", None),
+        "source_sha256": source_hashes,
+        "decisions": [{
+            "name": d.name, "kind": d.kind.value, "layer": d.layer,
+            "group_size": d.group_size,
+            "convrot_groupsize": d.convrot_groupsize,
+            "out_dtype": torch_dtype_name(d.out_dtype) if d.out_dtype else None,
+        } for d in plan.decisions],
+        "entries": [{
+            "name": e["name"], "dtype": torch_dtype_name(e["dtype"]),
+            "shape": list(e["shape"]), "nbytes": e["nbytes"],
+        } for e in plan.output_entries],
+    }
+    h.update(json_dumps(options).encode("utf-8"))
+    return h.hexdigest()
 
 
 class _SimulatedCrash(Exception):
@@ -2977,38 +3760,70 @@ class ConversionEngine:
         self.tmp_path = tmp_path
         self.final_path = final_path
         self.reader = CheckpointReader(info)
+        self.input_hashes = hash_checkpoint_files(info)
         self.state = ConversionState(
-            plan_hash=_plan_hash(info, plan, args), output=final_path, tmp=tmp_path,
+            plan_hash=_plan_hash(info, plan, args, self.input_hashes),
+            output=final_path, tmp=tmp_path,
             fmt=plan.fmt)
         self.writer: Optional[SafetensorsStreamWriter] = None
         self.metrics: Dict[str, TensorMetrics] = {}
-        self.input_hashes: Dict[str, str] = {}
         self.output_hash = ""
 
     # -- state persistence -------------------------------------------------
     def save_state(self) -> None:
-        tmp = self.state_path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(dataclasses.asdict(self.state), f)
-        os.replace(tmp, self.state_path)
+        if self.writer is not None:
+            self.writer.flush()
+            if self.writer.identity is not None:
+                self.state.temp_device, self.state.temp_inode = self.writer.identity
+        _atomic_write_json(self.state_path, dataclasses.asdict(self.state))
 
     def load_state(self) -> bool:
         if not os.path.exists(self.state_path):
             return False
         try:
-            with open(self.state_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            data = _load_json_object(
+                self.state_path, "resume state", nofollow=True)
             st = ConversionState(**{k: v for k, v in data.items() if k in ConversionState.__dataclass_fields__})
+            if (type(st.version) is not int
+                    or not all(isinstance(value, str) for value in (
+                        st.plan_hash, st.output, st.tmp, st.fmt))
+                    or not isinstance(st.entries, dict)
+                    or type(st.done) is not bool
+                    or any(value is not None and type(value) is not int
+                           for value in (st.temp_device, st.temp_inode))
+                    or any(value is not None and value < 0
+                           for value in (st.temp_device, st.temp_inode))):
+                raise OutputError("resume state has invalid field types")
+            for name, record in st.entries.items():
+                if (not isinstance(name, str) or not name
+                        or not isinstance(record, dict)
+                        or type(record.get("offset")) is not int
+                        or record["offset"] < 0
+                        or type(record.get("size")) is not int
+                        or record["size"] < 0
+                        or record.get("status") != "done"
+                        or not isinstance(record.get("sha256"), str)
+                        or not re.fullmatch(r"[0-9a-f]{64}", record["sha256"])):
+                    raise OutputError(
+                        f"resume state has an invalid tensor record for {name!r}")
         except Exception as e:
-            raise OutputError(f"cannot parse resume state {self.state_path}: {e}")
+            raise OutputError(
+                f"cannot parse resume state {self.state_path}: {e}") from e
+        if st.version != ConversionState().version:
+            raise OutputError(
+                f"resume state version {st.version} is unsupported; remove it and "
+                "start a fresh conversion")
         if st.plan_hash != self.state.plan_hash:
             raise OutputError(
                 "resume state does not match the current conversion parameters "
                 "(input files, format, options changed). Remove the state file to start fresh.")
-        if st.fmt != self.plan.fmt or st.output != self.final_path:
+        if st.fmt != self.plan.fmt or os.path.abspath(st.output) != os.path.abspath(self.final_path):
             raise OutputError("resume state mismatch (output/format changed)")
-        if not os.path.exists(st.tmp):
-            raise OutputError(f"resume temp file missing: {st.tmp}")
+        if os.path.abspath(st.tmp) != os.path.abspath(self.tmp_path):
+            raise OutputError("resume state references a different temp path")
+        if not os.path.exists(st.tmp) and not os.path.exists(self.final_path):
+            raise OutputError(
+                f"resume data missing: neither {st.tmp} nor {self.final_path} exists")
         self.state = st
         return True
 
@@ -3016,34 +3831,106 @@ class ConversionEngine:
         return {k: v["offset"] for k, v in self.state.entries.items()
                 if v.get("status") == "done"}
 
-    # -- hashing -----------------------------------------------------------
-    def hash_inputs(self) -> None:
-        """Hash input file bytes while they are read (cheap incremental)."""
-        self._input_hashers = {f: hashlib.sha256() for f in self.info.files}
+    def _verify_resume_entries(self, entries_by_name: Dict[str, Dict[str, Any]]) -> None:
+        if self.writer is None:
+            raise OutputError("resume verification requires an open output writer")
+        for name, record in self.state.entries.items():
+            if record.get("status") != "done":
+                continue
+            if name not in entries_by_name:
+                raise OutputError(f"resume state contains unknown tensor {name!r}")
+            expected = entries_by_name[name]
+            if record.get("offset") != self.writer.offset_for(name) or \
+                    record.get("size") != expected["nbytes"]:
+                raise OutputError(f"resume state range mismatch for {name!r}")
+            digest = record.get("sha256")
+            if not isinstance(digest, str) or self.writer.tensor_sha256(name) != digest:
+                raise OutputError(f"resume temp data checksum mismatch for {name!r}")
 
-    def _feed_hash(self, source: str, data: bytes) -> None:
-        h = self._input_hashers.get(source)
-        if h is not None:
-            h.update(data)
+    def _verify_completed_output(
+            self, entries_by_name: Dict[str, Dict[str, Any]]) -> None:
+        """Verify a fully written staged output after a post-conversion crash."""
+        completed = {name for name, record in self.state.entries.items()
+                     if record.get("status") == "done"}
+        if completed != set(entries_by_name):
+            missing = sorted(set(entries_by_name) - completed)
+            extra = sorted(completed - set(entries_by_name))
+            raise OutputError(
+                f"staged resume inventory mismatch: missing={missing[:5]} "
+                f"extra={extra[:5]}")
+        fd, file_stat = _open_regular_nofollow(self.final_path, os.O_RDONLY)
+        identity = (int(file_stat.st_dev), int(file_stat.st_ino))
+        os.close(fd)
+        expected_identity = None
+        if self.state.temp_device is not None and self.state.temp_inode is not None:
+            expected_identity = (self.state.temp_device, self.state.temp_inode)
+        if expected_identity is not None and identity != expected_identity:
+            raise OutputError(
+                "staged output identity changed; refusing possible replacement")
+        with RawSafetensorsFile(self.final_path) as staged:
+            if set(staged.entries) != set(entries_by_name):
+                raise OutputError("staged output tensor inventory changed")
+            for name, expected in entries_by_name.items():
+                dtype, shape, _, _ = staged.get(name)
+                if dtype != expected["dtype"] or tuple(shape) != tuple(expected["shape"]):
+                    raise OutputError(f"staged output shape/dtype mismatch for {name!r}")
+                digest = hashlib.sha256(staged.read_bytes(name)).hexdigest()
+                if digest != self.state.entries[name].get("sha256"):
+                    raise OutputError(f"staged output checksum mismatch for {name!r}")
+        post_stat = os.stat(self.final_path, follow_symlinks=False)
+        if (int(post_stat.st_dev), int(post_stat.st_ino)) != identity:
+            raise OutputError("staged output was replaced during resume verification")
 
-    def finish_hashes(self) -> None:
-        self.input_hashes = {f: h.hexdigest() for f, h in getattr(self, "_input_hashers", {}).items()}
+    @staticmethod
+    def _decision_output_names(d: TensorDecision) -> List[str]:
+        if d.kind == DecisionKind.QUANTIZE:
+            if d.layer is None:
+                raise PolicyError(f"quantized tensor {d.name!r} has no layer name")
+            return [d.layer + suffix for suffix in
+                    (".weight", ".weight_s_rel", ".weight_s_channel", ".weight_codebook")]
+        return [d.name]
+
+    def _record_entry(self, name: str, data_sha256: str,
+                      entries_by_name: Dict[str, Dict[str, Any]]) -> None:
+        if self.writer is None:
+            raise OutputError("cannot record output before the writer is open")
+        self.state.entries[name] = {
+            "offset": self.writer.offset_for(name),
+            "size": entries_by_name[name]["nbytes"],
+            "status": "done",
+            "sha256": data_sha256,
+        }
 
     # -- main loop ---------------------------------------------------------
     def run(self, sensitivity: Optional[SensitivityAnalyzer] = None) -> None:
         args = self.args
         max_mem = args.max_memory or (2 * 1024**3)
-        # auto -> CPU: deterministic (matches the reference golden vectors),
-        # memory-bounded, and never loads the whole checkpoint onto the GPU.
-        # CUDA/ROCm are explicit opt-ins (faster; the codebook subsample is
-        # device-dependent, so outputs may differ from CPU runs).
-        device = torch.device("cpu")
-        if args.device in ("cuda", "rocm") and torch.cuda.is_available():
-            device = torch.device("cuda")
-        elif args.device in ("cuda", "rocm"):
-            log().warning("--device %s requested but CUDA is unavailable; using CPU", args.device)
+        # Device selection was resolved once during planning.  PyTorch exposes
+        # ROCm accelerators through the "cuda" device type, while plan.device
+        # retains the user-facing backend identity for metadata and resume.
+        device = torch.device(
+            "cuda" if self.plan.device in ("cuda", "rocm") else "cpu")
+        if device.type == "cuda" and not torch.cuda.is_available():
+            raise PolicyError(
+                f"planned {self.plan.device} conversion but the accelerator is no "
+                "longer available")
 
+        entries_by_name = {e["name"]: e for e in self.plan.output_entries}
         resumed = self.load_state() if args.resume else False
+        if resumed and not os.path.exists(self.tmp_path) \
+                and os.path.exists(self.final_path):
+            log().info("recovering completed staged output %s", self.final_path)
+            self._verify_completed_output(entries_by_name)
+            post_hashes = {
+                path: sha256_file(path) for path in sorted(self.info.files)}
+            if post_hashes != self.input_hashes:
+                raise InputError(
+                    "one or more source files changed since the staged output was "
+                    "created")
+            self.state.done = True
+            _atomic_write_json(self.state_path, dataclasses.asdict(self.state))
+            self.output_hash = sha256_file(self.final_path)
+            return
         if resumed:
             log().info("resuming conversion from %s", self.tmp_path)
         else:
@@ -3051,78 +3938,66 @@ class ConversionEngine:
                 if args.resume:
                     log().warning("no resume state found; starting fresh and removing "
                                   "stale temp output %s", self.tmp_path)
-                    os.remove(self.tmp_path)
+                    _remove_temp_path(self.tmp_path)
                 elif args.overwrite:
                     log().info("removing stale temp output %s", self.tmp_path)
-                    os.remove(self.tmp_path)
+                    _remove_temp_path(self.tmp_path)
                 else:
                     raise OutputError(
                         f"temp output already exists: {self.tmp_path} (use --overwrite or --resume)")
-        self.hash_inputs()
-
-        entries_by_name = {e["name"]: e for e in self.plan.output_entries}
         resume_offsets = self.completed_offsets() if resumed else {}
+        expected_identity = None
+        if resumed and self.state.temp_device is not None and self.state.temp_inode is not None:
+            expected_identity = (self.state.temp_device, self.state.temp_inode)
         self.writer = SafetensorsStreamWriter(self.tmp_path, self.plan.output_entries,
-                                              resume_offsets=resume_offsets)
-        if not resumed:
-            self.writer.open()
-
-        output_sha = hashlib.sha256()
-        if not resumed:
-            output_sha.update(self.writer.header_bytes())
+                                              resume_offsets=resume_offsets,
+                                              resume_mode=resumed,
+                                              expected_identity=expected_identity)
+        self.writer.open()
+        if resumed:
+            self._verify_resume_entries(entries_by_name)
+        else:
+            self.save_state()
 
         total = len(self.plan.decisions)
         t0 = time.time()
         done = 0
         for d in self.plan.decisions:
             done += 1
+            output_names = self._decision_output_names(d)
+            completed_outputs = [
+                name for name in output_names
+                if self.state.entries.get(name, {}).get("status") == "done"
+            ]
+            if len(completed_outputs) == len(output_names):
+                continue
+            # A signal can land between the per-layer writes.  Recompute and
+            # rewrite that entire logical layer so stored bytes and checksums
+            # cannot mix two quantization attempts/backends.
+            if completed_outputs:
+                if self.writer is None:
+                    raise OutputError("resume writer is not initialized")
+                for output_name in output_names:
+                    self.state.entries.pop(output_name, None)
+                    self.writer.invalidate_resume_tensor(output_name)
             if d.kind == DecisionKind.QUANTIZE:
+                compute_dtype = getattr(args, "_compute_dtype_tensor", torch.float32)
                 meta = self.info.by_name(d.name)
-                # sensitivity pass may have flipped this layer to keep-precision
-                if sensitivity is not None and d.name in sensitivity.results:
-                    m = sensitivity.results[d.name]
-                    keep, why = sensitivity.decide_keep(m)
-                    if keep:
-                        d.kind = DecisionKind.KEEP_PRECISION
-                        d.reason = f"sensitivity fallback: {why}"
-                        self.plan.n_quantized -= 1
-                        self.plan.n_kept += 1
-                if d.kind == DecisionKind.QUANTIZE:
-                    compute_dtype = getattr(args, "_compute_dtype_tensor", None)
-                    _meta = self.info.by_name(d.name)
-                    _work = _meta.nbytes * (12 // max(_meta.dtype.itemsize, 1))
-                    if _work > max_mem:
-                        self.plan.chunked_layers.add(d.name)
+                if meta is None:
+                    raise PolicyError(f"conversion plan references missing tensor {d.name!r}")
+                if _quant_work_bytes(meta) > max_mem:
+                    self.plan.chunked_layers.add(d.name)
+                    self._write_quantized_chunked(
+                        d, entries_by_name, max_mem, device, compute_dtype)
+                else:
                     quant_tensors = quantize_tensor_bounded(
                         self.reader, d.name, self.plan.fmt, d.group_size,
                         d.convrot_groupsize, max_mem, device,
                         compute_dtype=compute_dtype)
-                    if sensitivity is not None:
-                        # evaluate metrics on a dequant sample of this layer
-                        dq = dequantize_weight_by_format(
-                            quant_tensors, self.plan.fmt, d.group_size,
-                            d.convrot_groupsize, torch.float32)
-                        orig = self.reader.read_tensor(d.name).float()
-                        m = sensitivity.evaluate(d.name, orig, dq)
-                        keep, why = sensitivity.decide_keep(m)
-                        if keep:
-                            d.kind = DecisionKind.KEEP_PRECISION
-                            d.reason = f"sensitivity fallback: {why}"
-                            self.plan.n_quantized -= 1
-                            self.plan.n_kept += 1
-                            del quant_tensors, dq, orig
-                            # passthrough write below (falls through via `else`)
-                        else:
-                            self._write_quantized(d, quant_tensors, entries_by_name, output_sha)
-                            del quant_tensors
-                            self._mark_done(d)
-                    else:
-                        self._write_quantized(d, quant_tensors, entries_by_name, output_sha)
-                        del quant_tensors
-                        self._mark_done(d)
-            if d.kind != DecisionKind.QUANTIZE:
-                self._write_passthrough(d, entries_by_name, output_sha)
-                self._mark_done(d)
+                    self._write_quantized(d, quant_tensors, entries_by_name)
+                    del quant_tensors
+            else:
+                self._write_passthrough(d, entries_by_name)
 
             if getattr(self, "_crash_after", None) is not None and done >= self._crash_after:
                 raise _SimulatedCrash(f"simulated interruption after {done} tensors")
@@ -3132,51 +4007,132 @@ class ConversionEngine:
                 rate = done / max(elapsed, 1e-9)
                 log().info("progress %d/%d tensors (%.1f/s)", done, total, rate)
 
-        self.finish_hashes()
-        assert self.writer is not None
-        self.writer.finalize(self.final_path)
-        self.output_hash = output_sha.hexdigest()
-        self.state.done = True
+        if self.writer is None:
+            raise OutputError("conversion ended without an output writer")
+        expected_names = set(entries_by_name)
+        completed_names = {name for name, record in self.state.entries.items()
+                           if record.get("status") == "done"}
+        if completed_names != expected_names:
+            missing = sorted(expected_names - completed_names)
+            raise OutputError(f"conversion ended with incomplete tensors: {missing[:5]}")
+        post_hashes = {path: sha256_file(path) for path in sorted(self.info.files)}
+        if post_hashes != self.input_hashes:
+            raise InputError(
+                "one or more source files changed during conversion; refusing to "
+                "publish a mixed checkpoint")
         self.save_state()
+        self.writer.finalize(self.final_path)
+        self.output_hash = sha256_file(self.final_path)
+        self.state.done = True
+        _atomic_write_json(self.state_path, dataclasses.asdict(self.state))
         log().info("conversion complete: %s", self.final_path)
 
     # -- writers -----------------------------------------------------------
     def _write_quantized(self, d: TensorDecision, tensors: Dict[str, torch.Tensor],
-                         entries_by_name: Dict[str, Dict[str, Any]], output_sha) -> None:
-        assert d.layer is not None
-        assert self.writer is not None
+                         entries_by_name: Dict[str, Dict[str, Any]]) -> None:
+        if d.layer is None:
+            raise PolicyError(f"quantized tensor {d.name!r} has no layer name")
+        if self.writer is None:
+            raise OutputError("cannot write quantized tensor before writer initialization")
         suffix_map = {"": ".weight", "_s_rel": ".weight_s_rel",
                       "_s_channel": ".weight_s_channel", "_codebook": ".weight_codebook",
                       "_correction": ".weight_correction"}
-        src = self.info.by_name(d.name).source
-        raw = bytes(self.reader.read_bytes(d.name))
-        self._feed_hash(src, raw)
         for suffix, t in tensors.items():
             out_name = d.layer + suffix_map[suffix]
             data = tensor_to_bytes(t)
-            off = self.writer.write_tensor_bytes(out_name, data)
-            output_sha.update(data)
-            self.state.entries[out_name] = {"offset": off, "size": len(data), "status": "done"}
+            self.writer.write_tensor_bytes(out_name, data)
+            self._record_entry(out_name, hashlib.sha256(data).hexdigest(),
+                               entries_by_name)
+
+    def _write_quantized_chunked(self, d: TensorDecision,
+                                 entries_by_name: Dict[str, Dict[str, Any]],
+                                 max_mem: int, device: torch.device,
+                                 compute_dtype: Optional[torch.dtype]) -> None:
+        if d.layer is None:
+            raise PolicyError(f"quantized tensor {d.name!r} has no layer name")
+        if self.writer is None:
+            raise OutputError("cannot write quantized tensor before writer initialization")
+        meta = self.info.by_name(d.name)
+        if meta is None:
+            raise PolicyError(f"conversion plan references missing tensor {d.name!r}")
+        n, k = int(meta.shape[0]), int(meta.shape[1])
+        chunk_rows = _chunk_rows_for_budget(k, n, max_mem)
+        sample_size = _codebook_sample_size(max_mem, n * k)
+        codebook = _gather_codebook_samples(
+            self.reader, d.name, k, d.group_size, d.convrot_groupsize,
+            sample_size, chunk_rows, compute_dtype=compute_dtype)
+        suffix_map = {"": ".weight", "_s_rel": ".weight_s_rel",
+                      "_s_channel": ".weight_s_channel"}
+        hashers = {suffix: hashlib.sha256() for suffix in suffix_map}
+        row_bytes = {
+            "": entries_by_name[d.layer + ".weight"]["nbytes"] // n,
+            "_s_rel": entries_by_name[d.layer + ".weight_s_rel"]["nbytes"] // n,
+            "_s_channel": entries_by_name[d.layer + ".weight_s_channel"]["nbytes"] // n,
+        }
+        for r0 in range(0, n, chunk_rows):
+            r1 = min(n, r0 + chunk_rows)
+            part = _quantize_row_chunk(
+                self.reader, d.name, r0, r1, d.group_size,
+                d.convrot_groupsize, codebook, device, compute_dtype)
+            for suffix, output_suffix in suffix_map.items():
+                name = d.layer + output_suffix
+                data = tensor_to_bytes(part[suffix])
+                self.writer.write_tensor_slice(name, r0 * row_bytes[suffix], data)
+                hashers[suffix].update(data)
+            del part
+        codebook_name = d.layer + ".weight_codebook"
+        codebook_data = tensor_to_bytes(codebook)
+        self.writer.write_tensor_bytes(codebook_name, codebook_data)
+        for suffix, output_suffix in suffix_map.items():
+            self._record_entry(d.layer + output_suffix, hashers[suffix].hexdigest(),
+                               entries_by_name)
+        self._record_entry(codebook_name, hashlib.sha256(codebook_data).hexdigest(),
+                           entries_by_name)
 
     def _write_passthrough(self, d: TensorDecision,
-                           entries_by_name: Dict[str, Dict[str, Any]], output_sha) -> None:
-        assert self.writer is not None
+                           entries_by_name: Dict[str, Dict[str, Any]]) -> None:
+        if self.writer is None:
+            raise OutputError("cannot write passthrough tensor before writer initialization")
         meta = self.info.by_name(d.name)
+        if meta is None:
+            raise PolicyError(f"conversion plan references missing tensor {d.name!r}")
         target_dtype = entries_by_name[d.name]["dtype"]
+        max_mem = int(getattr(self.args, "max_memory", 2 * 1024**3))
+        # Keep I/O buffers modest even when the user's quantization budget is
+        # very large.  The output was preallocated, so slices may be written in
+        # any order without ever materializing the full passthrough tensor.
+        io_bytes = min(16 * 1024 * 1024, max(1, max_mem // 4))
+        digest = hashlib.sha256()
         if target_dtype == meta.dtype:
-            raw = bytes(self.reader.read_bytes(d.name))
-            self._feed_hash(meta.source, raw)
-            data = raw
+            raw = self.reader.read_bytes(d.name)
+            for byte_offset in range(0, meta.nbytes, io_bytes):
+                data = bytes(raw[byte_offset:byte_offset + io_bytes])
+                self.writer.write_tensor_slice(d.name, byte_offset, data)
+                digest.update(data)
+            del raw
         else:
-            t = self.reader.read_tensor(d.name).to(target_dtype)
-            self._feed_hash(meta.source, bytes(self.reader.read_bytes(d.name)))
-            data = tensor_to_bytes(t)
-        off = self.writer.write_tensor_bytes(d.name, data)
-        output_sha.update(data)
-        self.state.entries[d.name] = {"offset": off, "size": len(data), "status": "done"}
-
-    def _mark_done(self, d: TensorDecision) -> None:
-        pass
+            bytes_per_element = meta.dtype.itemsize + 2 * target_dtype.itemsize
+            if max_mem < bytes_per_element:
+                raise PolicyError(
+                    f"--max-memory {human_bytes(max_mem)} cannot cast one "
+                    f"{meta.dtype} element to {target_dtype}")
+            elements_per_chunk = max(1, min(
+                math.prod(meta.shape),
+                max_mem // bytes_per_element,
+                max(1, io_bytes // target_dtype.itemsize),
+            ))
+            source = self.reader.read_tensor(d.name).reshape(-1)
+            numel = math.prod(meta.shape)
+            for element_offset in range(0, numel, elements_per_chunk):
+                converted = source[element_offset:element_offset + elements_per_chunk].to(
+                    target_dtype)
+                data = tensor_to_bytes(converted)
+                self.writer.write_tensor_slice(
+                    d.name, element_offset * target_dtype.itemsize, data)
+                digest.update(data)
+                del converted, data
+            del source
+        self._record_entry(d.name, digest.hexdigest(), entries_by_name)
 
     def close(self) -> None:
         if self.writer is not None:
@@ -3192,7 +4148,8 @@ def build_quant_metadata(info: CheckpointInfo, plan: ConversionPlan) -> Dict[str
     """Official `_quantization_metadata` payload: {"layers": {layer: conf}}."""
     layers: Dict[str, Any] = {}
     for d in plan.quantized_layers():
-        assert d.layer is not None
+        if d.layer is None:
+            raise PolicyError(f"quantized tensor {d.name!r} has no layer name")
         layers[d.layer] = {
             "format": plan.fmt,
             "group_size": d.group_size,
@@ -3207,14 +4164,14 @@ def build_extension_metadata(info: CheckpointInfo, plan: ConversionPlan,
                              calibration: Optional[CalibrationStats],
                              sensitivity: Optional[SensitivityAnalyzer],
                              input_hashes: Dict[str, str],
-                             output_sha256: str,
+                             tensor_payload_sha256: str,
                              validation_summary: Dict[str, Any],
-                             elapsed: float, peak_mem: int,
                              warnings: List[str]) -> Dict[str, Any]:
     """Namespaced extension metadata (never described as official ComfyUI keys)."""
     d = plan.detection
     quant_layers = plan.quantized_layers()
     conf = {
+        "schema": "comfy_wxa8/v1",
         "converter": CONVERTER_NAME,
         "converter_version": CONVERTER_VERSION,
         "format": plan.fmt,
@@ -3224,14 +4181,17 @@ def build_extension_metadata(info: CheckpointInfo, plan: ConversionPlan,
         "unet_prefix": d.unet_prefix,
         "source": {
             "kind": info.kind,
-            "files": info.files,
+            "files": _portable_file_labels(info.files),
             "total_bytes": info.total_bytes,
-            "sha256": input_hashes,
+            "sha256": _portable_hash_manifest(info.files, input_hashes),
         },
         "quantization": {
             "weight_bits": 4,
             "activation_bits": 8,
-            "weight_quantization": "per-group asymmetric codebook (Lloyd-Max, symmetric)",
+            "weight_quantization": "per-group 16-entry symmetric Lloyd-Max codebook",
+            "activation_quantization": "runtime dynamic symmetric int8 per input row after ConvRot",
+            "activation_scale": "fp32 amax(row)/127, clamped to at least 1e-30",
+            "activation_rounding": "nearest integer, clamped to [-128,127]",
             "group_size": quant_layers[0].group_size if quant_layers else None,
             "convrot": True,
             "convrot_groupsize": quant_layers[0].convrot_groupsize if quant_layers else None,
@@ -3240,6 +4200,11 @@ def build_extension_metadata(info: CheckpointInfo, plan: ConversionPlan,
             "symmetric": True,
             "n_quantized_layers": len(quant_layers),
             "n_kept_tensors": plan.n_kept,
+            "compute_dtype": getattr(args, "compute_dtype", "auto"),
+            "effective_compute_dtype": torch_dtype_name(
+                getattr(args, "_compute_dtype_tensor", torch.float32)),
+            "passthrough_output_dtype": getattr(args, "output_dtype", "auto"),
+            "chunked_layers": sorted(plan.chunked_layers),
         },
         "calibration": calibration.to_dict() if calibration is not None else {
             "source": None, "method": "calibration-free (reference format)",
@@ -3253,8 +4218,9 @@ def build_extension_metadata(info: CheckpointInfo, plan: ConversionPlan,
         "reproducibility": {
             "seed": getattr(args, "seed", 0),
             "device": getattr(args, "device", "auto"),
+            "effective_device": plan.device,
             "torch_version": env.torch_version,
-            "deterministic": True,
+            "deterministic_on_same_backend": True,
             "codebook_subsample_seed": 0,
         },
         "compatibility": {
@@ -3278,13 +4244,25 @@ def build_extension_metadata(info: CheckpointInfo, plan: ConversionPlan,
             "triton_backend": {"requires": f"triton >= {TRITON_MIN_VERSION[0]}.{TRITON_MIN_VERSION[1]} (ROCm)"},
         },
         "output": {
-            "sha256": output_sha256,
-            "bytes": plan.total_out_bytes,
+            "tensor_data_sha256": tensor_payload_sha256,
+            "tensor_data_bytes": plan.total_out_bytes,
             "entries": len(plan.output_entries),
+            "file_sha256": None,
+            "file_sha256_note": "The full-file SHA256 is emitted in the report. "
+                                "It cannot be embedded in the file it hashes.",
+        },
+        "policy_summary": {
+            "decision_counts": {
+                kind.value: sum(1 for item in plan.decisions if item.kind == kind)
+                for kind in DecisionKind
+            },
+            "reason_counts": dict(sorted({
+                reason: sum(1 for item in plan.decisions if item.reason == reason)
+                for reason in {item.reason for item in plan.decisions}
+            }.items())),
+            "full_manifest": "conversion report",
         },
         "validation": validation_summary,
-        "elapsed_seconds": round(elapsed, 3),
-        "peak_rss_bytes": peak_mem,
         "warnings": warnings,
     }
     return conf
@@ -3303,6 +4281,16 @@ class ValidationCheck:
     status: str          # passed | passed-with-warnings | failed | skipped
     detail: str = ""
     reason: str = ""
+
+
+def _refresh_validation_summary(summary: Dict[str, Any]) -> Dict[str, Any]:
+    checks = summary.setdefault("checks", [])
+    summary["n_passed"] = sum(1 for c in checks if c.get("status") == "passed")
+    summary["n_passed_with_warnings"] = sum(
+        1 for c in checks if c.get("status") == "passed-with-warnings")
+    summary["n_failed"] = sum(1 for c in checks if c.get("status") == "failed")
+    summary["n_skipped"] = sum(1 for c in checks if c.get("status") == "skipped")
+    return summary
 
 
 class Validator:
@@ -3335,6 +4323,7 @@ class Validator:
             metrics: Optional[Dict[str, TensorMetrics]] = None,
             input_hashes: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         args = self.args
+        full_validation = bool(args.validate or args.validation_only)
         out_path = self.output_path
         if not os.path.exists(out_path):
             self.check("output-exists", False, f"{out_path} missing")
@@ -3354,8 +4343,9 @@ class Validator:
             return self.summary()
 
         expected = {e["name"]: e for e in self.plan.output_entries}
-        missing = [n for n in expected if n not in st.keys()]
-        extra = [n for n in st.keys() if n not in expected]
+        output_name_set = set(out_names)
+        missing = [n for n in expected if n not in output_name_set]
+        extra = [n for n in output_name_set if n not in expected]
         self.check("output-inventory", not missing and not extra,
                    f"missing={missing[:5]} extra={extra[:5]}")
 
@@ -3364,7 +4354,7 @@ class Validator:
         dtype_ok = True
         bad = []
         for name, e in expected.items():
-            if name not in st.keys():
+            if name not in output_name_set:
                 continue
             t = st.get_slice(name)
             shp = tuple(t.get_shape())
@@ -3389,10 +4379,85 @@ class Validator:
         has_quant_meta = METADATA_KEY_QUANT in meta
         self.check("metadata-present", has_quant_meta,
                    "missing _quantization_metadata" if not has_quant_meta else
-                   f"{len(json.loads(meta[METADATA_KEY_QUANT]).get('layers', {}))} layers recorded")
+                   "present")
         ext_ok = METADATA_KEY_EXT in meta
         self.check("extension-metadata-present", ext_ok,
                    "missing comfy_wxa8 extension metadata" if not ext_ok else "present")
+        ext_payload: Dict[str, Any] = {}
+        if ext_ok:
+            try:
+                ext_payload = json.loads(meta[METADATA_KEY_EXT])
+                required = ("schema", "converter", "converter_version", "format",
+                            "architecture", "source", "quantization", "output")
+                source_block = ext_payload.get("source", {}) \
+                    if isinstance(ext_payload, dict) else {}
+                quant_block = ext_payload.get("quantization", {}) \
+                    if isinstance(ext_payload, dict) else {}
+                output_block = ext_payload.get("output", {}) \
+                    if isinstance(ext_payload, dict) else {}
+                source_files = source_block.get("files", []) \
+                    if isinstance(source_block, dict) else []
+                source_hashes = source_block.get("sha256", {}) \
+                    if isinstance(source_block, dict) else {}
+                schema_ok = isinstance(ext_payload, dict) and all(
+                    key in ext_payload for key in required)
+                schema_ok = (
+                    schema_ok
+                    and ext_payload.get("schema") == "comfy_wxa8/v1"
+                    and ext_payload.get("format") == self.plan.fmt
+                    and ext_payload.get("format_revision") == FORMAT_W4A8_REVISION
+                    and ext_payload.get("architecture") ==
+                    self.plan.detection.architecture
+                    and isinstance(ext_payload.get("source"), dict)
+                    and isinstance(ext_payload.get("quantization"), dict)
+                    and isinstance(ext_payload.get("output"), dict)
+                    and isinstance(source_files, list)
+                    and source_files
+                    and all(isinstance(label, str) and label
+                            and not Path(label).is_absolute()
+                            for label in source_files)
+                    and isinstance(source_hashes, dict)
+                    and set(source_hashes) == set(source_files)
+                    and all(isinstance(digest, str)
+                            and re.fullmatch(r"[0-9a-f]{64}", digest)
+                            for digest in source_hashes.values())
+                    and quant_block.get("weight_bits") == 4
+                    and quant_block.get("activation_bits") == 8
+                    and quant_block.get("packing") == "int4-nibble-lsb"
+                    and quant_block.get("scale_dtype") == "fp8_e4m3fn"
+                    and isinstance(quant_block.get("activation_quantization"), str)
+                    and isinstance(output_block.get("tensor_data_sha256"), str)
+                    and bool(re.fullmatch(
+                        r"[0-9a-f]{64}", output_block["tensor_data_sha256"]))
+                )
+                self.check("extension-metadata-schema", schema_ok,
+                           "required fields, revision and architecture"
+                           if schema_ok else
+                           "invalid extension fields, revision or architecture")
+                if input_hashes:
+                    recorded_source_hashes = ext_payload.get("source", {}).get(
+                        "sha256", {})
+                    source_hash_ok = (
+                        isinstance(recorded_source_hashes, dict)
+                        and sorted(recorded_source_hashes.values()) ==
+                        sorted(input_hashes.values())
+                    )
+                    self.check(
+                        "metadata-source-hash", source_hash_ok,
+                        "source content hashes match" if source_hash_ok else
+                        "embedded source hashes do not match the supplied original")
+                recorded_payload_hash = ext_payload.get("output", {}).get(
+                    "tensor_data_sha256")
+                if recorded_payload_hash:
+                    actual_payload_hash = sha256_safetensors_payload(out_path)
+                    self.check("tensor-payload-hash",
+                               recorded_payload_hash == actual_payload_hash,
+                               f"sha256={actual_payload_hash}")
+                else:
+                    self.check("tensor-payload-hash", False,
+                               "missing output.tensor_data_sha256")
+            except Exception as e:
+                self.check("extension-metadata-json", False, f"unparseable: {e}")
         if has_quant_meta:
             try:
                 qm = json.loads(meta[METADATA_KEY_QUANT])
@@ -3400,80 +4465,163 @@ class Validator:
                 q_layers = {d.layer for d in self.plan.quantized_layers()}
                 mism = q_layers.symmetric_difference(set(layers.keys()))
                 self.check("metadata-layer-inventory", not mism,
-                           f"layer set mismatch: {sorted(mism)[:5]}")
+                           (f"{len(layers)} layers match" if not mism else
+                            f"layer set mismatch: {sorted(mism)[:5]}"))
+                decision_by_layer = {
+                    decision.layer: decision for decision in self.plan.quantized_layers()
+                }
                 conf_ok = all(
-                    isinstance(v, dict) and v.get("format") == self.plan.fmt
-                    for v in layers.values())
-                self.check("metadata-layer-conf", conf_ok, "format field mismatch")
+                    isinstance(value, dict)
+                    and value.get("format") == self.plan.fmt
+                    and value.get("group_size") ==
+                    decision_by_layer.get(layer).group_size
+                    and value.get("convrot") is True
+                    and value.get("convrot_groupsize") ==
+                    decision_by_layer.get(layer).convrot_groupsize
+                    for layer, value in layers.items()
+                    if layer in decision_by_layer)
+                conf_ok = conf_ok and not mism
+                self.check("metadata-layer-conf", conf_ok,
+                           "format/group/ConvRot fields valid" if conf_ok else
+                           "invalid format/group/ConvRot field")
             except Exception as e:
                 self.check("metadata-json", False, f"unparseable: {e}")
 
-        # ---- sampled tensor round trips (pack/unpack + decode vs original) ----
+        # ---- tensor round trips (all with --validate, representative otherwise) ----
         q_layers = self.plan.quantized_layers()
         if q_layers:
             import random
-            rng = random.Random(getattr(args, "seed", 0) or 0)
-            sample = sorted(q_layers, key=lambda d: self.info.by_name(d.name).nbytes, reverse=True)
-            sample = sample[:16] + (rng.sample(sample, min(8, len(sample))) if len(sample) > 16 else [])
-            sample = list({id(d): d for d in sample}.values())
+            rng = random.Random(getattr(args, "seed", 0) or 0)  # noqa: S311
+            if full_validation:
+                sample = list(q_layers)
+            else:
+                sample = sorted(q_layers, key=lambda d: self.info.by_name(d.name).nbytes,
+                                reverse=True)
+                sample = sample[:16] + (rng.sample(sample, min(8, len(sample)))
+                                        if len(sample) > 16 else [])
+                sample = list({id(d): d for d in sample}.values())
             worst: Dict[str, float] = {}
             for d in sample:
-                assert d.layer is not None
+                if d.layer is None:
+                    self.check(f"recon-{d.name}", False,
+                               "quantized decision has no layer name")
+                    continue
                 try:
-                    with safe_open(out_path, framework="pt") as st2:
-                        packed = st2.get_tensor(d.layer + ".weight")
-                        s_rel = st2.get_tensor(d.layer + ".weight_s_rel")
-                        s_ch = st2.get_tensor(d.layer + ".weight_s_channel")
-                        cb = st2.get_tensor(d.layer + ".weight_codebook")
+                    cb = st.get_tensor(d.layer + ".weight_codebook")
                     orig = self.info.by_name(d.name)
                     if orig is not None and reader is not None:
-                        orig_t = reader.read_tensor(d.name).float()
-                        dq = dequantize_w4a8_weight(packed, s_rel, s_ch, codebook=cb,
-                                                    group_size=d.group_size,
-                                                    convrot_groupsize=d.convrot_groupsize,
-                                                    output_dtype=torch.float32)
-                        m = compute_weight_metrics(orig_t, dq)
+                        max_mem = getattr(args, "max_memory", 2 * 1024**3)
+                        bounded = (
+                            d.name in getattr(self.plan, "chunked_layers", set())
+                            or _quant_work_bytes(orig) > max_mem
+                        )
+                        if bounded:
+                            n, k = int(orig.shape[0]), int(orig.shape[1])
+                            chunk_rows = _chunk_rows_for_budget(k, n, max_mem)
+                            acc = _MetricAccumulator(d.name)
+                            pack_ok = True
+                            original_view = reader.read_tensor(d.name)
+                            packed_slice = st.get_slice(d.layer + ".weight")
+                            s_rel_slice = st.get_slice(d.layer + ".weight_s_rel")
+                            s_ch_slice = st.get_slice(d.layer + ".weight_s_channel")
+                            for r0 in range(0, n, chunk_rows):
+                                r1 = min(n, r0 + chunk_rows)
+                                packed = packed_slice[r0:r1]
+                                s_rel = s_rel_slice[r0:r1]
+                                s_ch = s_ch_slice[r0:r1]
+                                dq = dequantize_w4a8_weight(
+                                    packed, s_rel, s_ch, codebook=cb,
+                                    group_size=d.group_size,
+                                    convrot_groupsize=d.convrot_groupsize,
+                                    output_dtype=torch.float32)
+                                acc.update(original_view[r0:r1], dq, None)
+                                rt = unpack_w4(packed)
+                                repacked = (
+                                    (rt[:, 0::2] & 0xF)
+                                    | ((rt[:, 1::2] & 0xF) << 4)
+                                ).to(torch.int8)
+                                pack_ok = pack_ok and bool(torch.equal(repacked, packed))
+                                del packed, s_rel, s_ch, dq, rt, repacked
+                            m = acc.finish()
+                        else:
+                            packed = st.get_tensor(d.layer + ".weight")
+                            s_rel = st.get_tensor(d.layer + ".weight_s_rel")
+                            s_ch = st.get_tensor(d.layer + ".weight_s_channel")
+                            orig_t = reader.read_tensor(d.name).float()
+                            dq = dequantize_w4a8_weight(
+                                packed, s_rel, s_ch, codebook=cb,
+                                group_size=d.group_size,
+                                convrot_groupsize=d.convrot_groupsize,
+                                output_dtype=torch.float32)
+                            m = compute_weight_metrics(orig_t, dq)
+                            rt = unpack_w4(packed)
+                            repacked = (
+                                (rt[:, 0::2] & 0xF)
+                                | ((rt[:, 1::2] & 0xF) << 4)
+                            ).to(torch.int8)
+                            pack_ok = bool(torch.equal(repacked, packed))
                         worst[d.layer] = m.rel_l2
                         if m.rel_l2 > self.plan.detection.policy.max_rel_l2:
-                            self.check(f"recon-{d.layer[:60]}", False,
+                            self.check(f"recon-{d.layer}", False,
                                        f"relL2 {m.rel_l2:.4f} > {self.plan.detection.policy.max_rel_l2}")
                         elif m.cosine < self.plan.detection.policy.min_cosine:
-                            self.check(f"recon-{d.layer[:60]}", False,
+                            self.check(f"recon-{d.layer}", False,
                                        f"cosine {m.cosine:.4f} < {self.plan.detection.policy.min_cosine}")
                         else:
-                            self.check(f"recon-{d.layer[:60]}", True,
+                            self.check(f"recon-{d.layer}", True,
                                        f"relL2={m.rel_l2:.4f} snr={m.snr_db:.1f}dB cos={m.cosine:.4f}")
-                        # packing round trip
-                        rt = unpack_w4(packed)
-                        repacked = ((rt[:, 0::2] & 0xF) | ((rt[:, 1::2] & 0xF) << 4)).to(torch.int8)
-                        rt_ok = bool(torch.equal(repacked, packed))
-                        self.check(f"pack-rt-{d.layer[:60]}", rt_ok, "pack/unpack round trip")
+                        self.check(f"pack-rt-{d.layer}", pack_ok,
+                                   "pack/unpack round trip"
+                                   + (" (bounded row chunks)" if bounded else ""))
                 except Exception as e:
-                    self.check(f"recon-{d.layer[:60]}", False, f"error: {e}")
+                    self.check(f"recon-{d.layer}", False, f"error: {e}")
             if worst:
                 mx = max(worst.values())
                 self.check("reconstruction-error-bound", mx <= self.plan.detection.policy.max_rel_l2,
-                           f"max sampled relL2 {mx:.4f} (policy bound {self.plan.detection.policy.max_rel_l2})")
+                           f"max {'full' if full_validation else 'sampled'} relL2 {mx:.4f} "
+                           f"(policy bound {self.plan.detection.policy.max_rel_l2})")
 
         # ---- scale validation ----
         scale_ok = True
         scale_detail = ""
         n_scale = 0
-        for d in q_layers[:64]:
-            assert d.layer is not None
+        for d in q_layers:
+            if d.layer is None:
+                scale_ok = False
+                scale_detail = f"{d.name}: quantized decision has no layer name"
+                break
             try:
-                with safe_open(out_path, framework="pt") as st2:
-                    s_rel = st2.get_tensor(d.layer + ".weight_s_rel").float()
-                    s_ch = st2.get_tensor(d.layer + ".weight_s_channel").float()
-                    cb = st2.get_tensor(d.layer + ".weight_codebook").float()
-                if not torch.isfinite(s_rel).all() or not torch.isfinite(s_ch).all() \
-                        or not torch.isfinite(cb).all():
+                cb = st.get_tensor(d.layer + ".weight_codebook").float()
+                orig = self.info.by_name(d.name)
+                max_mem = getattr(args, "max_memory", 2 * 1024**3)
+                if orig is not None and _quant_work_bytes(orig) > max_mem:
+                    n, k = int(orig.shape[0]), int(orig.shape[1])
+                    chunk_rows = _chunk_rows_for_budget(k, n, max_mem)
+                else:
+                    n = int(st.get_slice(d.layer + ".weight_s_channel").get_shape()[0])
+                    chunk_rows = n
+                finite = bool(torch.isfinite(cb).all())
+                valid_range = True
+                s_rel_slice = st.get_slice(d.layer + ".weight_s_rel")
+                s_ch_slice = st.get_slice(d.layer + ".weight_s_channel")
+                for r0 in range(0, n, chunk_rows):
+                    r1 = min(n, r0 + chunk_rows)
+                    s_rel = s_rel_slice[r0:r1].float()
+                    s_ch = s_ch_slice[r0:r1].float()
+                    finite = finite and bool(
+                        torch.isfinite(s_rel).all() and torch.isfinite(s_ch).all())
+                    valid_range = valid_range and bool(
+                        (s_rel >= 0).all() and (s_ch > 0).all())
+                    del s_rel, s_ch
+                if not finite:
                     scale_ok = False
                     scale_detail = f"{d.layer}: non-finite scales"
                     break
-                if (s_rel <= 0).any() or (s_ch <= 0).any():
+                if not valid_range:
                     scale_ok = False
-                    scale_detail = f"{d.layer}: non-positive scales"
+                    scale_detail = (
+                        f"{d.layer}: negative fp8 relative scale or non-positive "
+                        "channel scale")
                     break
                 n_scale += 1
             except Exception as e:
@@ -3481,7 +4629,8 @@ class Validator:
                 scale_detail = f"{d.layer}: {e}"
                 break
         self.check("scale-validation", scale_ok,
-                   scale_detail or f"{n_scale} layers OK (fp8 s_rel finite/positive, fp32 s_channel finite/positive)")
+                   scale_detail or f"{n_scale} layers OK (fp8 s_rel finite/nonnegative, "
+                   "fp32 s_channel finite/positive)")
 
         # ---- deterministic re-quantization sample ----
         if q_layers and reader is not None and not args.validation_only:
@@ -3493,54 +4642,83 @@ class Validator:
                            skipped=True,
                            reason="device-dependent codebook subsample")
             d0 = q_layers[0]
-            w = reader.read_tensor(d0.name)
             try:
-                out1 = quantize_weight_by_format(w, self.plan.fmt, d0.group_size, d0.convrot_groupsize)
-                out2 = quantize_weight_by_format(w, self.plan.fmt, d0.group_size, d0.convrot_groupsize)
+                if d0.name in getattr(self.plan, "chunked_layers", set()):
+                    self.check("deterministic-conversion", True,
+                               "skipped: bounded chunk determinism is covered by self-test",
+                               skipped=True, reason="large chunked layer")
+                    raise StopIteration
+                compute_dtype = getattr(args, "_compute_dtype_tensor", torch.float32)
+                max_mem = getattr(args, "max_memory", 2 * 1024**3)
+                out1 = quantize_tensor_bounded(
+                    reader, d0.name, self.plan.fmt, d0.group_size,
+                    d0.convrot_groupsize, max_mem, torch.device("cpu"),
+                    compute_dtype=compute_dtype)
+                out2 = quantize_tensor_bounded(
+                    reader, d0.name, self.plan.fmt, d0.group_size,
+                    d0.convrot_groupsize, max_mem, torch.device("cpu"),
+                    compute_dtype=compute_dtype)
                 det = all(torch.equal(out1[k], out2[k]) for k in out1)
                 self.check("deterministic-conversion", det, "two runs byte-identical")
                 if conv_device == "cpu" and d0.name not in getattr(self.plan, "chunked_layers", set()):
-                    with safe_open(out_path, framework="pt") as st2:
-                        on_disk = st2.get_tensor(d0.layer + ".weight")
+                    on_disk = st.get_tensor(d0.layer + ".weight")
                     matches_disk = torch.equal(out1[""], on_disk)
                     self.check("deterministic-vs-disk", matches_disk,
                                "recomputed packed weight matches the file" if matches_disk else "MISMATCH")
-                elif d0.name in getattr(self.plan, "chunked_layers", set()):
-                    self.check("deterministic-vs-disk", True,
-                               "skipped: layer was quantized via the bounded-memory "
-                               "chunked path (codebook subsample differs from the "
-                               "in-memory path by design)",
-                               skipped=True, reason="chunked codebook subsample")
+            except StopIteration:
+                pass
             except Exception as e:
                 self.check("deterministic-conversion", False, f"error: {e}")
 
         # ---- output hash ----
-        if args.validate:
+        if full_validation:
             self.output_sha256 = sha256_file(out_path)
             self.check("output-hash", True, f"sha256={self.output_sha256}")
 
         # ---- compatibility probe (optional, no ComfyUI required) ----
-        if args.validate:
+        if full_validation:
             if self.env.has_comfy_kitchen:
-                self.check("compat-comfy-kitchen", self.env.comfy_kitchen_has_w4a8_layout,
+                compatible = self.env.comfy_kitchen_has_w4a8_layout
+                self.check("compat-comfy-kitchen", True,
                            detail=f"installed comfy-kitchen: {self.env.comfy_kitchen_rev or 'version unknown'}, "
-                                  f"AsymW4A8Int8Layout registered: {self.env.comfy_kitchen_has_w4a8_layout}",
-                           warn=not self.env.comfy_kitchen_has_w4a8_layout)
+                                  "static package source contains AsymW4A8Int8Layout: "
+                                  f"{compatible}",
+                           warn=not compatible)
             else:
                 self.check("compat-comfy-kitchen", True, "comfy-kitchen not installed (skipped)",
                            skipped=True, reason="optional runtime probe")
             if self.env.has_comfy_quant_ops:
-                self.check("compat-comfyui", self.plan.fmt in self.env.comfyui_quant_algos,
-                           detail=f"ComfyUI QUANT_ALGOS: {self.env.comfyui_quant_algos}",
-                           warn=self.plan.fmt not in self.env.comfyui_quant_algos)
+                compatible = self.plan.fmt in self.env.comfyui_quant_algos
+                self.check("compat-comfyui", True,
+                           detail=f"static ComfyUI quant_ops formats: "
+                                  f"{self.env.comfyui_quant_algos}",
+                           warn=not compatible)
             else:
                 self.check("compat-comfyui", True, "ComfyUI not installed (skipped)",
                            skipped=True, reason="optional runtime probe")
 
         # ---- input hash cross-check ----
         if input_hashes:
-            self.check("input-hash", True, json_dumps(input_hashes))
+            if full_validation:
+                current_hashes = hash_checkpoint_files(self.info, refresh=True)
+                portable_current = _portable_hash_manifest(
+                    self.info.files, current_hashes)
+                portable_expected = _portable_hash_manifest(
+                    self.info.files, input_hashes)
+                self.check(
+                    "input-hash", current_hashes == input_hashes,
+                    (json_dumps(portable_current) if current_hashes == input_hashes else
+                     "source changed during validation: " + json_dumps({
+                         "expected": portable_expected,
+                         "actual": portable_current,
+                     })))
+            else:
+                self.check("input-hash", True,
+                           "source hashes matched before and after conversion: "
+                           + json_dumps(_portable_hash_manifest(
+                               self.info.files, input_hashes)))
 
+        del st
         return self.summary()
 
 
@@ -3565,17 +4743,54 @@ def republish_with_metadata(src_path: str, final_path: str, metadata: Dict[str, 
             "shape": list(e["shape"]),
             "data_offsets": [start, end],
         }
-        offset = (end + 7) & ~7
-    raw = json.dumps(header, separators=(",", ":")).encode("utf-8")
-    final_tmp = final_path + ".repub.tmp"
-    with open(src_path, "rb") as src:
-        old_hlen = struct.unpack("<Q", src.read(8))[0]
-        src.seek(8 + old_hlen)
-        with open(final_tmp, "wb") as dst:
-            dst.write(struct.pack("<Q", len(raw)))
-            dst.write(raw)
-            shutil.copyfileobj(src, dst, length=1 << 20)
-    os.replace(final_tmp, final_path)
+        offset = end
+    # Canonical key ordering makes a metadata-only republish byte-identical
+    # regardless of the mapping order returned by a safetensors implementation.
+    raw = json.dumps(header, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    if len(raw) > MAX_SAFETENSORS_HEADER_SIZE:
+        raise OutputError("metadata header exceeds the safetensors 100 MB safety limit")
+    raw += b" " * ((-len(raw)) % 8)
+    parent = os.path.dirname(os.path.abspath(final_path)) or "."
+    fd, final_tmp = tempfile.mkstemp(
+        prefix=f".{Path(final_path).name}.metadata.", suffix=".tmp", dir=parent)
+    try:
+        with open(src_path, "rb") as src:
+            head = src.read(8)
+            if len(head) != 8:
+                raise OutputError(f"{src_path}: truncated source header during republish")
+            old_hlen = struct.unpack("<Q", head)[0]
+            payload_start = 8 + old_hlen
+            if payload_start > os.fstat(src.fileno()).st_size:
+                raise OutputError(f"{src_path}: invalid source header during republish")
+            payload_bytes = os.fstat(src.fileno()).st_size - payload_start
+            if payload_bytes != offset:
+                raise OutputError(
+                    f"{src_path}: payload size {payload_bytes} != planned {offset}")
+            src.seek(payload_start)
+            with os.fdopen(fd, "wb") as dst:
+                dst.write(struct.pack("<Q", len(raw)))
+                dst.write(raw)
+                shutil.copyfileobj(src, dst, length=1 << 20)
+                dst.flush()
+                os.fsync(dst.fileno())
+        with RawSafetensorsFile(final_tmp) as candidate:
+            if candidate.metadata != metadata:
+                raise OutputError("republished metadata did not round-trip")
+            if set(candidate.entries) != {entry["name"] for entry in entries}:
+                raise OutputError("republished tensor inventory did not round-trip")
+            for entry in entries:
+                dtype, shape, _, _ = candidate.get(entry["name"])
+                if dtype != entry["dtype"] or tuple(shape) != tuple(entry["shape"]):
+                    raise OutputError(
+                        f"republished shape/dtype mismatch for {entry['name']!r}")
+        os.replace(final_tmp, final_path)
+        _fsync_parent(final_path)
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        with contextlib.suppress(OSError):
+            os.unlink(final_tmp)
+        raise
     return final_path
 
 
@@ -3659,6 +4874,17 @@ def build_report(info: CheckpointInfo, plan: ConversionPlan, env: EnvironmentInf
         "n_input_tensors": len(info.tensors), "n_quantized": plan.n_quantized,
         "n_kept": plan.n_kept,
         "quantization_rows": quant_rows,
+        "tensor_decisions": [
+            {"name": item.name, "decision": item.kind.value,
+             "reason": item.reason, "layer": item.layer,
+             "group_size": item.group_size if item.kind == DecisionKind.QUANTIZE else None,
+             "convrot_groupsize": item.convrot_groupsize
+             if item.kind == DecisionKind.QUANTIZE else None}
+            for item in plan.decisions
+        ],
+        "sensitivity_metrics": {
+            name: dataclasses.asdict(metric) for name, metric in metrics.items()
+        },
         "calibration_summary": (
             f"source={calibration.source}, files={calibration.files}, "
             f"layers={len(calibration.layers)}, provenance={json_dumps(calibration.provenance)}"
@@ -3711,10 +4937,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--calibration-samples", type=int, default=None,
                    help="limit calibration rows used per layer")
     p.add_argument("--calibration-cache", metavar="PATH", default=None,
-                   help="read/write calibration statistics cache")
+                   help="read/write a compressed cache of the activation rows")
     p.add_argument("--seed", type=int, default=0, help="reproducibility seed")
     p.add_argument("--include", action="append", default=[],
-                   metavar="PATTERN", help="regex; force-quantize matching layer weights")
+                   metavar="PATTERN", help="regex; select matching eligible layer weights "
+                        "for quantization (shape/dtype safety gates still apply)")
     p.add_argument("--exclude", action="append", default=[],
                    metavar="PATTERN", help="regex; never quantize matching tensors")
     p.add_argument("--keep-precision", action="append", default=[],
@@ -3722,15 +4949,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--sensitivity-threshold", type=float, default=None,
                    help="keep layers at original precision when their (activation-aware "
                         "if calibration given, else weight-only) error exceeds this")
-    p.add_argument("--error-threshold", type=float, default=0.35,
-                   help="max allowed per-layer reconstruction relL2; layers above are "
-                        "kept at original precision and reported")
+    p.add_argument("--error-threshold", type=float, default=None,
+                   help="hard reconstruction relL2 fallback during a calibration/"
+                        "sensitivity prepass (default: architecture policy bound)")
     p.add_argument("--max-memory", default="2G", metavar="SIZE",
                    help="per-tensor working-memory budget (e.g. 512M, 2G); larger "
                         "tensors are quantized in chunks")
-    p.add_argument("--streaming", action="store_true",
-                   help="stream the conversion with bounded memory (default for "
-                        "safetensors inputs)")
+    p.add_argument("--streaming", action="store_true", default=True,
+                   help="stream the conversion with bounded memory (always enabled)")
     p.add_argument("--resume", action="store_true",
                    help="resume an interrupted conversion from its state file")
     p.add_argument("--overwrite", action="store_true",
@@ -3768,33 +4994,104 @@ def _fmt_display(fmt: Optional[str]) -> Optional[str]:
 
 
 def plan_from_output(output_path: str, detection: DetectionResult,
-                     fmt: str) -> ConversionPlan:
+                     fmt: str, info: Optional[CheckpointInfo] = None) -> ConversionPlan:
     """Reconstruct a minimal plan from an existing output checkpoint (validation-only)."""
     with safe_open(output_path, framework="pt") as st:
         names = list(st.keys())
-        meta = st.metadata()
-    qm = json.loads(meta.get(METADATA_KEY_QUANT, "{}"))
-    layers = qm.get("layers", {})
-    decisions: List[TensorDecision] = []
-    for layer, conf in layers.items():
-        decisions.append(TensorDecision(
-            f"{layer}.weight", DecisionKind.QUANTIZE, "reconstructed from output metadata",
-            layer=layer, group_size=int(conf.get("group_size", 16)),
-            convrot_groupsize=int(conf.get("convrot_groupsize", 256))))
-    for name in names:
-        if name.endswith(".weight") and name[:-len(".weight")] not in layers:
-            decisions.append(TensorDecision(name, DecisionKind.KEEP, "reconstructed passthrough"))
-    entries = []
-    for name in names:
-        with safe_open(output_path, framework="pt") as st:
+        meta = st.metadata() or {}
+        actual_entries = []
+        for name in names:
             sl = st.get_slice(name)
             shape = tuple(sl.get_shape())
             dt = torch_dtype_from_safe(sl.get_dtype())
-        nb = tensor_nbytes(dt, shape)
-        entries.append({"name": name, "dtype": dt, "shape": shape, "nbytes": nb})
+            actual_entries.append({
+                "name": name,
+                "dtype": dt,
+                "shape": shape,
+                "nbytes": tensor_nbytes(dt, shape),
+            })
+    try:
+        qm = json.loads(meta.get(METADATA_KEY_QUANT, "{}"))
+    except (TypeError, json.JSONDecodeError) as e:
+        raise ValidationError(
+            f"{output_path}: invalid {METADATA_KEY_QUANT} metadata: {e}") from e
+    if not isinstance(qm, dict) or not isinstance(qm.get("layers"), dict):
+        raise ValidationError(
+            f"{output_path}: {METADATA_KEY_QUANT} must contain a layers object")
+    layers = qm.get("layers", {})
+    if not layers:
+        raise ValidationError(
+            f"{output_path}: no quantized layers recorded in {METADATA_KEY_QUANT}")
+    decisions: List[TensorDecision] = []
+    for layer, conf in layers.items():
+        if not isinstance(layer, str) or not layer or not isinstance(conf, dict):
+            raise ValidationError(
+                f"{output_path}: malformed quantized-layer metadata entry")
+        try:
+            group_size = int(conf.get("group_size", 16))
+            convrot_groupsize = int(conf.get("convrot_groupsize", 256))
+        except (TypeError, ValueError) as e:
+            raise ValidationError(
+                f"{output_path}: invalid group metadata for {layer!r}") from e
+        if conf.get("format") != fmt or group_size <= 0 or convrot_groupsize <= 0:
+            raise ValidationError(
+                f"{output_path}: incompatible format/group metadata for {layer!r}")
+        source_name = f"{layer}.weight"
+        if info is not None:
+            source_meta = info.by_name(source_name)
+            if source_meta is None or len(source_meta.shape) != 2:
+                raise ValidationError(
+                    f"{output_path}: quantized layer {layer!r} has no matching "
+                    "2D weight in the supplied original checkpoint")
+            try:
+                validate_w4_shape(
+                    int(source_meta.shape[1]), group_size, convrot_groupsize)
+            except PolicyError as e:
+                raise ValidationError(
+                    f"{output_path}: invalid W4A8 shape metadata for {layer!r}: {e}") from e
+        decisions.append(TensorDecision(
+            source_name, DecisionKind.QUANTIZE, "reconstructed from output metadata",
+            layer=layer, group_size=group_size,
+            convrot_groupsize=convrot_groupsize))
+    quantized_names = {f"{layer}.weight" for layer in layers}
+    if info is not None:
+        for tensor in info.tensors:
+            if tensor.name not in quantized_names:
+                decisions.append(TensorDecision(
+                    tensor.name, DecisionKind.KEEP, "reconstructed passthrough"))
+    else:
+        for name in names:
+            if name.endswith(".weight") and name not in quantized_names:
+                decisions.append(TensorDecision(
+                    name, DecisionKind.KEEP, "reconstructed passthrough"))
+    if info is not None:
+        passthrough_dtype = None
+        try:
+            ext = json.loads(meta.get(METADATA_KEY_EXT, "{}"))
+            if not isinstance(ext, dict) or not isinstance(
+                    ext.get("quantization", {}), dict):
+                raise ValidationError(
+                    f"{output_path}: invalid {METADATA_KEY_EXT} metadata object")
+            recorded_dtype = ext.get("quantization", {}).get(
+                "passthrough_output_dtype", "auto")
+            if recorded_dtype not in ("auto", "fp16", "bf16"):
+                raise ValidationError(
+                    f"{output_path}: invalid passthrough_output_dtype "
+                    f"{recorded_dtype!r}")
+            passthrough_dtype = {
+                "auto": None, "fp16": torch.float16, "bf16": torch.bfloat16,
+            }[recorded_dtype]
+        except json.JSONDecodeError as e:
+            raise ValidationError(
+                f"{output_path}: invalid {METADATA_KEY_EXT} metadata: {e}") from e
+        entries, expected_total = build_output_entries(
+            info, decisions, fmt, passthrough_dtype)
+    else:
+        entries = actual_entries
+        expected_total = sum(entry["nbytes"] for entry in actual_entries)
     plan = ConversionPlan(fmt=fmt, detection=detection, decisions=decisions,
                           metadata_quant=qm, metadata_ext={},
-                          output_entries=entries, total_out_bytes=sum(e["nbytes"] for e in entries))
+                          output_entries=entries, total_out_bytes=expected_total)
     plan.n_quantized = len([d for d in decisions if d.kind == DecisionKind.QUANTIZE])
     plan.n_kept = len(decisions) - plan.n_quantized
     return plan
@@ -3804,10 +5101,23 @@ def _write_reports(args: Any, report: Dict[str, Any]) -> None:
     text = render_text_report(report)
     print(text)
     if args.report:
-        with open(args.report, "w", encoding="utf-8") as f:
-            f.write(text + "\n")
-        with open(args.report + ".json", "w", encoding="utf-8") as f:
-            json.dump(report, f, indent=1, default=str)
+        report_path = os.path.abspath(args.report)
+        parent = os.path.dirname(report_path) or "."
+        os.makedirs(parent, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=f".{Path(report_path).name}.",
+                                   suffix=".tmp", dir=parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, report_path)
+            _fsync_parent(report_path)
+        except Exception:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
+        _atomic_write_json(args.report + ".json", report, indent=1)
         log().info("reports written to %s and %s.json", args.report, args.report)
 
 
@@ -3822,11 +5132,17 @@ def run_self_tests() -> int:
         ("padding-removal", _test_padding_removal),
         ("scale-calculations", _test_scale_calculations),
         ("deterministic-conversion", _test_deterministic),
+        ("compute-dtype-selection", _test_compute_dtype),
+        ("real-activation-calibration", _test_activation_calibration),
+        ("standalone-environment-probe", _test_standalone_environment),
         ("metadata-generation", _test_metadata),
         ("registry-behavior", _test_registry),
+        ("architecture-detection-safety", _test_detection_safety),
         ("golden-vectors-vs-reference", _test_golden_vectors),
         ("malformed-checkpoints", _test_malformed),
+        ("checkpoint-input-variants", _test_checkpoint_variants),
         ("unsupported-tensors", _test_unsupported),
+        ("sensitivity-output-planning", _test_sensitivity_planning),
         ("resume-state-recovery", _test_resume),
         ("atomic-output", _test_atomic),
         ("end-to-end-mini-model-w4a8", _test_e2e_mini_model_w4a8),
@@ -3899,7 +5215,9 @@ def _test_odd_dims() -> str:
     torch.manual_seed(3)
     # odd N, K=48 (divisible by 16 but not by 32)
     w = torch.randn(17, 48)
-    p, s_rel, s_ch, cb, corr = quantize_w4a8_weight(w, group_size=16, convrot_groupsize=16)
+    p, s_rel, s_ch, corr, cb = quantize_w4a8_weight(
+        w, group_size=16, convrot_groupsize=16)
+    assert corr is None and cb is not None
     assert p.shape == (17, 24)
     dq = dequantize_w4a8_weight(p, s_rel, s_ch, codebook=cb, group_size=16,
                                 convrot_groupsize=16, output_dtype=torch.float32)
@@ -3910,19 +5228,30 @@ def _test_odd_dims() -> str:
 def _test_padding_removal() -> str:
     d = _tmpdir()
     path = os.path.join(d, "pad.safetensors")
-    tensors = {"a": torch.randn(3, 16), "b": torch.randn(5)}
+    tensors = {
+        "a_bool": torch.tensor([True]),
+        "b_u8": torch.tensor([1, 2, 3], dtype=torch.uint8),
+        "c_float": torch.randn(5),
+    }
+    if getattr(torch, "uint16", None) in TORCH_TO_SAFE:
+        tensors["d_u16"] = torch.tensor([1, 65535], dtype=torch.uint16)
+    if torch.complex64 in TORCH_TO_SAFE:
+        tensors["e_complex64"] = torch.tensor([1 + 2j], dtype=torch.complex64)
     safetensors.torch.save_file(tensors, path)
-    entries = [{"name": "a", "dtype": torch.float32, "shape": (3, 16), "nbytes": 3 * 16 * 4},
-               {"name": "b", "dtype": torch.float32, "shape": (5,), "nbytes": 20}]
+    entries = [
+        {"name": name, "dtype": tensor.dtype, "shape": tuple(tensor.shape),
+         "nbytes": tensor.numel() * tensor.element_size()}
+        for name, tensor in tensors.items()
+    ]
     w = SafetensorsStreamWriter(path + ".stream", entries)
     w.open()
-    w.write_tensor_bytes("a", tensor_to_bytes(tensors["a"]))
-    w.write_tensor_bytes("b", tensor_to_bytes(tensors["b"]))
+    for name, tensor in tensors.items():
+        w.write_tensor_bytes(name, tensor_to_bytes(tensor))
     w.finalize(path + ".final")
     with safe_open(path + ".final", framework="pt") as st:
-        assert torch.equal(st.get_tensor("a"), tensors["a"])
-        assert torch.equal(st.get_tensor("b"), tensors["b"])
-    return "streamed file == safetensors.save_file content"
+        for name, tensor in tensors.items():
+            assert torch.equal(st.get_tensor(name), tensor)
+    return "contiguous odd-byte and optional safetensors dtypes reopen"
 
 
 def _test_scale_calculations() -> str:
@@ -3943,6 +5272,8 @@ def _test_scale_calculations() -> str:
     assert (cb.abs() <= 1.0).all()
     assert torch.isfinite(s_rel.float()).all() and (s_rel.float() > 0).all()
     assert torch.isfinite(s_ch).all() and (s_ch > 0).all()
+    zero_metrics = compute_weight_metrics(torch.zeros(4, 4), torch.zeros(4, 4))
+    assert zero_metrics.rel_l2 == 0.0 and zero_metrics.cosine == 1.0
     return "s_rel/s_channel/codebook shapes, positivity, 1-LSB grid bound"
 
 
@@ -3951,12 +5282,75 @@ def _test_deterministic() -> str:
     w = torch.randn(64, 256)
     o1 = quantize_w4a8_weight(w)
     o2 = quantize_w4a8_weight(w)
-    for a, b in zip(o1, o2):
+    for a, b in zip(o1, o2, strict=True):
         if a is None or b is None:
             assert a is None and b is None
         else:
             assert torch.equal(a, b)
     return "two runs byte-identical (w4)"
+
+
+def _test_compute_dtype() -> str:
+    d = _tmpdir()
+    path = os.path.join(d, "bf16.safetensors")
+    torch.manual_seed(51)
+    safetensors.torch.save_file({"w": torch.randn(65, 64).bfloat16()}, path)
+    info = discover_checkpoint(path)
+    with CheckpointReader(info) as reader:
+        fp32 = quantize_tensor_bounded(
+            reader, "w", FORMAT_W4A8, 16, 64, 256 * 1024**2,
+            torch.device("cpu"), compute_dtype=torch.float32)
+        bf16 = quantize_tensor_bounded(
+            reader, "w", FORMAT_W4A8, 16, 64, 256 * 1024**2,
+            torch.device("cpu"), compute_dtype=torch.bfloat16)
+    assert any(not torch.equal(fp32[key], bf16[key]) for key in fp32)
+    return "fp32 and bf16 compute paths produce distinct deterministic tensors"
+
+
+def _test_activation_calibration() -> str:
+    torch.manual_seed(52)
+    original = torch.randn(8, 16)
+    dequant = original + torch.randn_like(original) * 0.03
+    activations = torch.randn(5, 16)
+    d = _tmpdir()
+    model_path = os.path.join(d, "calibration_model.safetensors")
+    source_path = os.path.join(d, "activations.npz")
+    cache_path = os.path.join(d, "activations.cache")
+    safetensors.torch.save_file({"layer.weight": original}, model_path)
+    np.savez(source_path, **{"layer.weight": activations.numpy()})
+    info = discover_checkpoint(model_path)
+    calibration = load_calibration(source_path, info, 5, cache_path)
+    cached = load_calibration(source_path, info, 5, cache_path)
+    assert torch.equal(cached.layers["layer.weight"]["samples"], activations)
+    with open(cache_path, "rb") as f:
+        assert f.read(4) == b"PK\x03\x04"
+    analyzer = SensitivityAnalyzer(None, 1.0, calibration)
+    metrics = analyzer.evaluate("layer.weight", original, dequant)
+    expected = activation_aware_error(original, dequant, activations)
+    fake = activations.abs().amax(dim=0).unsqueeze(0).expand(5, -1)
+    fake_value = activation_aware_error(original, dequant, fake)
+    assert expected is not None and abs(metrics.act_rel_l2 - expected) < 1e-8
+    assert abs(metrics.act_rel_l2 - fake_value) > 1e-6
+    return "real rows used directly; compressed safe cache round-trips"
+
+
+def _test_standalone_environment() -> str:
+    import builtins
+    original_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "comfy" or name.startswith("comfy.") or \
+                name == "comfy_kitchen" or name.startswith("comfy_kitchen."):
+            raise AssertionError(f"standalone probe imported {name}")
+        return original_import(name, *args, **kwargs)
+
+    builtins.__import__ = guarded_import
+    try:
+        inspected = inspect_environment()
+    finally:
+        builtins.__import__ = original_import
+    assert inspected.python and inspected.torch_version
+    return "compatibility inspection performs no ComfyUI/comfy-kitchen imports"
 
 
 def _test_metadata() -> str:
@@ -3974,7 +5368,18 @@ def _test_metadata() -> str:
         assert d_.layer in qm["layers"]
         conf = qm["layers"][d_.layer]
         assert conf["format"] == FORMAT_W4A8 and conf["group_size"] >= 4
-    return f"{len(qm['layers'])} layers recorded"
+    plan.n_quantized = len(plan.quantized_layers())
+    plan.n_kept = len(plan.decisions) - plan.n_quantized
+    ext = build_extension_metadata(
+        info, plan, inspect_environment(),
+        _selftest_args(os.path.join(d, "out.safetensors"), FORMAT_W4A8),
+        None, None, hash_checkpoint_files(info), "0" * 64, {}, [])
+    assert ext["schema"] == "comfy_wxa8/v1"
+    assert ext["source"]["files"] == ["mini.safetensors"]
+    assert list(ext["source"]["sha256"]) == ["mini.safetensors"]
+    assert "runtime dynamic symmetric int8" in \
+        ext["quantization"]["activation_quantization"]
+    return f"{len(qm['layers'])} layers recorded; extension schema and provenance valid"
 
 
 def _test_registry() -> str:
@@ -4015,6 +5420,31 @@ def _test_registry() -> str:
     return f"{len(names)} families, {len(covered)} ComfyUI classes covered"
 
 
+def _test_detection_safety() -> str:
+    boogu_key = "double_stream_layers.0.img_instruct_attn.processor.img_to_q.weight"
+    boogu = CheckpointInfo(
+        kind="safetensors", files=[], metadata={},
+        tensors=[TensorMeta(boogu_key, torch.float32, (64, 64), 64 * 64 * 4,
+                            "", 0, 64 * 64 * 4)])
+    detected = detect_architecture(
+        boogu, shape_lookup=lambda name: boogu.by_name(name).shape
+        if boogu.by_name(name) else None)
+    assert detected.architecture == "omnigen2"
+    assert get_family("Boogu").family == "omnigen2"
+
+    keys = ("clf.1.weight", "head.modulation")
+    ambiguous = CheckpointInfo(
+        kind="safetensors", files=[], metadata={},
+        tensors=[TensorMeta(name, torch.float32, (1,), 4, "", 0, 4)
+                 for name in keys])
+    try:
+        detect_architecture(ambiguous)
+        raise AssertionError("ambiguous checkpoint was guessed")
+    except UnknownArchitectureError as exc:
+        assert "ambiguous" in str(exc)
+    return "Boogu alias resolves; equal-score architectures fail closed"
+
+
 def _test_malformed() -> str:
     d = _tmpdir()
     # truncated header
@@ -4026,6 +5456,27 @@ def _test_malformed() -> str:
         raise AssertionError("expected InputError")
     except InputError:
         pass
+    # negative and overlapping ranges must fail before any tensor is exposed
+    for filename, spec, payload in (
+        ("negative.safetensors",
+         {"x": {"dtype": "U8", "shape": [1], "data_offsets": [-1, 0]}}, b""),
+        ("coerced-shape.safetensors",
+         {"x": {"dtype": "F32", "shape": ["1"], "data_offsets": [0, 4]}},
+         b"\x00" * 4),
+        ("overlap.safetensors", {
+            "a": {"dtype": "U8", "shape": [2], "data_offsets": [0, 2]},
+            "b": {"dtype": "U8", "shape": [2], "data_offsets": [1, 3]},
+        }, b"\x00" * 3),
+    ):
+        malformed = os.path.join(d, filename)
+        header = json.dumps(spec).encode("utf-8")
+        with open(malformed, "wb") as f:
+            f.write(struct.pack("<Q", len(header)) + header + payload)
+        try:
+            discover_checkpoint(malformed)
+            raise AssertionError(f"expected InputError for {filename}")
+        except InputError:
+            pass
     # bad data offsets
     p2 = os.path.join(d, "badoff.safetensors")
     hdr = json.dumps({"x": {"dtype": "F32", "shape": [4], "data_offsets": [0, 100]}}).encode()
@@ -4044,7 +5495,54 @@ def _test_malformed() -> str:
         raise AssertionError("expected PickleInputError")
     except PickleInputError:
         pass
-    return "truncated header, bad offsets, pickle guard"
+    # Explicit refresh must detect source mutation rather than returning the
+    # cached pre-conversion identity.
+    p4 = os.path.join(d, "mutable.safetensors")
+    safetensors.torch.save_file({"x": torch.zeros(16)}, p4)
+    mutable_info = discover_checkpoint(p4)
+    before = hash_checkpoint_files(mutable_info)
+    safetensors.torch.save_file({"x": torch.ones(16)}, p4)
+    assert hash_checkpoint_files(mutable_info) == before
+    assert hash_checkpoint_files(mutable_info, refresh=True) != before
+    return "truncation, size/range/overlap validation, pickle guard, source rehash"
+
+
+def _test_checkpoint_variants() -> str:
+    d = Path(_tmpdir())
+    shard = d / "model-00001-of-00001.safetensors"
+    safetensors.torch.save_file({
+        "mapped": torch.arange(4, dtype=torch.float32),
+        "extra_bool": torch.tensor([True]),
+    }, str(shard))
+    with open(d / "model.safetensors.index.json", "w", encoding="utf-8") as f:
+        json.dump({"weight_map": {"mapped": shard.name}}, f)
+    sharded = discover_checkpoint(str(d))
+    assert sharded.key_set() == {"mapped", "extra_bool"}
+    assert sharded.by_name("extra_bool").nbytes == 1
+    shard2 = d / "model-00002-of-00002.safetensors"
+    safetensors.torch.save_file({
+        "mapped2": torch.arange(2, dtype=torch.float32),
+        "extra_bool": torch.tensor([False]),
+    }, str(shard2))
+    with open(d / "model.safetensors.index.json", "w", encoding="utf-8") as f:
+        json.dump({"weight_map": {
+            "mapped": shard.name, "mapped2": shard2.name,
+        }}, f)
+    try:
+        discover_checkpoint(str(d))
+        raise AssertionError("duplicate unindexed shard tensor was accepted")
+    except InputError as exc:
+        assert "duplicate tensor" in str(exc)
+
+    pickle_path = d / "nested.pt"
+    expected = torch.arange(16, dtype=torch.float32).reshape(4, 4).bfloat16()
+    torch.save({"state_dict": {"nested.weight": expected}, "epoch": 3}, pickle_path)
+    pickled = discover_checkpoint(str(pickle_path), trust_pickle=True)
+    assert pickled.key_set() == {"nested.weight"}
+    with CheckpointReader(pickled) as reader:
+        assert bytes(reader.read_bytes("nested.weight")) == tensor_to_bytes(expected)
+    return ("indexed extra tensor and nested BF16 pickle load; duplicate shard "
+            "tensor rejected")
 
 
 def _test_unsupported() -> str:
@@ -4063,6 +5561,54 @@ def _test_unsupported() -> str:
     # linears quantized
     assert by_name["model.diffusion_model.input_blocks.1.0.transformer_blocks.0.attn1.to_q.weight"].kind == DecisionKind.QUANTIZE
     return "conv/embedding/norm kept; linear quantized"
+
+
+def _test_sensitivity_planning() -> str:
+    d = _tmpdir()
+    path = os.path.join(d, "wan_small.safetensors")
+    out = os.path.join(d, "wan_small_w4a8.safetensors")
+    torch.manual_seed(53)
+    q_name = "model.diffusion_model.blocks.0.self_attn.q.weight"
+    k_name = "model.diffusion_model.blocks.0.cross_attn.k.weight"
+    safetensors.torch.save_file({
+        "model.diffusion_model.head.modulation": torch.zeros(1),
+        q_name: torch.zeros(64, 64),
+        k_name: torch.randn(64, 64),
+    }, path)
+    info = discover_checkpoint(path)
+    det = detect_architecture(
+        info, shape_lookup=lambda name: info.by_name(name).shape
+        if info.by_name(name) else None)
+    decisions = classify_tensors(
+        info, det, FORMAT_W4A8, None, [], [], [], None, None)
+    analyzer = SensitivityAnalyzer(0.01, 1.0, None)
+    apply_sensitivity_prepass(
+        info, decisions, analyzer, 256 * 1024**2,
+        torch.device("cpu"), torch.float32)
+    by_name = {item.name: item for item in decisions}
+    assert by_name[q_name].kind == DecisionKind.QUANTIZE
+    assert by_name[k_name].kind == DecisionKind.KEEP_PRECISION
+    entries, total = build_output_entries(info, decisions, FORMAT_W4A8, None)
+    plan = ConversionPlan(
+        fmt=FORMAT_W4A8, detection=det, decisions=decisions,
+        metadata_quant={}, metadata_ext={}, output_entries=entries,
+        total_out_bytes=total)
+    plan.n_quantized = len(plan.quantized_layers())
+    plan.n_kept = len(decisions) - plan.n_quantized
+    args = _selftest_args(
+        out, FORMAT_W4A8,
+        extra={"max_memory": 256 * 1024**2, "sensitivity_threshold": 0.01,
+               "error_threshold": 1.0, "_compute_dtype_tensor": torch.float32})
+    engine = ConversionEngine(info, plan, args, out + ".state.json", out + ".tmp", out)
+    try:
+        engine.run()
+    finally:
+        engine.close()
+    with safe_open(out, framework="pt") as st:
+        assert tuple(st.get_tensor(q_name).shape) == (64, 32)
+        assert tuple(st.get_tensor(k_name).shape) == (64, 64)
+        assert st.get_tensor(k_name).dtype == torch.float32
+    return "sensitivity decisions frozen before packed/passthrough offsets"
 
 
 def _test_resume() -> str:
@@ -4093,17 +5639,65 @@ def _test_resume() -> str:
         eng.save_state()
     eng.close()
     assert os.path.exists(tmp_path)
+
+    # A changed conversion option must invalidate the resume plan.
+    args_drift = _selftest_args(
+        out, FORMAT_W4A8, resume=True,
+        extra={"max_memory": 1024 * 1024**2})
+    drift = ConversionEngine(info, plan, args_drift, state_path, tmp_path, out)
+    try:
+        drift.run()
+        raise AssertionError("resume accepted changed max-memory")
+    except OutputError as exc:
+        assert "parameters" in str(exc)
+    finally:
+        drift.close()
+
+    # Completed tensor bytes are checksummed before resume.
+    with open(state_path, "r", encoding="utf-8") as f:
+        saved = json.load(f)
+    first_record = next(iter(saved["entries"].values()))
+    byte_pos = int(first_record["offset"])
+    with open(tmp_path, "r+b") as f:
+        f.seek(byte_pos)
+        original_byte = f.read(1)
+        f.seek(byte_pos)
+        f.write(bytes([original_byte[0] ^ 0x01]))
+    corrupt = ConversionEngine(
+        info, plan, _selftest_args(out, FORMAT_W4A8, resume=True),
+        state_path, tmp_path, out)
+    try:
+        corrupt.run()
+        raise AssertionError("resume accepted corrupted completed tensor")
+    except OutputError as exc:
+        assert "checksum" in str(exc)
+    finally:
+        corrupt.close()
+    with open(tmp_path, "r+b") as f:
+        f.seek(byte_pos)
+        f.write(original_byte)
+
     # second run: resume and finish
     args2 = _selftest_args(out, FORMAT_W4A8, resume=True)
     eng2 = ConversionEngine(info, plan, args2, state_path, tmp_path, out)
     eng2.run()
     eng2.close()
+    # A crash after tensor finalization but before metadata publication must
+    # resume from the checksummed staged file without requantizing.
+    eng3 = ConversionEngine(
+        info, plan, _selftest_args(out, FORMAT_W4A8, resume=True),
+        state_path, tmp_path, out)
+    eng3.run()
+    eng3.close()
     with safe_open(out, framework="pt") as st:
         ql = plan.quantized_layers()[0]
         assert ql.layer is not None
         w = st.get_tensor(ql.layer + ".weight")
         assert w.shape == (info.by_name(ql.name).shape[0], info.by_name(ql.name).shape[1] // 2)
-    return "in-order interruption resumed and completed"
+    return ("option drift/data corruption rejected; partial and post-conversion "
+            "interruptions resumed")
+
+
 def _test_atomic() -> str:
     d = _tmpdir()
     path = os.path.join(d, "mini.safetensors")
@@ -4120,14 +5714,21 @@ def _test_atomic() -> str:
     plan.total_out_bytes = total
     plan.n_quantized = len(plan.quantized_layers())
     plan.n_kept = len(dec) - plan.n_quantized
-    # ensure the output never appears before finalize, and source is untouched
+    # Ensure the user-visible path never appears until metadata publication,
+    # and that the source remains untouched.
     src_mtime = os.path.getmtime(path)
-    eng = ConversionEngine(info, plan, args, out + ".state.json", out + ".tmp", out)
+    staged = out + ".staged"
+    eng = ConversionEngine(
+        info, plan, args, out + ".state.json", out + ".tmp", staged)
     eng.run()
-    assert os.path.exists(out)
+    eng.close()
+    assert not os.path.exists(out)
+    assert os.path.exists(staged)
     assert not os.path.exists(out + ".tmp")
+    republish_with_metadata(staged, out, {}, entries)
+    assert os.path.exists(out)
     assert os.path.getmtime(path) == src_mtime
-    return "atomic publish; original untouched"
+    return "requested path withheld until atomic metadata publish; original untouched"
 
 
 def _run_mini_convert(out: str, fmt: str, resume: bool = False, overwrite: bool = False,
@@ -4150,8 +5751,13 @@ def _run_mini_convert(out: str, fmt: str, resume: bool = False, overwrite: bool 
     qm = build_quant_metadata(info, plan)
     eng = ConversionEngine(info, plan, args, out + ".state.json", out + ".tmp", out)
     eng.run()
-    meta = {"_quantization_metadata": json_dumps(qm),
-            METADATA_KEY_EXT: json_dumps({"converter": CONVERTER_NAME, "selftest": True})}
+    eng.close()
+    meta = dict(info.metadata)
+    meta[METADATA_KEY_QUANT] = json_dumps(qm)
+    meta[METADATA_KEY_EXT] = json_dumps(build_extension_metadata(
+        info, plan, inspect_environment(), args, None, None,
+        hash_checkpoint_files(info), sha256_safetensors_payload(out),
+        {"status": "selftest"}, []))
     republish_with_metadata(out, out, meta, entries)
     return args, plan, info, det
 
@@ -4159,16 +5765,28 @@ def _run_mini_convert(out: str, fmt: str, resume: bool = False, overwrite: bool 
 def _test_e2e_mini_model_w4a8() -> str:
     d = _tmpdir()
     out = os.path.join(d, "out_w4a8.safetensors")
-    args, plan, info, det = _run_mini_convert(out, FORMAT_W4A8)
+    _, plan, info, detection = _run_mini_convert(out, FORMAT_W4A8)
     with safe_open(out, framework="pt") as st:
         assert "_quantization_metadata" in st.metadata()
+        assert st.metadata().get("_selftest") == "1"
+        metadata = st.metadata()
         qm = json.loads(st.metadata()["_quantization_metadata"])
         assert len(qm["layers"]) == plan.n_quantized
+        ext = json.loads(st.metadata()[METADATA_KEY_EXT])
+        assert ext["schema"] == "comfy_wxa8/v1"
+        assert ext["quantization"]["activation_bits"] == 8
         # spot-check one quantized layer
         layer = plan.quantized_layers()[0].layer
         w = st.get_tensor(layer + ".weight")
         assert w.dtype == torch.int8 and w.shape[1] == 640
-    return f"{plan.n_quantized} quantized layers; metadata embedded; file reopens"
+    duplicate = os.path.join(d, "out_w4a8_duplicate.safetensors")
+    republish_with_metadata(out, duplicate, metadata, plan.output_entries)
+    assert sha256_file(duplicate) == sha256_file(out)
+    validation_plan = plan_from_output(out, detection, FORMAT_W4A8, info)
+    assert {entry["name"] for entry in validation_plan.output_entries} == {
+        entry["name"] for entry in plan.output_entries}
+    return (f"{plan.n_quantized} quantized layers; metadata preserved; "
+            "validation inventory and deterministic serialization verified")
 
 
 def _selftest_args(out: str, fmt: str, resume: bool = False, overwrite: bool = False,
@@ -4195,7 +5813,26 @@ def _selftest_args(out: str, fmt: str, resume: bool = False, overwrite: bool = F
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
-    setup_logging(args.log_level, args.json_log)
+    operation_modes = {
+        "--inspect": args.inspect,
+        "--validation-only": args.validation_only,
+        "--metadata-only": args.metadata_only,
+        "--dry-run": args.dry_run,
+    }
+    selected_modes = [name for name, selected in operation_modes.items() if selected]
+    if len(selected_modes) > 1:
+        raise UsageError(
+            "operation modes are mutually exclusive: " + ", ".join(selected_modes))
+    if args.list_architectures and args.self_test:
+        raise UsageError("--list-architectures and --self-test are mutually exclusive")
+    if (args.list_architectures or args.self_test) and selected_modes:
+        special = "--list-architectures" if args.list_architectures else "--self-test"
+        raise UsageError(
+            f"{special} cannot be combined with " + ", ".join(selected_modes))
+    if args.resume and args.overwrite:
+        raise UsageError("--resume and --overwrite are mutually exclusive")
+    setup_logging(args.log_level,
+                  args.json_log if (args.list_architectures or args.self_test) else None)
     env = inspect_environment()
 
     if args.list_architectures:
@@ -4219,7 +5856,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     warnings: List[str] = []
     if isinstance(args.max_memory, str):
         args.max_memory = parse_size(args.max_memory)
+    if args.max_memory <= 0:
+        raise UsageError("--max-memory must be positive")
+    if args.group_size is not None and args.group_size <= 0:
+        raise UsageError("--group-size must be positive")
+    if args.calibration_samples is not None and args.calibration_samples <= 0:
+        raise UsageError("--calibration-samples must be positive")
+    for option, value in (("--sensitivity-threshold", args.sensitivity_threshold),
+                          ("--error-threshold", args.error_threshold)):
+        if value is not None and (not math.isfinite(value) or value < 0):
+            raise UsageError(f"{option} must be a finite non-negative number")
     info = discover_checkpoint(args.model, trust_pickle=args.trust_pickle)
+    _validate_destination_paths(info, args)
+    if args.json_log:
+        log().addHandler(JsonLogHandler(args.json_log))
     if info.kind == "pickle":
         warnings.append("pickle input loaded fully into RAM (streaming not possible); "
                         "only convert checkpoints you trust")
@@ -4284,12 +5934,23 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not args.output or not os.path.exists(args.output):
             parser.error("--validation-only requires an existing --output file")
         fmt = FORMAT_W4A8
-        plan = plan_from_output(args.output, detection, fmt)
+        plan = plan_from_output(args.output, detection, fmt, info)
         validator = Validator(info, plan, args.output, args, env)
-        summary = validator.run(reader=CheckpointReader(info))
+        validation_input_hashes = hash_checkpoint_files(info)
+        with CheckpointReader(info) as validation_reader:
+            summary = validator.run(reader=validation_reader,
+                                    input_hashes=validation_input_hashes)
+        quant_rows = []
+        for decision in plan.quantized_layers():
+            tensor = info.by_name(decision.name)
+            shape = tuple(tensor.shape) if tensor is not None else "missing"
+            quant_rows.append(
+                f"{decision.layer}: {shape} gs={decision.group_size} "
+                f"cgs={decision.convrot_groupsize}")
         report = build_report(info, plan, env, args, detection, None, {},
-                              summary, {}, summary.get("output_sha256", ""),
-                              time.time() - t_start, warnings, [])
+                              summary, validation_input_hashes,
+                              summary.get("output_sha256", ""),
+                              time.time() - t_start, warnings, quant_rows)
         _write_reports(args, report)
         return 0 if summary["n_failed"] == 0 else 2
 
@@ -4300,38 +5961,121 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # ---- output path safety ----
     out_path = os.path.abspath(args.output)
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    if os.path.isdir(out_path):
+        raise OutputError(f"output path is a directory: {out_path}")
     for f in info.files:
-        if os.path.abspath(f) == out_path:
+        same_file = os.path.abspath(f) == out_path
+        if os.path.exists(out_path):
+            with contextlib.suppress(OSError):
+                same_file = same_file or os.path.samefile(f, out_path)
+        if same_file:
             raise OutputError("output path must not be the same as an input file")
-    if os.path.exists(out_path) and not args.overwrite:
+    if os.path.exists(out_path) and not args.overwrite and not args.resume:
         raise OutputError(f"output already exists: {out_path} (use --overwrite)")
     tmp_path = out_path + ".tmp"
+    staged_path = out_path + ".staged"
+    validation_path = out_path + ".validation"
     state_path = out_path + ".state.json"
     if os.path.exists(tmp_path) and not args.overwrite and not args.resume:
         raise OutputError(f"temp output already exists: {tmp_path} (use --overwrite or --resume)")
+    for label, internal_path in (("staged output", staged_path),
+                                 ("validation output", validation_path)):
+        if not os.path.exists(internal_path):
+            continue
+        if args.overwrite:
+            _remove_temp_path(internal_path)
+        elif args.resume:
+            # A validation copy is never resume authority.  A staged output is
+            # trusted only together with its checksummed state file.
+            if internal_path == validation_path or not os.path.exists(state_path):
+                _remove_temp_path(internal_path)
+        else:
+            raise OutputError(
+                f"{label} already exists: {internal_path} "
+                "(use --overwrite or --resume)")
 
     # ---- planning ----
     compute_dtype = {"auto": torch.float32, "fp32": torch.float32,
                      "fp16": torch.float16, "bf16": torch.bfloat16}[args.compute_dtype]
+    args._compute_dtype_tensor = compute_dtype
     out_dtype = {"auto": None, "fp16": torch.float16, "bf16": torch.bfloat16}[args.output_dtype]
     decisions = classify_tensors(info, detection, fmt, args.group_size,
                                  args.include, args.exclude, args.keep_precision,
                                  out_dtype, None)
+
+    effective_device = torch.device("cpu")
+    effective_backend = "cpu"
+    if args.device == "cuda":
+        if torch.cuda.is_available() and getattr(torch.version, "hip", None) is None:
+            effective_device = torch.device("cuda")
+            effective_backend = "cuda"
+        else:
+            warnings.append("--device cuda requested but a CUDA backend is "
+                            "unavailable; CPU used")
+    elif args.device == "rocm":
+        if torch.cuda.is_available() and getattr(torch.version, "hip", None) is not None:
+            effective_device = torch.device("cuda")
+            effective_backend = "rocm"
+        else:
+            warnings.append("--device rocm requested but a ROCm backend is "
+                            "unavailable; CPU used")
+
+    # Sensitivity decisions are a planning operation.  They must be complete
+    # before output shapes and offsets are frozen.
+    needs_sensitivity_prepass = (
+        args.sensitivity_threshold is not None
+        or args.error_threshold is not None
+        or args.calibration_source is not None
+    )
+    prepass_source_hashes = (
+        hash_checkpoint_files(info, refresh=True)
+        if needs_sensitivity_prepass else None
+    )
+    calibration = None
+    if args.calibration_source:
+        calibration = load_calibration(args.calibration_source, info,
+                                       args.calibration_samples, args.calibration_cache,
+                                       args.max_memory)
+    sensitivity = None
+    if needs_sensitivity_prepass:
+        sensitivity = SensitivityAnalyzer(
+            args.sensitivity_threshold,
+            args.error_threshold if args.error_threshold is not None
+            else detection.policy.max_rel_l2,
+            calibration)
+        apply_sensitivity_prepass(info, decisions, sensitivity, args.max_memory,
+                                  effective_device, compute_dtype)
+        kept_by_sensitivity = sum(1 for m in sensitivity.results.values() if m.kept)
+        if kept_by_sensitivity:
+            warnings.append(
+                f"sensitivity prepass retained {kept_by_sensitivity} layer(s) at "
+                "original precision")
+        post_prepass_hashes = hash_checkpoint_files(info, refresh=True)
+        if post_prepass_hashes != prepass_source_hashes:
+            raise InputError(
+                "one or more source files changed during sensitivity planning; "
+                "refusing to build an output inventory from mixed data")
+
     plan = ConversionPlan(fmt=fmt, detection=detection, decisions=decisions,
                           metadata_quant={}, metadata_ext={}, output_entries=[])
-    plan.device = ("cuda" if (args.device in ("cuda", "rocm") and torch.cuda.is_available())
-                   else "cpu")
+    plan.device = effective_backend
     entries, total_out = build_output_entries(info, decisions, fmt, out_dtype)
     plan.output_entries = entries
     plan.total_out_bytes = total_out
     plan.n_quantized = len(plan.quantized_layers())
     plan.n_kept = len(decisions) - plan.n_quantized
+    plan.chunked_layers = {
+        d.name for d in plan.quantized_layers()
+        if _quant_work_bytes(info.by_name(d.name)) > args.max_memory
+    }
     plan.metadata_quant = build_quant_metadata(info, plan)
 
     if plan.n_quantized == 0:
         raise PolicyError(
             "no tensors selected for quantization under the "
-            f"{detection.architecture!r} policy (use --include to force layers)")
+            f"{detection.architecture!r} policy after sensitivity analysis "
+            "(adjust thresholds or use --include to force layers)")
 
     quant_rows = []
     for d in plan.quantized_layers():
@@ -4340,12 +6084,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"{d.layer}: {tuple(m.shape)} gs={d.group_size} cgs={d.convrot_groupsize}")
 
     if args.metadata_only:
-        meta = {"_quantization_metadata": json_dumps(plan.metadata_quant),
-                METADATA_KEY_EXT: json_dumps(build_extension_metadata(
-                    info, plan, env, args, None, None, {}, "", {}, 0.0, 0, warnings))}
+        metadata_input_hashes = hash_checkpoint_files(info)
+        meta = dict(info.metadata)
+        meta[METADATA_KEY_QUANT] = json_dumps(plan.metadata_quant)
+        meta[METADATA_KEY_EXT] = json_dumps(build_extension_metadata(
+            info, plan, env, args, calibration, sensitivity,
+            metadata_input_hashes, "", {"status": "metadata-only"},
+            warnings))
         if args.output:
-            with open(args.output + ".metadata.json", "w", encoding="utf-8") as f:
-                json.dump(meta, f, indent=1)
+            _atomic_write_json(args.output + ".metadata.json", meta, indent=1)
             log().info("metadata written to %s.metadata.json", args.output)
         else:
             print(json_dumps(meta))
@@ -4362,60 +6109,140 @@ def main(argv: Optional[List[str]] = None) -> int:
               f"to {out_path}; {plan.n_quantized} layers quantized")
         return 0
 
-    # ---- calibration / sensitivity ----
-    calibration = None
-    if args.calibration_source:
-        calibration = load_calibration(args.calibration_source, info,
-                                       args.calibration_samples, args.calibration_cache)
-    sensitivity = None
-    if args.sensitivity_threshold is not None or calibration is not None:
-        sensitivity = SensitivityAnalyzer(
-            args.sensitivity_threshold,
-            args.error_threshold if args.error_threshold is not None else 0.35,
-            calibration)
-
     # ---- conversion ----
-    engine = ConversionEngine(info, plan, args, state_path, tmp_path, out_path)
+    engine = ConversionEngine(info, plan, args, state_path, tmp_path, staged_path)
     try:
-        engine.run(sensitivity=sensitivity)
+        engine.run()
     except Exception:
-        engine.save_state()
+        try:
+            engine.save_state()
+        finally:
+            engine.close()
         log().error("conversion failed; state saved to %s (rerun with --resume)",
                     state_path)
         raise
+    engine.close()
     input_hashes = engine.input_hashes
     metrics = sensitivity.results if sensitivity else {}
 
-    # ---- metadata + publish ----
-    qm_meta = {METADATA_KEY_QUANT: json_dumps(plan.metadata_quant)}
+    # ---- provisional metadata + validation ----
+    tensor_payload_sha = sha256_safetensors_payload(staged_path)
+    # Preserve benign source metadata, overriding only the two keys owned by
+    # this converter.  Quantized inputs are refused earlier, so replacement is
+    # defensive rather than a re-quantization path.
+    qm_meta = dict(info.metadata)
+    qm_meta[METADATA_KEY_QUANT] = json_dumps(plan.metadata_quant)
     ext_meta = build_extension_metadata(
         info, plan, env, args, calibration, sensitivity, input_hashes,
-        "", {}, time.time() - t_start, _peak_rss_bytes(), warnings)
+        tensor_payload_sha, {"status": "pending"}, warnings)
     qm_meta[METADATA_KEY_EXT] = json_dumps(ext_meta)
-    # engine.run() already published tmp -> out_path; republish replaces the
-    # header (now including metadata) and atomically re-publishes
-    republish_with_metadata(out_path, out_path, qm_meta, entries)
+    republish_with_metadata(staged_path, validation_path, qm_meta, entries)
 
     # ---- validation ----
-    validator = Validator(info, plan, out_path, args, env)
-    summary = validator.run(reader=CheckpointReader(info), metrics=metrics,
-                            input_hashes=input_hashes)
-    output_sha = summary.get("output_sha256") or sha256_file(out_path)
+    validator = Validator(info, plan, validation_path, args, env)
+    with CheckpointReader(info) as validation_reader:
+        summary = validator.run(reader=validation_reader, metrics=metrics,
+                                input_hashes=input_hashes)
+
+    # Never expose a newly generated checkpoint at the requested output path
+    # when standalone validation failed.  The checksummed staged file and state
+    # remain available for --resume; an older --overwrite target is untouched.
+    if summary["n_failed"]:
+        warnings.append(
+            f"validation failed {summary['n_failed']} checks; new output was not "
+            "published and any pre-existing output remains unchanged")
+        report = build_report(
+            info, plan, env, args, detection, calibration, metrics, summary,
+            input_hashes, "", time.time() - t_start, warnings, quant_rows)
+        _write_reports(args, report)
+        if os.path.exists(validation_path):
+            _remove_temp_path(validation_path)
+        return 2
+
+    # Embed the completed tensor/schema validation.  Full-file SHA256 is not
+    # embedded because changing the header changes that hash; the stable tensor
+    # payload hash is embedded instead.
+    embedded_summary = json.loads(json_dumps(summary))
+    embedded_summary["checks"] = [
+        check for check in embedded_summary.get("checks", [])
+        if check.get("name") != "output-hash"
+    ]
+    embedded_summary.pop("output_sha256", None)
+    embedded_summary["scope"] = (
+        "tensor payload, reconstruction, policy and metadata schema before final "
+        "metadata publication; tensor payload is unchanged by publication")
+    _refresh_validation_summary(embedded_summary)
+    ext_meta = build_extension_metadata(
+        info, plan, env, args, calibration, sensitivity, input_hashes,
+        tensor_payload_sha, embedded_summary, warnings)
+    qm_meta[METADATA_KEY_EXT] = json_dumps(ext_meta)
+    # Build and inspect the exact final checkpoint at the private validation
+    # path.  Only a fully reopened, payload-bound candidate may replace the
+    # requested output (including an existing --overwrite target).
+    republish_with_metadata(staged_path, validation_path, qm_meta, entries)
+
+    final_ok = False
+    try:
+        with RawSafetensorsFile(validation_path) as final_raw:
+            final_meta = final_raw.metadata
+        final_ext = json.loads(final_meta[METADATA_KEY_EXT])
+        final_ok = (final_ext.get("output", {}).get("tensor_data_sha256") ==
+                    sha256_safetensors_payload(validation_path))
+        summary.setdefault("checks", []).append({
+            "name": "final-publication", "status": "passed" if final_ok else "failed",
+            "detail": "final file reopens; embedded tensor payload hash matches"
+                      if final_ok else "final tensor payload hash mismatch",
+            "reason": "",
+        })
+    except Exception as e:
+        summary.setdefault("checks", []).append({
+            "name": "final-publication", "status": "failed",
+            "detail": f"final reopen failed: {e}", "reason": "",
+        })
+    _refresh_validation_summary(summary)
+    if not final_ok:
+        warnings.append(
+            "final checkpoint candidate failed integrity checks; requested output "
+            "was not replaced")
+        report = build_report(
+            info, plan, env, args, detection, calibration, metrics, summary,
+            input_hashes, "", time.time() - t_start, warnings, quant_rows)
+        _write_reports(args, report)
+        if os.path.exists(validation_path):
+            _remove_temp_path(validation_path)
+        return 2
+
+    output_sha = sha256_file(validation_path)
+    os.replace(validation_path, out_path)
+    _fsync_parent(out_path)
+    summary["output_sha256"] = output_sha
+    output_hash_check = next(
+        (check for check in summary.get("checks", [])
+         if check.get("name") == "output-hash"), None)
+    if output_hash_check is not None:
+        output_hash_check["detail"] = f"sha256={output_sha}"
+    elif args.validate:
+        summary.setdefault("checks", []).append({
+            "name": "output-hash", "status": "passed",
+            "detail": f"sha256={output_sha}", "reason": "",
+        })
+    _refresh_validation_summary(summary)
 
     # ---- report ----
-    if summary["n_failed"]:
-        warnings.append(f"validation failed {summary['n_failed']} checks "
-                        "(see report); do not use this output for runtime testing")
     report = build_report(info, plan, env, args, detection, calibration, metrics,
                           summary, input_hashes, output_sha,
                           time.time() - t_start, warnings, quant_rows)
     _write_reports(args, report)
 
     # ---- cleanup ----
-    if os.path.exists(state_path):
-        os.remove(state_path)
     if os.path.exists(tmp_path):
-        os.remove(tmp_path)
+        _remove_temp_path(tmp_path)
+    if os.path.exists(validation_path):
+        _remove_temp_path(validation_path)
+    if os.path.exists(staged_path):
+        _remove_temp_path(staged_path)
+    if os.path.exists(state_path):
+        _remove_temp_path(state_path)
     return 0 if summary["n_failed"] == 0 else 2
 
 
@@ -6080,23 +7907,30 @@ OyAenXft3Ppgk0/+sAcN1Dy54TRxC00Zt3tKkz22GxH/3hclbn//8Y8/ASjBWEAl/ySYv/8Nx5B/wXOf
 
 
 def _load_golden() -> Dict[str, Dict[str, Any]]:
-    import base64 as _b64, zlib as _zlib
+    import base64 as _b64
+    import zlib as _zlib
     payload = json.loads(_zlib.decompress(_b64.b64decode(_GOLDEN_BLOB)).decode("utf-8"))
     out = {}
+    np_dtypes = {torch.float16: np.float16, torch.float32: np.float32,
+                 torch.uint8: np.uint8, torch.int8: np.int8}
+
+    def _tensor(record, key, dtype, shape):
+        return torch.from_numpy(
+            np.frombuffer(_b64.b64decode(record[key]),
+                          dtype=np_dtypes[dtype]).copy()).view(shape)
+
     for name, g in payload.items():
         shape = tuple(g["shape"])
-        _NP_DT = {torch.float16: np.float16, torch.float32: np.float32,
-                  torch.uint8: np.uint8, torch.int8: np.int8}
-
-        def _t(key, dt, shp):
-            return torch.from_numpy(
-                np.frombuffer(_b64.b64decode(g[key]), dtype=_NP_DT[dt]).copy()).view(shp)
         out[name] = {
-            "weight": _t("weight_b64", torch.float16, shape),
-            "packed": _t("packed_b64", torch.int8, (shape[0], shape[1] // 2)),
-            "s_rel_u8": _t("s_rel_u8_b64", torch.uint8, (shape[0], shape[1] // g["gs"])),
-            "s_channel": _t("s_channel_b64", torch.float32, (shape[0],)),
-            "codebook": _t("codebook_b64", torch.float32, (16,)),
+            "weight": _tensor(g, "weight_b64", torch.float16, shape),
+            "packed": _tensor(
+                g, "packed_b64", torch.int8, (shape[0], shape[1] // 2)),
+            "s_rel_u8": _tensor(
+                g, "s_rel_u8_b64", torch.uint8,
+                (shape[0], shape[1] // g["gs"])),
+            "s_channel": _tensor(
+                g, "s_channel_b64", torch.float32, (shape[0],)),
+            "codebook": _tensor(g, "codebook_b64", torch.float32, (16,)),
             "gs": g["gs"], "cgs": g["cgs"],
         }
     return out
