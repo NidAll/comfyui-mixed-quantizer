@@ -345,6 +345,15 @@ non-Boogu text encoder; the same workflow fails identically with the bf16
 checkpoint. Check the conditioning part of the workflow and update ComfyUI before
 suspecting the quantized file.
 
+Community INT4/INT8 ConvRot text encoders (files named `*_int4_convrot.safetensors`
+or `*_int8_convrot.safetensors`) are not standard ComfyUI text encoders. Their
+distribution repos require a nightly ComfyUI plus a custom INT4 loader
+(ComfyUI-INT4-Fast) and must be loaded with that loader's node; the standard
+CLIPLoader "will not decode these correctly" and can produce garbage
+conditioning that surfaces as the RMSNorm shape error above. Use the official
+repack of the same text encoder (for Boogu: `qwen3vl_8b_fp8_scaled.safetensors`
+from Comfy-Org) with the standard CLIPLoader.
+
 ## Security
 
 The model, metadata, configuration files, paths and calibration data are treated as
