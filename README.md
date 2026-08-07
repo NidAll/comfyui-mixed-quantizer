@@ -229,6 +229,7 @@ relL2 = per-layer weight reconstruction error (max over sampled layers).
 | mmdit_sd3 | SD3 (and SD3.5 family) | fixture (15 tensors) | pass | 0.0729 |
 | lumina2 | Lumina2, ZImage, ZImagePixelSpace | fixture (real naming, 35 tensors) | pass | 0.0727 |
 | lumina2 | Z-Image Turbo (real, sickOllie_zTurbo 11.46 GiB, bf16) | 170 layers, 3.42 GiB out | pass (full validation, cuda) | 0.0730 |
+| (runtime) | real ComfyUI v0.30.0 + loader patch + comfy-kitchen 0.2.27 load | zimage + minimax_h3 outputs | pass (QuantizedTensor, AsymW4A8Int8Layout) | - |
 | (input form) | sharded directory | hydit fixture split in 2 shards | pass | 0.0728 |
 | (input form) | bounded-memory chunked path (2 MiB budget) | minimax_h3 fixture | pass | 0.0855 |
 
@@ -287,6 +288,18 @@ bit-exactness against the reference implementation, malformed checkpoints,
 unsupported tensors, resume-state recovery, atomic output writing, and an
 end-to-end mini-model conversion. These are engineering tests, not full-model
 quality validation.
+
+## Troubleshooting
+
+**ComfyUI logs `unet unexpected: [...comfy_quant...]` when loading a W4A8
+checkpoint.** This is a benign artifact of the load path. The `comfy_quant`
+markers are consumed during quantization detection before the weight load; they
+may still be listed as unexpected on some ComfyUI builds with dynamic VRAM
+loading enabled. The packed weights and scales are not in the list, the model
+still runs, and the warning can be ignored. Verified by loading W4A8 outputs of
+two structurally different families (Z-Image and MiniMax H3) through the real
+ComfyUI v0.30.0 + comfy-kitchen 0.2.27 load path: every quantized layer becomes
+an `AsymW4A8Int8Layout` QuantizedTensor and no warning is emitted.
 
 ## Security
 

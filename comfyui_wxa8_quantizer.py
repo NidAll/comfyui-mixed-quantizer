@@ -156,7 +156,7 @@ except Exception as _exc:  # pragma: no cover - import guard
 # Version / revision constants (research record; see module docstring)
 # ---------------------------------------------------------------------------
 CONVERTER_NAME = "comfyui_wxa8_quantizer"
-CONVERTER_VERSION = "1.1.2"
+CONVERTER_VERSION = "1.1.3"
 FORMAT_W4A8 = "asym_w4a8_int8"
 FORMAT_W4A8_REVISION = "asym-w4a8-int8-r1"
 METADATA_KEY_QUANT = "_quantization_metadata"     # official key read by ComfyUI
@@ -276,6 +276,7 @@ class EnvironmentInfo:
     cpu_count: int
     has_comfy_kitchen: bool = False
     comfy_kitchen_rev: Optional[str] = None
+    comfy_kitchen_has_w4a8_layout: bool = False
     has_comfy_quant_ops: bool = False
     comfyui_quant_algos: List[str] = field(default_factory=list)
 
@@ -317,8 +318,9 @@ def inspect_environment() -> EnvironmentInfo:
             try:
                 from comfy_kitchen.tensor import get_layout_class  # type: ignore
                 get_layout_class("AsymW4A8Int8Layout")
+                info.comfy_kitchen_has_w4a8_layout = True
             except Exception:
-                info.comfy_kitchen_rev = (info.comfy_kitchen_rev or "") + " (no AsymW4A8Int8Layout)"
+                info.comfy_kitchen_has_w4a8_layout = False
     except Exception:
         pass
     try:
@@ -3520,9 +3522,10 @@ class Validator:
         # ---- compatibility probe (optional, no ComfyUI required) ----
         if args.validate:
             if self.env.has_comfy_kitchen:
-                self.check("compat-comfy-kitchen", "AsymW4A8Int8Layout" in (self.env.comfy_kitchen_rev or ""),
-                           detail=f"installed comfy-kitchen: {self.env.comfy_kitchen_rev}",
-                           warn=not ("AsymW4A8Int8Layout" in (self.env.comfy_kitchen_rev or "")))
+                self.check("compat-comfy-kitchen", self.env.comfy_kitchen_has_w4a8_layout,
+                           detail=f"installed comfy-kitchen: {self.env.comfy_kitchen_rev or 'version unknown'}, "
+                                  f"AsymW4A8Int8Layout registered: {self.env.comfy_kitchen_has_w4a8_layout}",
+                           warn=not self.env.comfy_kitchen_has_w4a8_layout)
             else:
                 self.check("compat-comfy-kitchen", True, "comfy-kitchen not installed (skipped)",
                            skipped=True, reason="optional runtime probe")
