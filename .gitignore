@@ -11,6 +11,8 @@ build/
 
 # test data: regenerable fixtures and local-only artifacts
 testdata/*.safetensors
+# root-level model checkpoints (never commit)
+/*.safetensors
 testdata/*.json
 testdata/*.tmp
 testdata/*.state.json

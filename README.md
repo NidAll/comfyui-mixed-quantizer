@@ -207,7 +207,7 @@ with the runtime status of each family.
 
 ## Compatibility matrix
 
-All runs below used `comfyui_wxa8_quantizer.py 1.1.0` on torch 2.13.0+cu130 /
+All runs below used `comfyui_wxa8_quantizer.py 1.1.1` on torch 2.13.0+cu130 /
 safetensors 0.8.0 (CPU quantization; the CUDA path was also exercised). "Executed"
 means the conversion finished and the output passed the standalone validation suite
 (reopen, inventory, shapes, dtypes, metadata, pack round trips, scale checks,
@@ -226,6 +226,8 @@ relL2 = per-layer weight reconstruction error (max over sampled layers).
 | minimax_h3 | MiniMaxH3 | fixture (28 tensors, prefix-less) | pass | 0.0728 |
 | hydit | HunyuanDiT, HunyuanDiT1 | fixture (12 tensors) | pass | 0.0728 |
 | mmdit_sd3 | SD3 (and SD3.5 family) | fixture (15 tensors) | pass | 0.0729 |
+| lumina2 | Lumina2, ZImage, ZImagePixelSpace | fixture (real naming, 35 tensors) | pass | 0.0727 |
+| lumina2 | Z-Image Turbo (real, sickOllie_zTurbo 11.46 GiB, bf16) | 170 layers, 3.42 GiB out | pass (full validation, cuda) | 0.0730 |
 | (input form) | sharded directory | hydit fixture split in 2 shards | pass | 0.0728 |
 | (input form) | bounded-memory chunked path (2 MiB budget) | minimax_h3 fixture | pass | 0.0855 |
 

@@ -1,0 +1,105 @@
+==============================================================================
+comfyui_wxa8_quantizer 1.1.1 -- conversion report
+==============================================================================
+format            : asym_w4a8_int8 (asym-w4a8-int8-r1)
+architecture      : lumina2 (confidence medium)
+unet prefix       : model.diffusion_model.
+input             : safetensors (testdata/zimage_fixture.safetensors)
+output            : testdata/zimage_fixture_w4a8.safetensors (5.64 MiB)
+elapsed           : 6.784 s
+peak RSS          : 623.19 MiB
+
+-- detection evidence --
+  + cap_embedder.1.weight
+  ~ layers.0.attention.qkv.weight (hint)
+
+-- tensor statistics --
+  input tensors   : 35
+  quantized layers: 20
+  kept tensors    : 15
+
+-- quantization --
+  model.diffusion_model.context_refiner.0.attention.out: (384, 384) gs=16 cgs=64
+  model.diffusion_model.context_refiner.0.attention.qkv: (1152, 384) gs=16 cgs=64
+  model.diffusion_model.context_refiner.0.feed_forward.w1: (1024, 384) gs=16 cgs=64
+  model.diffusion_model.context_refiner.0.feed_forward.w2: (384, 1024) gs=16 cgs=256
+  model.diffusion_model.context_refiner.0.feed_forward.w3: (1024, 384) gs=16 cgs=64
+  model.diffusion_model.layers.0.attention.out: (384, 384) gs=16 cgs=64
+  model.diffusion_model.layers.0.attention.qkv: (1152, 384) gs=16 cgs=64
+  model.diffusion_model.layers.0.feed_forward.w1: (1024, 384) gs=16 cgs=64
+  model.diffusion_model.layers.0.feed_forward.w2: (384, 1024) gs=16 cgs=256
+  model.diffusion_model.layers.0.feed_forward.w3: (1024, 384) gs=16 cgs=64
+  model.diffusion_model.layers.1.attention.out: (384, 384) gs=16 cgs=64
+  model.diffusion_model.layers.1.attention.qkv: (1152, 384) gs=16 cgs=64
+  model.diffusion_model.layers.1.feed_forward.w1: (1024, 384) gs=16 cgs=64
+  model.diffusion_model.layers.1.feed_forward.w2: (384, 1024) gs=16 cgs=256
+  model.diffusion_model.layers.1.feed_forward.w3: (1024, 384) gs=16 cgs=64
+  model.diffusion_model.layers.2.attention.out: (384, 384) gs=16 cgs=64
+  model.diffusion_model.layers.2.attention.qkv: (1152, 384) gs=16 cgs=64
+  model.diffusion_model.layers.2.feed_forward.w1: (1024, 384) gs=16 cgs=64
+  model.diffusion_model.layers.2.feed_forward.w2: (384, 1024) gs=16 cgs=256
+  model.diffusion_model.layers.2.feed_forward.w3: (1024, 384) gs=16 cgs=64
+
+-- calibration --
+  calibration-free (reference format; per-group absmax scales)
+
+-- validation --
+  [passed                ] output-reopen -- 95 tensors, 5.66 MiB
+  [passed                ] output-entry-count -- 95 vs 95 expected
+  [passed                ] output-inventory -- missing=[] extra=[]
+  [passed                ] shape-preservation
+  [passed                ] dtype-check
+  [passed                ] metadata-present -- 20 layers recorded
+  [passed                ] extension-metadata-present -- present
+  [passed                ] metadata-layer-inventory -- layer set mismatch: []
+  [passed                ] metadata-layer-conf -- format field mismatch
+  [passed                ] recon-model.diffusion_model.context_refiner.0.attention.qkv -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.context_refiner.0.attention.qkv -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.layers.0.attention.qkv -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.layers.0.attention.qkv -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.layers.1.attention.qkv -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.layers.1.attention.qkv -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.layers.2.attention.qkv -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.layers.2.attention.qkv -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.context_refiner.0.feed_forward.w1 -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.context_refiner.0.feed_forward.w1 -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.context_refiner.0.feed_forward.w2 -- relL2=0.0727 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.context_refiner.0.feed_forward.w2 -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.context_refiner.0.feed_forward.w3 -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.context_refiner.0.feed_forward.w3 -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.layers.0.feed_forward.w1 -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.layers.0.feed_forward.w1 -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.layers.0.feed_forward.w2 -- relL2=0.0727 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.layers.0.feed_forward.w2 -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.layers.0.feed_forward.w3 -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.layers.0.feed_forward.w3 -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.layers.1.feed_forward.w1 -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.layers.1.feed_forward.w1 -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.layers.1.feed_forward.w2 -- relL2=0.0727 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.layers.1.feed_forward.w2 -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.layers.1.feed_forward.w3 -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.layers.1.feed_forward.w3 -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.layers.2.feed_forward.w1 -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.layers.2.feed_forward.w1 -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.layers.2.feed_forward.w2 -- relL2=0.0727 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.layers.2.feed_forward.w2 -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.layers.2.feed_forward.w3 -- relL2=0.0726 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.layers.2.feed_forward.w3 -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.layers.2.attention.out -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.layers.2.attention.out -- pack/unpack round trip
+  [passed                ] reconstruction-error-bound -- max sampled relL2 0.0727 (policy bound 0.25)
+  [passed                ] scale-validation -- 20 layers OK (fp8 s_rel finite/positive, fp32 s_channel finite/positive)
+  [passed                ] deterministic-conversion -- two runs byte-identical
+  [passed                ] deterministic-vs-disk -- recomputed packed weight matches the file
+  [passed                ] output-hash -- sha256=e7a549d39f1640a6d3b81ecc5484e0d0e9d6f3aec7016fa722cafe5d58d0f00c
+  [skipped               ] compat-comfy-kitchen -- comfy-kitchen not installed (skipped)
+  [skipped               ] compat-comfyui -- ComfyUI not installed (skipped)
+  [passed                ] input-hash -- {"testdata/zimage_fixture.safetensors":"42bf56f7f4778264339306dd9183e8fcb79ffb06b84f060b4acce7f21888afa1"}
+
+-- compatibility requirements --
+  comfy-kitchen >= aa1ab2263dc06225d9de6702dfc087313d4bc971 (PR #90, merged) with AsymW4A8Int8Layout; ComfyUI >= PR #15308 head b6578f2ae11ab3dea3156ed68d8724476cda1232 (NOT merged into master at base bdcb886a4705a03cf40f4a7226de9fc7c059fc90); CUDA: PyTorch cu130+, SM >= 8.0; ROCm: triton >= 3.7; eager works anywhere
+
+-- output integrity --
+  sha256          : e7a549d39f1640a6d3b81ecc5484e0d0e9d6f3aec7016fa722cafe5d58d0f00c
+  input zimage_fixture.safetensors : 42bf56f7f4778264339306dd9183e8fcb79ffb06b84f060b4acce7f21888afa1
+==============================================================================

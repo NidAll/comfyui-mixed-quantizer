@@ -156,7 +156,7 @@ except Exception as _exc:  # pragma: no cover - import guard
 # Version / revision constants (research record; see module docstring)
 # ---------------------------------------------------------------------------
 CONVERTER_NAME = "comfyui_wxa8_quantizer"
-CONVERTER_VERSION = "1.1.0"
+CONVERTER_VERSION = "1.1.1"
 FORMAT_W4A8 = "asym_w4a8_int8"
 FORMAT_W4A8_REVISION = "asym-w4a8-int8-r1"
 METADATA_KEY_QUANT = "_quantization_metadata"     # official key read by ComfyUI
@@ -1192,7 +1192,7 @@ UNIVERSAL_EXCLUDE = (
     r"audio_out|video_out|linear_fc2|to_gate_logits|genre_embedder|speaker_embedder|"
     r"lyric_proj|text_embedding|ref_image_patch_embedder|ofs_embedding_linear_1|"
     r"ofs_embedding_linear_2|time_embedding_linear_1|time_embedding_linear_2|"
-    r"adaln_proj|adaln_modulation|adaln_single|time_caption_embed|extra_embedder|"
+    r"adaln_proj|adaln_modulation|adaLN_modulation|adaln_single|time_caption_embed|extra_embedder|"
     r"text_embedder|label_emb|clip_txt_mapper|clip_img_mapper|clip_mapper|"
     r"clip_txt_pooled_mapper|cond_type_embedding|distilled_guidance_layer|"
     r"control_adapter|ref_conv|latent_in|cond_in|cam_out_layer|repo_layers|"
@@ -1540,14 +1540,17 @@ _register(FamilyPolicy(
     comfyui_classes=("Lumina2", "ZImage", "ZImagePixelSpace"),
     detect_primary=("cap_embedder.1.weight",),
     detect_hints=("noise_refiner.0.attention.k_norm.weight", "layers.0.attn.qkv.weight",
-                  "dec_net.cond_embed.weight"),
+                  "layers.0.attention.qkv.weight", "dec_net.cond_embed.weight"),
     quantize=(
         r"layers\.\d+\.attn\.(qkv|o_proj|proj)\.weight$",
         r"layers\.\d+\.mlp\.(w1|w2|fc1|fc2)\.weight$",
-        r"noise_refiner\.\d+\.attention\.(qkv|proj)\.weight$",
+        # real Lumina2 / Z-Image naming (comfy/ldm/lumina/model.py):
+        # JointTransformerBlock.attention.{qkv,out}, FeedForward.{w1,w2,w3}
+        r"(layers|context_refiner|noise_refiner)\.\d+\.attention\.(qkv|out)\.weight$",
+        r"(layers|context_refiner|noise_refiner)\.\d+\.feed_forward\.(w1|w2|w3)\.weight$",
     ),
     keep=(r"(^|\.)(cap_embedder|clip_text_pooled_proj|siglip_embedder|x_embedder|t_embedder|"
-          r"cond_embed|final_layer|dec_net|pos_embed)\.",),
+          r"cond_embed|final_layer|dec_net|pos_embed|adaLN_modulation)\.",),
     exclude=UNIVERSAL_EXCLUDE,
     runtime_status="experimental",
 ))

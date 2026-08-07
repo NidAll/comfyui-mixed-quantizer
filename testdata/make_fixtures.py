@@ -96,6 +96,37 @@ def make_minimax_h3():
     sd["token_refiner.blocks.0.mlp.fc1.weight"] = L(2304, 768, 0.005)
     return sd
 
+def make_zimage():
+    """Z-Image shaped fixture using the real tensor naming from
+    comfy/ldm/lumina/model.py (attention.qkv/out, feed_forward.w1/w2/w3,
+    context_refiner, noise_refiner, adaLN_modulation)."""
+    sd = {}; p = "model.diffusion_model."
+    for b in range(3):
+        pre = p + f"layers.{b}."
+        sd[pre + "attention.qkv.weight"] = L(1152, 384)
+        sd[pre + "attention.out.weight"] = L(384, 384)
+        sd[pre + "feed_forward.w1.weight"] = L(1024, 384, 0.01)
+        sd[pre + "feed_forward.w2.weight"] = L(384, 1024, 0.01)
+        sd[pre + "feed_forward.w3.weight"] = L(1024, 384, 0.01)
+        sd[pre + "adaLN_modulation.0.weight"] = L(1536, 64)
+        sd[pre + "attention_norm1.weight"] = torch.randn(384) * 0.1
+        sd[pre + "attention.q_norm.weight"] = torch.randn(128) * 0.1
+    for b in range(1):
+        pre = p + f"context_refiner.{b}."
+        sd[pre + "attention.qkv.weight"] = L(1152, 384)
+        sd[pre + "attention.out.weight"] = L(384, 384)
+        sd[pre + "feed_forward.w1.weight"] = L(1024, 384, 0.01)
+        sd[pre + "feed_forward.w2.weight"] = L(384, 1024, 0.01)
+        sd[pre + "feed_forward.w3.weight"] = L(1024, 384, 0.01)
+    sd[p + "cap_embedder.1.weight"] = L(384, 256)
+    sd[p + "x_embedder.weight"] = L(384, 64)
+    sd[p + "t_embedder.mlp.0.weight"] = L(256, 64)
+    sd[p + "final_layer.adaLN_modulation.1.weight"] = L(384, 64)
+    sd[p + "final_layer.linear.weight"] = L(16, 384, 0.01)
+    sd[p + "cap_pad_token"] = torch.randn(1, 384)
+    return sd
+
+
 def make_hydit():
     sd = {}; p = "model.diffusion_model."
     for b in range(2):
@@ -126,6 +157,7 @@ def make_mmdit_sd3():
 makers = {
     "sdxl": make_sdxl, "sd15": make_sd15, "flux": make_flux, "wan": make_wan,
     "minimax_h3": make_minimax_h3, "hydit": make_hydit, "mmdit_sd3": make_mmdit_sd3,
+    "zimage": make_zimage,
 }
 key = os.path.basename(OUT).split("_fixture")[0]
 sd = makers[key]()
