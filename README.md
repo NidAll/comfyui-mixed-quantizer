@@ -37,7 +37,7 @@ documented in the [Research basis](#research-basis) section below.
   byte-identical to the reference implementation; fp32 scale fields can differ in
   the last ULPs across platforms (verified with golden vectors and side-by-side
   runs).
-* Architecture detection from the checkpoint alone. The embedded registry has 42
+* Architecture detection from the checkpoint alone. The embedded registry has 43
   policy families that cover all 98 model classes ComfyUI supported at the research
   revision, each with its own quantize / keep / exclude rules and validation
   thresholds. Unknown or ambiguous models are refused unless `--architecture` is
@@ -197,14 +197,22 @@ converter only replaces its official quantization key and `comfy_wxa8` namespace
 
 ## Architecture support
 
-42 policy families cover all 98 ComfyUI supported-model classes at the research
+43 policy families cover all 98 ComfyUI supported-model classes at the research
 revision (`bdcb886a4705a03cf40f4a7226de9fc7c059fc90`): SD1.5 / SD2.x / SDXL (+refiner,
 SSD-1B, Segmind-Vega, KOALA), SVD/SV3D, Stable Cascade, SD3 MMDiT, StableAudio,
 AuraFlow, PixArt Alpha/Sigma, HunyuanDiT, Flux (+inpaint/schnell/longcat/ovis),
 Flux2, Chroma (+Radiance), Mochi, MiniMax H3, LTXV/LTXAV, ACE-Step, Cosmos
 (+Predict2), Anima, Lumina2/Z-Image, PixelDiT/PiD, Wan 2.1/2.2 (all variants),
-Hunyuan3D, TripoSplat, HiDream (+O1), SeedVR2, OmniGen2/Boogu, Ideogram4, Krea2,
-MageFlow, QwenImage, JoyImage, Kandinsky5, CogVideoX, ErnieImage. The perception
+Hunyuan3D, TripoSplat, HiDream (+O1), SeedVR2, OmniGen2, Boogu, Ideogram4, Krea2,
+MageFlow, QwenImage, JoyImage, Kandinsky5, CogVideoX, ErnieImage.
+Boogu and OmniGen2 use the real state-dict naming from their published
+checkpoints: Boogu has `double_stream_layers.N.img_self_attn` /
+`img_instruct_attn.processor` / `img_feed_forward` and
+`single_stream_layers.N.attn` / `feed_forward`, OmniGen2 has `layers.N.attn` /
+`feed_forward`, and both share the `context_refiner` / `noise_refiner` /
+`ref_image_refiner` blocks and embedders. Use the single-file ComfyUI repack
+(Comfy-Org) for Boogu; the raw HF `transformer/` shards are not a single
+ComfyUI checkpoint. The perception
 models RT-DETR_v4, DepthAnything3 and SAM3 are registered as unsupported, because
 ComfyUI has no quantized-loading path for them; conversion is refused unless
 `--architecture` forces it.
@@ -219,7 +227,7 @@ with the runtime status of each family.
 
 ## Compatibility matrix
 
-Fixture rows were rerun with `comfyui_wxa8_quantizer.py 1.2.0` on torch 2.13.0 /
+Fixture rows were rerun with `comfyui_wxa8_quantizer.py 1.2.1` on torch 2.13.0 /
 safetensors 0.8.0 using CPU quantization. The real-model and CUDA rows are retained
 from the documented 1.1.x runs because those checkpoints and a GPU are not stored in
 this repository. "Executed"
@@ -243,6 +251,8 @@ when `--validate` was used).
 | mmdit_sd3 | SD3 (and SD3.5 family) | fixture (15 tensors) | pass | 0.0729 |
 | lumina2 | Lumina2, ZImage, ZImagePixelSpace | fixture (real naming, 35 tensors) | pass | 0.0727 |
 | lumina2 | Z-Image Turbo (real, sickOllie_zTurbo 11.46 GiB, bf16) | 170 layers, 3.42 GiB out | pass (full validation, cuda) | 0.0730 |
+| boogu | Boogu-Image-0.1 (Base/Turbo/Edit naming) | fixture (real naming, 73 layers) | pass | 0.0727 |
+| omnigen2 | OmniGen2 | fixture (real naming, 35 layers) | pass | 0.0727 |
 | (runtime) | real ComfyUI v0.30.0 + loader patch + comfy-kitchen 0.2.27 load | zimage + minimax_h3 outputs | pass (QuantizedTensor, AsymW4A8Int8Layout) | - |
 | (input form) | sharded directory | hydit fixture split in 2 shards | pass | 0.0728 |
 | (input form) | bounded-memory chunked path (32 MiB budget) | Wan + MiniMax H3 fixtures | pass | 0.0729 |
@@ -278,7 +288,7 @@ when `--validate` was used).
   naming; detection fails safely and requests `--architecture`.
 * The remaining families (stable_cascade, stable_audio, aura_flow, mochi, ltxv,
   ace_step, cosmos, cosmos_predict2, anima, pixeldit, hunyuan3d,
-  triposplat, hidream, chroma, seedvr2, omnigen2, ideogram4, krea2, mage_flow,
+  triposplat, hidream, chroma, seedvr2, ideogram4, krea2, mage_flow,
   qwen_image, joyimage, kandinsky5, cogvideox, ernie_image, sd20, sdxl_refiner,
   svd) have explicit policy profiles and detection signatures, but were not
   individually executed with fixture tensors. They share the same verified
@@ -302,7 +312,7 @@ python comfyui_wxa8_quantizer.py --self-test
 The embedded self-tests cover W4 packing round trips, odd dimensions and odd-byte
 tensors, scale calculations, compute-dtype selection, real activation rows,
 standalone environment inspection, metadata generation, registry behavior (all 98
-ComfyUI model classes covered by 42 policy families), fail-closed ambiguity,
+ComfyUI model classes covered by 43 policy families), fail-closed ambiguity,
 golden-vector bit-exactness, malformed checkpoints, input variants, sensitivity
 output planning, checksummed resume, atomic output writing, and an end-to-end
 mini-model conversion. These are engineering tests, not full-model quality

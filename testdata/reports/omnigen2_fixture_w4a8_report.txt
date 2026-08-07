@@ -1,0 +1,164 @@
+==============================================================================
+comfyui_wxa8_quantizer 1.2.1 -- conversion report
+==============================================================================
+format            : asym_w4a8_int8 (asym-w4a8-int8-r1)
+architecture      : omnigen2 (confidence high)
+unet prefix       : model.
+input             : safetensors (testdata/omnigen2_fixture.safetensors)
+output            : testdata/omnigen2_fixture_w4a8.safetensors (6.52 MiB)
+elapsed           : 7.252 s
+peak RSS          : 587.76 MiB
+
+-- detection evidence --
+  + time_caption_embed.timestep_embedder.linear_1.bias
+  + layers.0.attn.to_q.weight
+  ~ layers.0.feed_forward.linear_1.weight (hint)
+  ~ context_refiner.0.attn.to_q.weight (hint)
+  ~ ref_image_patch_embedder.weight (hint)
+  ~ x_embedder.weight (hint)
+
+-- tensor statistics --
+  input tensors   : 85
+  quantized layers: 35
+  kept tensors    : 50
+
+-- quantization --
+  context_refiner.0.attn.to_k: (384, 384) gs=16 cgs=64
+  context_refiner.0.attn.to_out.0: (384, 384) gs=16 cgs=64
+  context_refiner.0.attn.to_q: (384, 384) gs=16 cgs=64
+  context_refiner.0.attn.to_v: (384, 384) gs=16 cgs=64
+  context_refiner.0.feed_forward.linear_1: (384, 384) gs=16 cgs=64
+  context_refiner.0.feed_forward.linear_2: (384, 384) gs=16 cgs=64
+  context_refiner.0.feed_forward.linear_3: (384, 384) gs=16 cgs=64
+  layers.0.attn.to_k: (384, 384) gs=16 cgs=64
+  layers.0.attn.to_out.0: (384, 384) gs=16 cgs=64
+  layers.0.attn.to_q: (384, 384) gs=16 cgs=64
+  layers.0.attn.to_v: (384, 384) gs=16 cgs=64
+  layers.0.feed_forward.linear_1: (384, 384) gs=16 cgs=64
+  layers.0.feed_forward.linear_2: (384, 384) gs=16 cgs=64
+  layers.0.feed_forward.linear_3: (384, 384) gs=16 cgs=64
+  layers.1.attn.to_k: (384, 384) gs=16 cgs=64
+  layers.1.attn.to_out.0: (384, 384) gs=16 cgs=64
+  layers.1.attn.to_q: (384, 384) gs=16 cgs=64
+  layers.1.attn.to_v: (384, 384) gs=16 cgs=64
+  layers.1.feed_forward.linear_1: (384, 384) gs=16 cgs=64
+  layers.1.feed_forward.linear_2: (384, 384) gs=16 cgs=64
+  layers.1.feed_forward.linear_3: (384, 384) gs=16 cgs=64
+  noise_refiner.0.attn.to_k: (384, 384) gs=16 cgs=64
+  noise_refiner.0.attn.to_out.0: (384, 384) gs=16 cgs=64
+  noise_refiner.0.attn.to_q: (384, 384) gs=16 cgs=64
+  noise_refiner.0.attn.to_v: (384, 384) gs=16 cgs=64
+  noise_refiner.0.feed_forward.linear_1: (384, 384) gs=16 cgs=64
+  noise_refiner.0.feed_forward.linear_2: (384, 384) gs=16 cgs=64
+  noise_refiner.0.feed_forward.linear_3: (384, 384) gs=16 cgs=64
+  ref_image_refiner.0.attn.to_k: (384, 384) gs=16 cgs=64
+  ref_image_refiner.0.attn.to_out.0: (384, 384) gs=16 cgs=64
+  ref_image_refiner.0.attn.to_q: (384, 384) gs=16 cgs=64
+  ref_image_refiner.0.attn.to_v: (384, 384) gs=16 cgs=64
+  ref_image_refiner.0.feed_forward.linear_1: (384, 384) gs=16 cgs=64
+  ref_image_refiner.0.feed_forward.linear_2: (384, 384) gs=16 cgs=64
+  ref_image_refiner.0.feed_forward.linear_3: (384, 384) gs=16 cgs=64
+
+-- calibration --
+  calibration-free (reference format; per-group absmax scales)
+
+-- validation --
+  [passed                ] output-reopen -- 190 tensors, 6.54 MiB
+  [passed                ] output-entry-count -- 190 vs 190 expected
+  [passed                ] output-inventory -- missing=[] extra=[]
+  [passed                ] shape-preservation
+  [passed                ] dtype-check
+  [passed                ] metadata-present -- present
+  [passed                ] extension-metadata-present -- present
+  [passed                ] extension-metadata-schema -- required fields, revision and architecture
+  [passed                ] metadata-source-hash -- source content hashes match
+  [passed                ] tensor-payload-hash -- sha256=1c6301a65b4d506cf2dbec7cf22375b5efca9b0120ed5f3ef237446db1cc98c5
+  [passed                ] metadata-layer-inventory -- 35 layers match
+  [passed                ] metadata-layer-conf -- format/group/ConvRot fields valid
+  [passed                ] recon-context_refiner.0.attn.to_k -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-context_refiner.0.attn.to_k -- pack/unpack round trip
+  [passed                ] recon-context_refiner.0.attn.to_out.0 -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-context_refiner.0.attn.to_out.0 -- pack/unpack round trip
+  [passed                ] recon-context_refiner.0.attn.to_q -- relL2=0.0726 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-context_refiner.0.attn.to_q -- pack/unpack round trip
+  [passed                ] recon-context_refiner.0.attn.to_v -- relL2=0.0723 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-context_refiner.0.attn.to_v -- pack/unpack round trip
+  [passed                ] recon-context_refiner.0.feed_forward.linear_1 -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-context_refiner.0.feed_forward.linear_1 -- pack/unpack round trip
+  [passed                ] recon-context_refiner.0.feed_forward.linear_2 -- relL2=0.0726 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-context_refiner.0.feed_forward.linear_2 -- pack/unpack round trip
+  [passed                ] recon-context_refiner.0.feed_forward.linear_3 -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-context_refiner.0.feed_forward.linear_3 -- pack/unpack round trip
+  [passed                ] recon-layers.0.attn.to_k -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-layers.0.attn.to_k -- pack/unpack round trip
+  [passed                ] recon-layers.0.attn.to_out.0 -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-layers.0.attn.to_out.0 -- pack/unpack round trip
+  [passed                ] recon-layers.0.attn.to_q -- relL2=0.0726 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-layers.0.attn.to_q -- pack/unpack round trip
+  [passed                ] recon-layers.0.attn.to_v -- relL2=0.0726 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-layers.0.attn.to_v -- pack/unpack round trip
+  [passed                ] recon-layers.0.feed_forward.linear_1 -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-layers.0.feed_forward.linear_1 -- pack/unpack round trip
+  [passed                ] recon-layers.0.feed_forward.linear_2 -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-layers.0.feed_forward.linear_2 -- pack/unpack round trip
+  [passed                ] recon-layers.0.feed_forward.linear_3 -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-layers.0.feed_forward.linear_3 -- pack/unpack round trip
+  [passed                ] recon-layers.1.attn.to_k -- relL2=0.0723 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-layers.1.attn.to_k -- pack/unpack round trip
+  [passed                ] recon-layers.1.attn.to_out.0 -- relL2=0.0723 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-layers.1.attn.to_out.0 -- pack/unpack round trip
+  [passed                ] recon-layers.1.attn.to_q -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-layers.1.attn.to_q -- pack/unpack round trip
+  [passed                ] recon-layers.1.attn.to_v -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-layers.1.attn.to_v -- pack/unpack round trip
+  [passed                ] recon-layers.1.feed_forward.linear_1 -- relL2=0.0726 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-layers.1.feed_forward.linear_1 -- pack/unpack round trip
+  [passed                ] recon-layers.1.feed_forward.linear_2 -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-layers.1.feed_forward.linear_2 -- pack/unpack round trip
+  [passed                ] recon-layers.1.feed_forward.linear_3 -- relL2=0.0723 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-layers.1.feed_forward.linear_3 -- pack/unpack round trip
+  [passed                ] recon-noise_refiner.0.attn.to_k -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-noise_refiner.0.attn.to_k -- pack/unpack round trip
+  [passed                ] recon-noise_refiner.0.attn.to_out.0 -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-noise_refiner.0.attn.to_out.0 -- pack/unpack round trip
+  [passed                ] recon-noise_refiner.0.attn.to_q -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-noise_refiner.0.attn.to_q -- pack/unpack round trip
+  [passed                ] recon-noise_refiner.0.attn.to_v -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-noise_refiner.0.attn.to_v -- pack/unpack round trip
+  [passed                ] recon-noise_refiner.0.feed_forward.linear_1 -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-noise_refiner.0.feed_forward.linear_1 -- pack/unpack round trip
+  [passed                ] recon-noise_refiner.0.feed_forward.linear_2 -- relL2=0.0723 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-noise_refiner.0.feed_forward.linear_2 -- pack/unpack round trip
+  [passed                ] recon-noise_refiner.0.feed_forward.linear_3 -- relL2=0.0726 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-noise_refiner.0.feed_forward.linear_3 -- pack/unpack round trip
+  [passed                ] recon-ref_image_refiner.0.attn.to_k -- relL2=0.0726 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-ref_image_refiner.0.attn.to_k -- pack/unpack round trip
+  [passed                ] recon-ref_image_refiner.0.attn.to_out.0 -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-ref_image_refiner.0.attn.to_out.0 -- pack/unpack round trip
+  [passed                ] recon-ref_image_refiner.0.attn.to_q -- relL2=0.0727 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-ref_image_refiner.0.attn.to_q -- pack/unpack round trip
+  [passed                ] recon-ref_image_refiner.0.attn.to_v -- relL2=0.0726 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-ref_image_refiner.0.attn.to_v -- pack/unpack round trip
+  [passed                ] recon-ref_image_refiner.0.feed_forward.linear_1 -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-ref_image_refiner.0.feed_forward.linear_1 -- pack/unpack round trip
+  [passed                ] recon-ref_image_refiner.0.feed_forward.linear_2 -- relL2=0.0724 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-ref_image_refiner.0.feed_forward.linear_2 -- pack/unpack round trip
+  [passed                ] recon-ref_image_refiner.0.feed_forward.linear_3 -- relL2=0.0725 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-ref_image_refiner.0.feed_forward.linear_3 -- pack/unpack round trip
+  [passed                ] reconstruction-error-bound -- max full relL2 0.0727 (policy bound 0.25)
+  [passed                ] scale-validation -- 35 layers OK (fp8 s_rel finite/nonnegative, fp32 s_channel finite/positive)
+  [passed                ] deterministic-conversion -- two runs byte-identical
+  [passed                ] deterministic-vs-disk -- recomputed packed weight matches the file
+  [passed                ] output-hash -- sha256=a058d16862fddd48d4ecb6ca11b9762242494b990f45a214e46641a2b3505f94
+  [skipped               ] compat-comfy-kitchen -- comfy-kitchen not installed (skipped)
+  [skipped               ] compat-comfyui -- ComfyUI not installed (skipped)
+  [passed                ] input-hash -- {"omnigen2_fixture.safetensors":"cca5ac8d6b3c08befe6e16ec15f697b318131af49907712518de878489d38f55"}
+  [passed                ] final-publication -- final file reopens; embedded tensor payload hash matches
+
+-- compatibility requirements --
+  comfy-kitchen >= aa1ab2263dc06225d9de6702dfc087313d4bc971 (PR #90, merged) with AsymW4A8Int8Layout; ComfyUI >= PR #15308 head 8c3a2b27c37bd34e87b58846baf962407c92843c (NOT merged into master at base bdcb886a4705a03cf40f4a7226de9fc7c059fc90); CUDA: PyTorch cu130+, SM >= 8.0; ROCm: triton >= 3.7; eager works anywhere
+
+-- output integrity --
+  sha256          : a058d16862fddd48d4ecb6ca11b9762242494b990f45a214e46641a2b3505f94
+  input omnigen2_fixture.safetensors : cca5ac8d6b3c08befe6e16ec15f697b318131af49907712518de878489d38f55
+==============================================================================

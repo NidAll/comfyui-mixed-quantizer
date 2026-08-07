@@ -44,3 +44,5 @@ jobs:
         run: |
           python testdata/make_fixtures.py testdata/wan_fixture.safetensors
           python comfyui_wxa8_quantizer.py testdata/wan_fixture.safetensors --output testdata/ci_out.safetensors --format w4a8 --validate
+          python testdata/make_fixtures.py testdata/boogu_fixture.safetensors
+          python comfyui_wxa8_quantizer.py testdata/boogu_fixture.safetensors --output testdata/ci_boogu_out.safetensors --format w4a8 --validate

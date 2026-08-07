@@ -13,7 +13,7 @@ accepts only `w4a8` and defaults to it.
 - Repo (public): `https://github.com/NidAll/comfyui-w4a8-quantizer`
   (renamed from `comfyui-wxa8-quantizer`; old URL redirects)
 - Branch: `main`, SSH remote `git@github.com:NidAll/comfyui-w4a8-quantizer.git`
-- Script version: `1.1.3` (`CONVERTER_VERSION` in the script)
+- Script version: `1.2.1` (`CONVERTER_VERSION` in the script)
 
 ## Format facts (verified, do not guess)
 
@@ -41,7 +41,7 @@ divides K. The CUDA kernel requires group sizes in {4, 8, 16} or multiples of 16
 
 ## Architecture registry
 
-The script embeds 42 policy families covering all 98 ComfyUI model classes at
+The script embeds 43 policy families covering all 98 ComfyUI model classes at
 the research revision `bdcb886a4705a03cf40f4a7226de9fc7c059fc90`. Detection
 signatures mirror ComfyUI's `detect_unet_config`. Each family has its own
 quantize / keep / exclude patterns and validation thresholds. Generic fallback
@@ -52,6 +52,25 @@ Z-Image / Lumina2 real naming (used by `sickOllie_zTurbo`): `attention.qkv` and
 `adaLN_modulation` (capitalization matters; universal exclude has both cases).
 Do not rename these patterns back to `attn.qkv` / `mlp.w1`; that broke real
 checkpoints in v1.1.1.
+
+Boogu / OmniGen2 real naming (verified against the published checkpoints,
+v1.2.1):
+- Boogu-Image-0.1 (Base/Turbo/Edit, Comfy-Org repack, prefix-less):
+  `double_stream_layers.N.img_self_attn.to_q`, `.img_instruct_attn.processor.img_to_q`,
+  `.img_feed_forward.linear_1/2/3`, `.instruct_feed_forward.linear_1/2/3`,
+  `single_stream_layers.N.attn.to_q`, `single_stream_layers.N.feed_forward.linear_1/2/3`,
+  plus `context_refiner` / `noise_refiner` / `ref_image_refiner` with
+  `attn.to_q` / `feed_forward.linear_1/2/3`. Modulation linears
+  (`img_normN.linear`, `instruct_normN.linear`, `single_stream_layers.N.norm1.linear`,
+  `noise_refiner.N.norm1.linear`, `ref_image_refiner.N.norm1.linear`) and
+  `norm_out.linear_1/2` are kept at original precision.
+- OmniGen2 (BAAI/OmniGen2): `layers.N.attn.to_q/to_k/to_v/to_out.0`,
+  `layers.N.feed_forward.linear_1/2/3`, same refiners. Its hidden dim is 2520,
+  which fails the W4A8 `K % 16 == 0` rule; only `feed_forward.linear_2`
+  (K=10240) layers quantize, the rest pass through with a recorded reason.
+Boogu is its own family (not an omnigen2 alias); detection is disambiguated by
+`img_self_attn` / `img_feed_forward` / `processor` keys before the omnigen2
+`layers.0.attn.to_q` check.
 
 ## Environment
 
@@ -100,7 +119,7 @@ Fixture generation and conversion (small, fast, no real models):
     --output testdata/wan_fixture_w4a8.safetensors --format w4a8 --validate
 ```
 
-Families: `sdxl, sd15, flux, wan, minimax_h3, hydit, mmdit_sd3, zimage`.
+Families: `sdxl, sd15, flux, wan, minimax_h3, hydit, mmdit_sd3, zimage, boogu, omnigen2` (boogu and omnigen2 use the real state-dict naming).
 `zimage` uses the real Lumina2/Z-Image naming. Reports live in
 `testdata/reports/` (path-sanitized).
 

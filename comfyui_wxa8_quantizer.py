@@ -169,7 +169,7 @@ except Exception as _exc:  # pragma: no cover - import guard
 # Version / revision constants (research record; see module docstring)
 # ---------------------------------------------------------------------------
 CONVERTER_NAME = "comfyui_wxa8_quantizer"
-CONVERTER_VERSION = "1.2.0"
+CONVERTER_VERSION = "1.2.1"
 FORMAT_W4A8 = "asym_w4a8_int8"
 FORMAT_W4A8_REVISION = "asym-w4a8-int8-r1"
 MAX_SAFETENSORS_HEADER_SIZE = 100_000_000
@@ -2007,21 +2007,56 @@ _register(FamilyPolicy(
     notes="SeedVR2 shares Lumina2-like signatures; disambiguated by hints.",
 ))
 
-# --- omnigen2 / boogu ---
+# --- omnigen2 ---
+# Real OmniGen2 naming (BAAI/OmniGen2 state dict): layers.N.attn.to_q / to_k /
+# to_v / to_out.0, layers.N.feed_forward.linear_1/2/3, and the same structure
+# inside context_refiner / noise_refiner / ref_image_refiner.
 _register(FamilyPolicy(
     family="omnigen2",
-    comfyui_classes=("Omnigen2", "Boogu"),
+    comfyui_classes=("Omnigen2",),
     detect_primary=("time_caption_embed.timestep_embedder.linear_1.bias",
-                    "double_stream_layers.0.img_instruct_attn.processor.img_to_q.weight"),
-    detect_hints=("ref_image_patch_embedder.weight", "x_embedder.weight"),
+                    "layers.0.attn.to_q.weight"),
+    detect_hints=("layers.0.feed_forward.linear_1.weight", "context_refiner.0.attn.to_q.weight",
+                  "ref_image_patch_embedder.weight", "x_embedder.weight"),
     quantize=(
-        r"(double_stream_layers|single_stream_layers)\.\d+\.(img_attn|txt_attn|img_instruct_attn|processor)\.(qkv|to_q|to_k|to_v|proj|to_out\.0)\.weight$",
-        r"(double_stream_layers|single_stream_layers)\.\d+\.(img_mlp|txt_mlp)\.(w1|w2|fc1|fc2)\.weight$",
+        r"layers\.\d+\.attn\.(to_q|to_k|to_v|to_out\.0)\.weight$",
+        r"layers\.\d+\.feed_forward\.(linear_1|linear_2|linear_3)\.weight$",
+        r"(context_refiner|noise_refiner|ref_image_refiner)\.\d+\.attn\.(to_q|to_k|to_v|to_out\.0)\.weight$",
+        r"(context_refiner|noise_refiner|ref_image_refiner)\.\d+\.feed_forward\.(linear_1|linear_2|linear_3)\.weight$",
     ),
-    keep=(r"(^|\.)(x_embedder|ref_image_patch_embedder|time_caption_embed|final_layer|"
-          r"cap_embedder|cond_embedder|pos_embed)\.",),
+    keep=(r"(^|\.)(norm_out|image_index_embedding)\.", r"norm\d+\.linear\.(weight|bias)$"),
     exclude=UNIVERSAL_EXCLUDE,
     runtime_status="experimental",
+))
+
+# --- boogu ---
+# Real Boogu-Image-0.1 naming (Base/Turbo/Edit, Comfy-Org repack verified):
+# double_stream_layers.N.img_self_attn / img_instruct_attn(.processor) /
+# img_feed_forward / instruct_feed_forward, single_stream_layers.N.attn /
+# feed_forward, plus the OmniGen2-style refiners and embedders.
+_register(FamilyPolicy(
+    family="boogu",
+    comfyui_classes=("Boogu",),
+    detect_primary=("double_stream_layers.0.img_instruct_attn.processor.img_to_q.weight",
+                    "double_stream_layers.0.img_self_attn.to_q.weight",
+                    "double_stream_layers.0.img_feed_forward.linear_1.weight"),
+    detect_hints=("single_stream_layers.0.attn.to_q.weight",
+                  "single_stream_layers.0.feed_forward.linear_1.weight",
+                  "context_refiner.0.attn.to_q.weight",
+                  "ref_image_patch_embedder.weight", "x_embedder.weight"),
+    quantize=(
+        r"double_stream_layers\.\d+\.(img_self_attn|img_instruct_attn)\.(to_q|to_k|to_v|to_out\.0)\.weight$",
+        r"double_stream_layers\.\d+\.img_instruct_attn\.processor\.(img_to_q|img_to_k|img_to_v|img_out|instruct_to_q|instruct_to_k|instruct_to_v|instruct_out)\.weight$",
+        r"double_stream_layers\.\d+\.(img_feed_forward|instruct_feed_forward)\.(linear_1|linear_2|linear_3)\.weight$",
+        r"single_stream_layers\.\d+\.attn\.(to_q|to_k|to_v|to_out\.0)\.weight$",
+        r"single_stream_layers\.\d+\.feed_forward\.(linear_1|linear_2|linear_3)\.weight$",
+        r"(context_refiner|noise_refiner|ref_image_refiner)\.\d+\.attn\.(to_q|to_k|to_v|to_out\.0)\.weight$",
+        r"(context_refiner|noise_refiner|ref_image_refiner)\.\d+\.feed_forward\.(linear_1|linear_2|linear_3)\.weight$",
+    ),
+    keep=(r"(^|\.)(norm_out|image_index_embedding|time_caption_embed)\.", r"norm\d+\.linear\.(weight|bias)$"),
+    exclude=UNIVERSAL_EXCLUDE,
+    runtime_status="experimental",
+    notes="Real Boogu-Image-0.1 naming (double/single_stream_layers, img_instruct_attn.processor).",
 ))
 
 # --- lens ---
@@ -2427,15 +2462,27 @@ def detect_architecture(info: CheckpointInfo, override: Optional[str] = None,
         else:
             candidates.append(("cosmos_predict2", ["blocks.0.mlp.layer1.weight"],
                                [s for s in ("x_embedder.proj.1.weight",) if has(s)]))
-    # 21. boogu
-    if has("double_stream_layers.0.img_instruct_attn.processor.img_to_q.weight"):
-        # Boogu shares the explicit Omnigen2 policy profile in the registry.
-        candidates.append(("omnigen2", ["double_stream_layers.0.img_instruct_attn.processor.img_to_q.weight"],
-                           [s for s in ("ref_image_patch_embedder.weight", "x_embedder.weight") if has(s)]))
+    # 21. boogu (checked before omnigen2; both share the embedder skeleton)
+    if has("double_stream_layers.0.img_instruct_attn.processor.img_to_q.weight",
+           "double_stream_layers.0.img_self_attn.to_q.weight",
+           "double_stream_layers.0.img_feed_forward.linear_1.weight"):
+        candidates.append(("boogu",
+                           ["double_stream_layers.0.img_instruct_attn.processor.img_to_q.weight",
+                            "double_stream_layers.0.img_self_attn.to_q.weight",
+                            "double_stream_layers.0.img_feed_forward.linear_1.weight"],
+                           [s for s in ("single_stream_layers.0.attn.to_q.weight",
+                                        "single_stream_layers.0.feed_forward.linear_1.weight",
+                                        "context_refiner.0.attn.to_q.weight",
+                                        "ref_image_patch_embedder.weight") if has(s)]))
     # 22. omnigen2
-    if has("time_caption_embed.timestep_embedder.linear_1.bias"):
-        candidates.append(("omnigen2", ["time_caption_embed.timestep_embedder.linear_1.bias"],
-                           [s for s in ("ref_image_patch_embedder.weight", "x_embedder.weight") if has(s)]))
+    if has("time_caption_embed.timestep_embedder.linear_1.bias", "layers.0.attn.to_q.weight"):
+        candidates.append(("omnigen2",
+                           ["time_caption_embed.timestep_embedder.linear_1.bias",
+                            "layers.0.attn.to_q.weight"],
+                           [s for s in ("layers.0.feed_forward.linear_1.weight",
+                                        "context_refiner.0.attn.to_q.weight",
+                                        "ref_image_patch_embedder.weight",
+                                        "x_embedder.weight") if has(s)]))
     # 23. lens
     if has("transformer_blocks.0.attn.norm_added_q.weight",
            "transformer_blocks.0.img_mlp.w1.weight"):
@@ -5420,17 +5467,108 @@ def _test_registry() -> str:
     return f"{len(names)} families, {len(covered)} ComfyUI classes covered"
 
 
+def _ckpt(keys_shapes: Sequence[Tuple[str, Tuple[int, ...]]]) -> CheckpointInfo:
+    tensors = [TensorMeta(name, torch.float32, shape, int(np.prod(shape)) * 4,
+                          "", 0, int(np.prod(shape)) * 4)
+               for name, shape in keys_shapes]
+    return CheckpointInfo(kind="safetensors", files=[], metadata={}, tensors=tensors)
+
+
+def _classify_real(keys_shapes: Sequence[Tuple[str, Tuple[int, ...]]]):
+    info = _ckpt(keys_shapes)
+    det = detect_architecture(
+        info, shape_lookup=lambda n: (info.by_name(n).shape
+                                      if info.by_name(n) else None))
+    decisions = classify_tensors(info, det, FORMAT_W4A8, 16, None, None,
+                                 None, None, None)
+    return det, decisions
+
+
 def _test_detection_safety() -> str:
-    boogu_key = "double_stream_layers.0.img_instruct_attn.processor.img_to_q.weight"
-    boogu = CheckpointInfo(
-        kind="safetensors", files=[], metadata={},
-        tensors=[TensorMeta(boogu_key, torch.float32, (64, 64), 64 * 64 * 4,
-                            "", 0, 64 * 64 * 4)])
-    detected = detect_architecture(
-        boogu, shape_lookup=lambda name: boogu.by_name(name).shape
-        if boogu.by_name(name) else None)
-    assert detected.architecture == "omnigen2"
-    assert get_family("Boogu").family == "omnigen2"
+    # Real Boogu-Image-0.1 key naming (Comfy-Org repack, verified against the
+    # published checkpoint): double/single stream layers plus OmniGen2-style
+    # refiners and embedders. Detection must land on the dedicated boogu
+    # family, and the linear attention / FFN weights must actually quantize.
+    boogu_keys: Sequence[Tuple[str, Tuple[int, ...]]] = [
+        ("double_stream_layers.0.img_instruct_attn.processor.img_to_q.weight", (64, 64)),
+        ("double_stream_layers.0.img_instruct_attn.processor.img_out.weight", (64, 64)),
+        ("double_stream_layers.0.img_self_attn.to_q.weight", (64, 64)),
+        ("double_stream_layers.0.img_self_attn.to_k.weight", (16, 64)),
+        ("double_stream_layers.0.img_self_attn.to_out.0.weight", (64, 64)),
+        ("double_stream_layers.0.img_feed_forward.linear_1.weight", (256, 64)),
+        ("double_stream_layers.0.img_feed_forward.linear_2.weight", (64, 256)),
+        ("double_stream_layers.0.img_feed_forward.linear_3.weight", (256, 64)),
+        ("double_stream_layers.0.instruct_feed_forward.linear_1.weight", (256, 64)),
+        ("double_stream_layers.0.img_norm1.linear.weight", (256, 64)),
+        ("double_stream_layers.0.img_norm1.linear.bias", (256,)),
+        ("double_stream_layers.0.img_norm1.norm.weight", (64,)),
+        ("single_stream_layers.0.attn.to_q.weight", (64, 64)),
+        ("single_stream_layers.0.attn.to_k.weight", (16, 64)),
+        ("single_stream_layers.0.attn.to_out.0.weight", (64, 64)),
+        ("single_stream_layers.0.feed_forward.linear_1.weight", (256, 64)),
+        ("single_stream_layers.0.feed_forward.linear_2.weight", (64, 256)),
+        ("single_stream_layers.0.norm1.linear.weight", (256, 64)),
+        ("context_refiner.0.attn.to_q.weight", (64, 64)),
+        ("context_refiner.0.feed_forward.linear_1.weight", (256, 64)),
+        ("noise_refiner.0.attn.to_q.weight", (64, 64)),
+        ("ref_image_refiner.0.feed_forward.linear_1.weight", (256, 64)),
+        ("x_embedder.weight", (64, 64)),
+        ("ref_image_patch_embedder.weight", (64, 64)),
+        ("time_caption_embed.timestep_embedder.linear_1.weight", (64, 64)),
+        ("norm_out.linear_1.weight", (64, 64)),
+        ("norm_out.linear_2.weight", (64, 64)),
+        ("image_index_embedding", (5, 64)),
+    ]
+    det, decisions = _classify_real(boogu_keys)
+    assert det.architecture == "boogu", det.architecture
+    assert det.confidence == "high", det.confidence
+    assert get_family("Boogu").family == "boogu"
+    quantized = {d.name for d in decisions if d.kind == DecisionKind.QUANTIZE}
+    kept = {d.name for d in decisions if d.kind != DecisionKind.QUANTIZE}
+    assert len(quantized) == 16, sorted(quantized)
+    assert "double_stream_layers.0.img_instruct_attn.processor.img_to_q.weight" in quantized
+    assert "double_stream_layers.0.img_self_attn.to_q.weight" in quantized
+    assert "single_stream_layers.0.feed_forward.linear_1.weight" in quantized
+    assert "context_refiner.0.attn.to_q.weight" in quantized
+    assert "double_stream_layers.0.img_norm1.linear.weight" in kept  # modulation
+    assert "single_stream_layers.0.norm1.linear.weight" in kept      # modulation
+    assert "norm_out.linear_1.weight" in kept                        # output head
+    assert "x_embedder.weight" in kept                               # embedder
+    assert "time_caption_embed.timestep_embedder.linear_1.weight" in kept
+
+    # Real OmniGen2 key naming (BAAI/OmniGen2): layers.N + refiners. Detection
+    # must land on omnigen2 and the linear weights must quantize too.
+    og2_keys: Sequence[Tuple[str, Tuple[int, ...]]] = [
+        ("layers.0.attn.to_q.weight", (64, 64)),
+        ("layers.0.attn.to_k.weight", (16, 64)),
+        ("layers.0.attn.to_v.weight", (16, 64)),
+        ("layers.0.attn.to_out.0.weight", (64, 64)),
+        ("layers.0.feed_forward.linear_1.weight", (256, 64)),
+        ("layers.0.feed_forward.linear_2.weight", (64, 256)),
+        ("layers.0.feed_forward.linear_3.weight", (256, 64)),
+        ("layers.0.norm1.linear.weight", (256, 64)),
+        ("layers.0.attn.norm_k.weight", (64,)),
+        ("context_refiner.0.attn.to_q.weight", (64, 64)),
+        ("context_refiner.0.feed_forward.linear_1.weight", (256, 64)),
+        ("noise_refiner.0.attn.to_q.weight", (64, 64)),
+        ("noise_refiner.0.feed_forward.linear_1.weight", (256, 64)),
+        ("time_caption_embed.timestep_embedder.linear_1.bias", (64,)),
+        ("x_embedder.weight", (64, 64)),
+        ("ref_image_patch_embedder.weight", (64, 64)),
+        ("norm_out.linear_1.weight", (64, 64)),
+    ]
+    det, decisions = _classify_real(og2_keys)
+    assert det.architecture == "omnigen2", det.architecture
+    assert det.confidence == "high", det.confidence
+    quantized = {d.name for d in decisions if d.kind == DecisionKind.QUANTIZE}
+    kept = {d.name for d in decisions if d.kind != DecisionKind.QUANTIZE}
+    assert len(quantized) == 9, sorted(quantized)
+    assert "layers.0.attn.to_q.weight" in quantized
+    assert "layers.0.feed_forward.linear_2.weight" in quantized
+    assert "context_refiner.0.attn.to_q.weight" in quantized
+    assert "noise_refiner.0.feed_forward.linear_1.weight" in quantized
+    assert "layers.0.norm1.linear.weight" in kept
+    assert "norm_out.linear_1.weight" in kept
 
     keys = ("clf.1.weight", "head.modulation")
     ambiguous = CheckpointInfo(
@@ -5442,7 +5580,8 @@ def _test_detection_safety() -> str:
         raise AssertionError("ambiguous checkpoint was guessed")
     except UnknownArchitectureError as exc:
         assert "ambiguous" in str(exc)
-    return "Boogu alias resolves; equal-score architectures fail closed"
+    return ("real Boogu/OmniGen2 naming quantizes; Boogu is its own family; "
+        "equal-score architectures fail closed")
 
 
 def _test_malformed() -> str:
