@@ -330,6 +330,21 @@ two structurally different families (Z-Image and MiniMax H3) through the real
 ComfyUI v0.30.0 + comfy-kitchen 0.2.27 load path: every quantized layer becomes
 an `AsymW4A8Int8Layout` QuantizedTensor and no warning is emitted.
 
+**`RuntimeError: Given normalized_shape=[4096], expected input with shape
+[*, 4096], but got input of size [1, 512, 12288]` (or a similar RMSNorm/LayerNorm
+shape error) right after sampling starts.** This is a conditioning mismatch, not
+a quantization defect. The failing module (for Boogu/OmniGen2 that is
+`time_caption_embed.caption_embedder`) is kept at original precision and is
+byte-identical in the W4A8 output; the model config it drives (`instruction_feat_dim`,
+`hidden_size`) is read from those same kept tensors. The input to that norm comes
+from the text encoder, a separate file that the converter never touches. A correct
+Boogu workflow (official template, `qwen3vl_8b_fp8_scaled.safetensors` as text
+encoder) produces `[B, seq, 4096]` conditioning. If you see a multiple of 4096
+(12288 = 3 x 4096), the workflow is concatenating conditioning streams or using a
+non-Boogu text encoder; the same workflow fails identically with the bf16
+checkpoint. Check the conditioning part of the workflow and update ComfyUI before
+suspecting the quantized file.
+
 ## Security
 
 The model, metadata, configuration files, paths and calibration data are treated as
