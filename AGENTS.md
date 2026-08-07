@@ -55,10 +55,21 @@ checkpoints in v1.1.1.
 
 ## Environment
 
-- `.venv`: torch 2.13.0+cu130, safetensors 0.8.0, comfy-kitchen 0.2.27,
-  comfy-aimdo 0.4.13, numpy, pillow, tqdm, torchaudio, opencv-python,
-  transformers, psutil, av, requests, einops. No pip module; use
-  `uv pip install --python .venv/bin/python PKG`.
+The working tree is kept clean of large artifacts. No `.venv` and no model
+checkpoints are stored locally; both are recreated on demand.
+
+```bash
+uv venv .venv
+uv pip install --python .venv/bin/python -r requirements.txt
+# optional, only for ComfyUI loader reproduction (research/ComfyUI):
+uv pip install --python .venv/bin/python comfy-kitchen comfy-aimdo pillow \
+    tqdm torchaudio opencv-python transformers psutil av einops requests
+```
+
+Expected versions: torch 2.13.0+cu130, safetensors 0.8.0, comfy-kitchen 0.2.27,
+comfy-aimdo 0.4.13. There is no pip module inside the venv; install with `uv
+pip install --python .venv/bin/python PKG`.
+
 - GPU: quantization defaults to CPU
   (`--device auto`), which is deterministic and matches the golden vectors.
   `--device cuda` is faster; the codebook subsample is device-dependent, so
@@ -93,10 +104,12 @@ Families: `sdxl, sd15, flux, wan, minimax_h3, hydit, mmdit_sd3, zimage`.
 `zimage` uses the real Lumina2/Z-Image naming. Reports live in
 `testdata/reports/` (path-sanitized).
 
-Real checkpoint on disk (untracked, gitignored): `sickOllie_zTurbo.safetensors`
-(11.46 GiB bf16) converts to `sickOllie_zTurbo_w4a8.safetensors` (3.42 GiB,
-170 layers, max relL2 0.0730, ~4 minutes). The 12 GB input and
-3.4 GB output are local only; root-level `*.safetensors` is gitignored.
+Reference results from the real checkpoint (not kept on disk): the user's
+`sickOllie_zTurbo.safetensors` (11.46 GiB bf16) converts to
+`sickOllie_zTurbo_w4a8.safetensors` (3.42 GiB, 170 layers, max relL2 0.0730,
+~4 minutes, relL2 validated). Root-level `*.safetensors` is
+gitignored; do not commit model files. Use `testdata/make_fixtures.py` for
+small regeneration tests instead of real models.
 
 ## Verification before claiming success
 
