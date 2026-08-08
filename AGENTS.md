@@ -10,7 +10,7 @@ This branch (`experimental/mixed-precision`) adds `--format mixed`: a
 per-layer optimizer over the ComfyUI-native formats `convrot_w4a4`,
 `asym_w4a8_int8`, and `int8_tensorwise`. It is experimental and not merged to
 main. `--format w4a8` remains the default and is byte-identical to main
-v1.3.0 (golden vectors and the 35/35 self-test suite prove it).
+v1.3.0 (golden vectors and the 37/37 self-test suite prove it).
 
 - Local path: `/home/nidall/projects/testdeepseek/quantizationscripts_w4a8_w3a8`
 - Repo (public): `https://github.com/NidAll/comfyui-w4a8-quantizer`
@@ -18,8 +18,14 @@ v1.3.0 (golden vectors and the 35/35 self-test suite prove it).
 - Script version: `1.4.0-experimental` (`CONVERTER_VERSION`)
 - Audit status: P0 items closed (hard quality/compression gates, BF16
   promotion candidate, runtime-output calibration metric, per-format runtime
-  compatibility probe). Remaining certification gaps are documented in the
-  README limitations (real-model three-layout forward, LoRA/offload).
+  compatibility probe) and the follow-up implementation plan applied
+  (W4A8 runtime-basis simulation, target-accurate W4A4, simulator
+  equivalence suite, targeted global metric, unified ORIGINAL candidate,
+  per-format capability matrix, certification levels, model-level quality
+  harness, strict mixed smoke mode, upstream runtime-contract nightly sync).
+  Remaining certification gaps are documented in the README limitations
+  (real-model three-layout forward, LoRA/offload/low-VRAM, e2e generation,
+  balanced-v1 threshold tuning from the benchmark matrix).
 
 ## Format facts (verified, do not guess)
 
@@ -145,7 +151,7 @@ reset). `.venv` has torch 2.13.0+cu130 and comfy-kitchen 0.2.28.
 ## Common commands
 
 ```bash
-.venv/bin/python comfyui_wxa8_quantizer.py --self-test          # 35/35 required
+.venv/bin/python comfyui_wxa8_quantizer.py --self-test          # 37/37 required
 .venv/bin/python comfyui_wxa8_quantizer.py --list-architectures
 .venv/bin/python comfyui_wxa8_quantizer.py MODEL.safetensors --inspect
 
@@ -161,8 +167,18 @@ reset). `.venv` has torch 2.13.0+cu130 and comfy-kitchen 0.2.28.
 .venv/bin/python testdata/make_fixtures.py testdata/boogu_real_fixture.safetensors
 .venv/bin/python comfyui_wxa8_quantizer.py testdata/boogu_real_fixture.safetensors     --output testdata/boogu_real_fixture_mixed.safetensors --format mixed --profile balanced --validate
 
-# CUDA regression (real GPU; 9/9 on the RTX 3050)
+# CUDA regression (real GPU; 10/10 on the RTX 3050)
 .venv/bin/python testdata/cuda_smoke.py
+
+# simulator equivalence vs real comfy-kitchen (needs comfy-kitchen installed)
+.venv/bin/python testdata/runtime_equivalence.py --seeds 3
+
+# architecture + upstream runtime contract sync (local checkout or tarballs)
+.venv/bin/python testdata/comfyui_architecture_sync.py --comfy-src research/ComfyUI
+
+# model-level BF16-relative quality gate (target machine, real checkpoints)
+# PYTHONPATH=<comfyui-src> .venv/bin/python testdata/model_quality.py \
+#     --source original.safetensors --model converted.safetensors --threshold 0.05
 ```
 
 Expected results on the fixtures: boogu_real mixed = 19 W4A8 + 134 INT8
