@@ -162,6 +162,13 @@ Same as main: uv venv, no model checkpoints stored locally. GPU is an RTX
 real here. `research/ComfyUI` is v0.30.0 + loader patch (gitignored, do not
 reset). `.venv` has torch 2.13.0+cu130 and comfy-kitchen 0.2.28.
 
+Install: `uv pip install --python .venv/bin/python -r requirements.txt`
+(core converter plus huggingface_hub for the Colab download/upload flow);
+`-r requirements-optional.txt` adds comfy-kitchen + packaging for the
+companion tools that may import it (runtime_certify, runtime_equivalence,
+certified_convert --certify). The standalone converter never needs the
+optional set.
+
 ## Common commands
 
 ```bash

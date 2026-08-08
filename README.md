@@ -73,8 +73,11 @@ INT8 as the quality and coverage tier.
 ```bash
 uv venv .venv
 uv pip install --python .venv/bin/python -r requirements.txt
+# optional: tools that may import comfy-kitchen (runtime_certify,
+# runtime_equivalence, certified_convert --certify):
+uv pip install --python .venv/bin/python -r requirements-optional.txt
 # optional, for the ComfyUI loader reproduction (research/ComfyUI):
-uv pip install --python .venv/bin/python comfy-kitchen comfy-aimdo pillow \
+uv pip install --python .venv/bin/python comfy-aimdo pillow \
     tqdm torchaudio opencv-python transformers psutil av einops requests
 ```
 
