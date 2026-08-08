@@ -6,15 +6,15 @@
 generative-model checkpoints into ComfyUI-native quantized checkpoints. It
 does not import ComfyUI or comfy-kitchen at runtime.
 
-This branch (`experimental/mixed-precision`) adds `--format mixed`: a
-per-layer optimizer over the ComfyUI-native formats `convrot_w4a4`,
-`asym_w4a8_int8`, and `int8_tensorwise`. It is experimental and not merged to
-main. `--format w4a8` remains the default and is byte-identical to main
+The mixed mode (`--format mixed`) is a per-layer optimizer over the
+ComfyUI-native formats `convrot_w4a4`, `asym_w4a8_int8`, and
+`int8_tensorwise`, merged into main from the `experimental/mixed-precision`
+branch. `--format w4a8` remains the default and is byte-identical to main
 v1.3.0 (golden vectors and the 37/37 self-test suite prove it).
 
 - Local path: `/home/nidall/projects/testdeepseek/quantizationscripts_w4a8_w3a8`
 - Repo (public): `https://github.com/NidAll/comfyui-mixed-quantizer`
-- Branch: `experimental/mixed-precision` (do not merge to main without review)
+- Branch: `main` (the experimental branch was merged)
 - Script version: `1.4.0-experimental` (`CONVERTER_VERSION`)
 - Audit status: P0 items closed (hard quality/compression gates, BF16
   promotion candidate, runtime-output calibration metric, per-format runtime
@@ -218,9 +218,11 @@ mixed balanced = 16 W4A8 + 4 INT8; wan mixed size-first = 10 W4A8 + 9 W4A4 +
    (0 failed).
 3. `testdata/cuda_smoke.py` must pass 10/10 on a CUDA machine (includes the
    W4A4 A8-mode simulator-vs-kernel quality check).
-4. CI matrix (ubuntu/windows/macos) runs self-tests, w4a8 fixture conversions,
-   and mixed fixture conversions including a `--validation-only` re-check of a
-   mixed output.
+4. CI workflows are temporarily removed (they live in git history:
+   ci.yml, cuda-smoke.yml, nightly-sync.yml, release-compat.yml). Run the
+   self-tests, fixture conversions (w4a8 + mixed, including a
+   `--validation-only` re-check) and the sync scripts locally until they
+   are restored.
 5. For loader questions, reproduce with the real ComfyUI path:
    `PYTHONPATH=research/ComfyUI .venv/bin/python`, flow
    `load_torch_file -> convert_old_quants -> load_diffusion_model_state_dict`,
@@ -232,12 +234,14 @@ mixed balanced = 16 W4A8 + 4 INT8; wan mixed size-first = 10 W4A8 + 9 W4A4 +
    formats before the forward runs.
 6. `testdata/comfyui_architecture_sync.py` must pass against the pinned
    ComfyUI revision (CI tarball mode) and against the local
-   `research/ComfyUI` checkout when present. The nightly workflow checks
-   ComfyUI main + comfy-kitchen main with --check-runtime-contract (three
-   QUANT_ALGOS names + three layout classes) and fails naming any regression.
-7. `testdata/runtime_equivalence.py` must pass (CI runs it with comfy-kitchen
-   installed): our W4A4-A4 / W4A8 / INT8 simulators must agree with the real
-   eager kernels to 1e-4 relative on the awkward K matrix.
+   `research/ComfyUI` checkout when present. The (currently removed)
+   nightly workflow checked ComfyUI main + comfy-kitchen main with
+   --check-runtime-contract (three QUANT_ALGOS names + scale names + three
+   layout classes) and failed naming any regression; run the check locally
+   until it is restored.
+7. `testdata/runtime_equivalence.py` must pass (install comfy-kitchen and
+   packaging first): our W4A4-A4 / W4A8 / INT8 simulators must agree with
+   the real eager kernels to 1e-4 relative on the awkward K matrix.
 
 ## Known behavior, do not "fix" it
 

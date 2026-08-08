@@ -211,8 +211,7 @@ Every simulator is permanently cross-checked against the real comfy-kitchen
 implementation in `testdata/runtime_equivalence.py` (exact output agreement
 0 to 5e-8 for W4A4-A4, W4A8, and INT8 across the awkward K matrix; the W4A4
 A8 mode is CUDA-only and its quality-vs-BF16 agreement with the CUDA kernels
-is checked in `testdata/cuda_smoke.py`). CI runs the equivalence suite on
-every push.
+is checked in `testdata/cuda_smoke.py`).
 
 Compression is enforced, not advisory. `--max-linear-bytes-per-param F`
 replaces the profile's effective bytes/parameter target and
@@ -368,8 +367,7 @@ closed unless `--architecture` is given.
   INT8 non-ConvRot path at K=3360, W4A4 at K=1152 with cgs=16 in both
   `linear_dtype` variants, a full mixed checkpoint through the kernels, and
   the W4A4 A8-mode simulator-vs-kernel quality check. 10/10 checks pass on
-  an RTX 3050. The workflow runs on release tags, pushes to the default
-  branch, and PRs touching the converter, in addition to manual dispatch.
+  an RTX 3050.
 * `testdata/comfyui_smoke.py`: real ComfyUI load path for W4A8 and mixed
   checkpoints. It reads the per-layer metadata and asserts each quantized
   module's layout matches its format (TensorCoreConvRotW4A4Layout /
@@ -393,11 +391,11 @@ closed unless `--architecture` is given.
 * `tools/runtime_certify.py` and `tools/certified_convert.py`: the runtime
   certificate generator and the staging/publishing orchestrator described
   under Runtime compatibility.
-* CI: `release-compat.yml` certifies against pinned revisions (ComfyUI
-  `344b43989e`, comfy-kitchen 0.2.28) on every release; the nightly workflow
-  tracks ComfyUI and comfy-kitchen main, checks the architecture registry,
-  the three QUANT_ALGOS + scale names, the three layout classes, and runs
-  the simulator equivalence suite against the latest comfy-kitchen.
+* CI: the GitHub workflows were removed for now and live in git history
+  (`ci.yml`, `cuda-smoke.yml`, `nightly-sync.yml`, `release-compat.yml`).
+  Until they are restored, run the self-tests, fixture conversions,
+  `cuda_smoke.py`, `runtime_equivalence.py` and
+  `comfyui_architecture_sync.py` locally before merging or releasing.
 * `testdata/comfyui_architecture_sync.py`: compares the embedded registry
   (43 families) with ComfyUI's `supported_models.py` class set. CI runs it
   against the pinned research revision; the nightly workflow runs it against
