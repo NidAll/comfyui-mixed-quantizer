@@ -1,13 +1,13 @@
 ==============================================================================
-comfyui_wxa8_quantizer 1.2.2 -- conversion report
+comfyui_wxa8_quantizer 1.2.3 -- conversion report
 ==============================================================================
 format            : asym_w4a8_int8 (asym-w4a8-int8-r1)
 architecture      : sd15 (confidence low)
 unet prefix       : model.diffusion_model.
 input             : safetensors (testdata/sd15_fixture.safetensors)
 output            : testdata/sd15_fixture_w4a8.safetensors (4.92 MiB)
-elapsed           : 1.409 s
-peak RSS          : 612.19 MiB
+elapsed           : 1.578 s
+peak RSS          : 612.70 MiB
 warnings:
   - low detection confidence; consider --architecture override
 
@@ -18,6 +18,11 @@ warnings:
   input tensors   : 8
   quantized layers: 2
   kept tensors    : 6
+
+-- compression --
+  quantized      : 2 / 3 policy-targeted 2D layers
+  byte share     : 56.5% of targeted 2D bytes
+  gate victims   : K in [320] not divisible by 256 (ConvRot-256); kept at original precision
 
 -- quantization --
   model.diffusion_model.input_blocks.1.0.transformer_blocks.0.attn2.to_k: (320, 768) gs=16 cgs=256
@@ -47,7 +52,7 @@ warnings:
   [passed                ] scale-validation -- 2 layers OK (fp8 s_rel finite/nonnegative, fp32 s_channel finite/positive)
   [passed                ] deterministic-conversion -- two runs byte-identical
   [passed                ] deterministic-vs-disk -- recomputed packed weight matches the file
-  [passed                ] output-hash -- sha256=5670042cfaae1d2d336498797ba27dce3d4a0ede377ac3fe34b3a025c0c0e564
+  [passed                ] output-hash -- sha256=95e5bb2d6e1014174fe1c90bc2bca09e3bc8b31b82446228d99560b4dc334259
   [passed                ] compat-comfy-kitchen -- installed comfy-kitchen: 0.2.28, static package source contains AsymW4A8Int8Layout: True
   [skipped               ] compat-comfyui -- ComfyUI not installed (skipped)
   [passed                ] input-hash -- {"sd15_fixture.safetensors":"ea69a2525e9be57e865aa36ac120add9e80728282626da6c660d552c13ad5dc0"}
@@ -57,6 +62,6 @@ warnings:
   comfy-kitchen >= aa1ab2263dc06225d9de6702dfc087313d4bc971 (PR #90, merged) with AsymW4A8Int8Layout; ComfyUI >= v0.31.0 (PR #15308 merged as 344b43989e; older builds need patches/comfyui_w4a8_loader.patch); CUDA: PyTorch cu130+, SM >= 8.0; ROCm: triton >= 3.7; eager works anywhere
 
 -- output integrity --
-  sha256          : 5670042cfaae1d2d336498797ba27dce3d4a0ede377ac3fe34b3a025c0c0e564
+  sha256          : 95e5bb2d6e1014174fe1c90bc2bca09e3bc8b31b82446228d99560b4dc334259
   input sd15_fixture.safetensors : ea69a2525e9be57e865aa36ac120add9e80728282626da6c660d552c13ad5dc0
 ==============================================================================

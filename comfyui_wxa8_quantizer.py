@@ -175,7 +175,7 @@ except Exception as _exc:  # pragma: no cover - import guard
 # Version / revision constants (research record; see module docstring)
 # ---------------------------------------------------------------------------
 CONVERTER_NAME = "comfyui_wxa8_quantizer"
-CONVERTER_VERSION = "1.2.2"
+CONVERTER_VERSION = "1.2.3"
 FORMAT_W4A8 = "asym_w4a8_int8"
 
 # comfy-kitchen 0.2.27 CUDA fused kernels implement ConvRot only for a 256-wide
@@ -4846,6 +4846,68 @@ def republish_with_metadata(src_path: str, final_path: str, metadata: Dict[str, 
 # ---------------------------------------------------------------------------
 # Reports
 # ---------------------------------------------------------------------------
+def compression_stats(info: CheckpointInfo, plan: ConversionPlan,
+                     detection: DetectionResult) -> Dict[str, Any]:
+    """How much of the family's policy-targeted 2D linear weights actually got
+    quantized, and which K values the ConvRot-256 gate rejected.
+
+    Targeted = 2D float weights matched by the family quantize patterns. The
+    fraction is bytes, not layer count, so big FFN layers dominate. A low
+    fraction means the checkpoint stays mostly at original precision (hidden
+    dims like 1152/1408/1920/2520/3360 are not divisible by 256).
+    """
+    prefix = detection.unet_prefix
+    if not any(k.startswith(prefix) for k in info.key_set()):
+        prefix = ""
+    q_re = detection.policy.quantize_re()
+    by_name = {d.name: d for d in plan.decisions}
+    quantized_layers = quantized_bytes = targeted_layers = targeted_bytes = 0
+    gate_k = set()
+    for meta in info.tensors:
+        if len(meta.shape) != 2 or meta.dtype not in FLOAT_DTYPES:
+            continue
+        rel = meta.name[len(prefix):] if prefix and meta.name.startswith(prefix) else meta.name
+        decision = by_name.get(meta.name)
+        in_qset = bool(q_re.search(rel))
+        if decision is not None and decision.kind == DecisionKind.QUANTIZE:
+            quantized_layers += 1
+            quantized_bytes += meta.nbytes
+            targeted_layers += 1
+            targeted_bytes += meta.nbytes
+        elif in_qset:
+            targeted_layers += 1
+            targeted_bytes += meta.nbytes
+            if decision is not None and "convrot_groupsize" in (decision.reason or ""):
+                gate_k.add(int(meta.shape[1]))
+    fraction = (min(1.0, quantized_bytes / targeted_bytes)
+                if targeted_bytes else None)
+    return {
+        "quantized_2d_layers": quantized_layers,
+        "targeted_2d_layers": targeted_layers,
+        "quantized_2d_bytes": quantized_bytes,
+        "targeted_2d_bytes": targeted_bytes,
+        "quantized_fraction": fraction,
+        "failing_k_values": sorted(gate_k),
+    }
+
+
+def low_compression_warning(stats: Dict[str, Any]) -> Optional[str]:
+    """Warning text when most policy-targeted linear bytes stay unquantized."""
+    frac = stats.get("quantized_fraction")
+    targeted = stats.get("targeted_2d_bytes") or 0
+    if frac is None or targeted == 0 or frac >= 0.5:
+        return None
+    ks = ", ".join(str(k) for k in stats.get("failing_k_values", []))
+    gate = " (failing K values: {})".format(ks) if ks else ""
+    return (
+        "low compression: only {:.0f}% of policy-targeted 2D linear bytes were "
+        "quantized ({} of {} layers). The CUDA ConvRot-256 gate keeps layers "
+        "with K % 256 != 0 at original precision{}, so the output stays mostly "
+        "at original precision."
+    ).format(100 * frac, stats["quantized_2d_layers"],
+             stats["targeted_2d_layers"], gate)
+
+
 def render_text_report(report: Dict[str, Any]) -> str:
     L: List[str] = []
     a = L.append
@@ -4876,6 +4938,20 @@ def render_text_report(report: Dict[str, Any]) -> str:
     a(f"  input tensors   : {report.get('n_input_tensors')}")
     a(f"  quantized layers: {report.get('n_quantized')}")
     a(f"  kept tensors    : {report.get('n_kept')}")
+    a("")
+    a("-- compression --")
+    comp = report.get("compression") or {}
+    if comp.get("targeted_2d_bytes"):
+        frac = comp.get("quantized_fraction")
+        a(f"  quantized      : {comp.get('quantized_2d_layers')} / "
+          f"{comp.get('targeted_2d_layers')} policy-targeted 2D layers")
+        a(f"  byte share     : {100*frac:.1f}% of targeted 2D bytes"
+          if frac is not None else "  byte share     : n/a")
+        if comp.get("failing_k_values"):
+            a("  gate victims   : K in %s not divisible by 256 (ConvRot-256); "
+              "kept at original precision" % comp["failing_k_values"])
+    else:
+        a("  no policy-targeted 2D linear layers")
     a("")
     a("-- quantization --")
     for row in report.get("quantization_rows", []):
@@ -4922,6 +4998,7 @@ def build_report(info: CheckpointInfo, plan: ConversionPlan, env: EnvironmentInf
         "output_path": args.output, "output_bytes": plan.total_out_bytes,
         "n_input_tensors": len(info.tensors), "n_quantized": plan.n_quantized,
         "n_kept": plan.n_kept,
+        "compression": compression_stats(info, plan, result),
         "quantization_rows": quant_rows,
         "tensor_decisions": [
             {"name": item.name, "decision": item.kind.value,
@@ -4950,6 +5027,66 @@ def build_report(info: CheckpointInfo, plan: ConversionPlan, env: EnvironmentInf
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+def _console_color(code: str, text: str) -> str:
+    """ANSI color when stdout is a terminal, plain text otherwise."""
+    if not sys.stdout.isatty():
+        return text
+    return f"\x1b[{code}m{text}\x1b[0m"
+
+
+def print_console_summary(*, out_path: str, input_bytes: int, output_bytes: int,
+                          architecture: str, confidence: str, n_quantized: int,
+                          n_kept: int, comp: Dict[str, Any],
+                          validation: Optional[Dict[str, Any]],
+                          elapsed: float, warnings: List[str],
+                          report_path: Optional[str] = None,
+                          dry_run: bool = False) -> None:
+    """Concise, human-friendly terminal summary printed after a conversion
+    (or dry run). Plain ASCII when piped; colored when interactive."""
+    saved = (1.0 - output_bytes / input_bytes) if input_bytes else 0.0
+    saved_txt = f"saved {100*saved:.1f}%" if saved >= 0 else "larger than input"
+    saved_color = _console_color("32", saved_txt) if saved >= 0.5 else (
+        _console_color("33", saved_txt) if saved >= 0 else saved_txt)
+    frac = comp.get("quantized_fraction")
+    frac_txt = (f"{100*frac:.0f}%" if frac is not None else "n/a")
+    mode = "dry run (nothing written)" if dry_run else "conversion complete"
+    title = _console_color("1", f" {mode} ") + f"  elapsed {elapsed:.1f} s"
+    n_failed = (validation or {}).get("n_failed", 0)
+    if validation:
+        v_txt = (f"{validation.get('n_passed', 0)} passed, "
+                 f"{validation.get('n_passed_with_warnings', 0)} with warnings, "
+                 f"{n_failed} failed, {validation.get('n_skipped', 0)} skipped")
+        v_txt = (_console_color("31", v_txt) if n_failed else
+                 _console_color("32", v_txt))
+    else:
+        v_txt = "not run (dry run)"
+    lines = []
+    a = lines.append
+    a("=" * 78)
+    a(title)
+    a("-" * 78)
+    a(f"  input       : {human_bytes(input_bytes):>10s}")
+    a(f"  output      : {human_bytes(output_bytes):>10s}   {saved_color}")
+    a(f"  architecture: {architecture} (confidence {confidence})")
+    if frac is not None:
+        a(f"  quantized   : {n_quantized} layers ({frac_txt} of policy-targeted "
+          "2D linear bytes); " + f"{n_kept} kept")
+    else:
+        a(f"  quantized   : {n_quantized} layers; {n_kept} kept")
+    a(f"  format      : {FORMAT_W4A8}  group_size=16  convrot_groupsize=256")
+    a(f"  validation  : {v_txt}")
+    if report_path:
+        a(f"  report      : {report_path}")
+    if warnings:
+        a("-" * 78)
+        wl = _console_color("33", "WARNING") if len(warnings) == 1 else             _console_color("33", f"WARNINGS ({len(warnings)})")
+        a(f"  {wl}")
+        for w in warnings:
+            a(f"    - {w}")
+    a("=" * 78)
+    print("\n".join(lines))
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="comfyui_wxa8_quantizer.py",
@@ -5193,6 +5330,7 @@ def run_self_tests() -> int:
         ("standalone-environment-probe", _test_standalone_environment),
         ("metadata-generation", _test_metadata),
         ("registry-behavior", _test_registry),
+        ("compression-stats", _test_compression_stats),
         ("architecture-detection-safety", _test_detection_safety),
         ("golden-vectors-vs-reference", _test_golden_vectors),
         ("malformed-checkpoints", _test_malformed),
@@ -5491,6 +5629,60 @@ def _classify_real(keys_shapes: Sequence[Tuple[str, Tuple[int, ...]]]):
     decisions = classify_tensors(info, det, FORMAT_W4A8, 16, None, None,
                                  None, None, None)
     return det, decisions
+
+
+def _test_compression_stats() -> str:
+    """The low-compression warning must fire for hidden dims not divisible by
+    256 (Boogu-style K=3360) and stay silent for ConvRot-compatible dims."""
+    # Boogu-style: 5 attention/FFN linears at K=3360 (gate victims) + one
+    # K=13568 FFN expansion layer that quantizes. The double_stream primary
+    # keys pin detection to the boogu family.
+    boogu_keys: Sequence[Tuple[str, Tuple[int, ...]]] = [
+        ("double_stream_layers.0.img_instruct_attn.processor.img_to_q.weight", (768, 3360)),
+        ("double_stream_layers.0.img_self_attn.to_q.weight", (768, 3360)),
+        ("context_refiner.0.attn.to_q.weight", (768, 3360)),
+        ("context_refiner.0.attn.to_k.weight", (768, 3360)),
+        ("context_refiner.0.feed_forward.linear_1.weight", (768, 3360)),
+        ("context_refiner.0.feed_forward.linear_2.weight", (768, 13568)),
+        ("single_stream_layers.0.attn.to_q.weight", (768, 3360)),
+        ("single_stream_layers.0.feed_forward.linear_1.weight", (768, 3360)),
+    ]
+    det, decisions = _classify_real(boogu_keys)
+    assert det.architecture == "boogu"
+    plan = ConversionPlan(fmt=FORMAT_W4A8, detection=det, decisions=decisions,
+                          metadata_quant={}, metadata_ext={}, output_entries=[])
+    info = _ckpt(boogu_keys)
+    stats = compression_stats(info, plan, det)
+    assert stats["targeted_2d_layers"] == 8
+    assert stats["quantized_2d_layers"] == 1
+    assert stats["quantized_fraction"] < 0.5, stats
+    assert stats["failing_k_values"] == [3360], stats
+    warn = low_compression_warning(stats)
+    assert warn is not None and "3360" in warn and "low compression" in warn
+    assert "convrot_groupsize" in decisions[0].reason
+
+    # Clean case: all quantize-set K divisible by 256 (flux-style). The
+    # key_norm weight is the flux detection primary; img/txt_in and the
+    # single-block linears complete the picture.
+    flux_keys: Sequence[Tuple[str, Tuple[int, ...]]] = [
+        ("model.diffusion_model.double_blocks.0.img_attn.norm.key_norm.weight", (768,)),
+        ("model.diffusion_model.img_in.weight", (768, 768)),
+        ("model.diffusion_model.double_blocks.0.img_attn.qkv.weight", (768, 768)),
+        ("model.diffusion_model.double_blocks.0.img_attn.proj.weight", (768, 768)),
+        ("model.diffusion_model.double_blocks.0.img_mlp.w1.weight", (3072, 768)),
+        ("model.diffusion_model.double_blocks.0.img_mlp.w2.weight", (768, 3072)),
+        ("model.diffusion_model.single_blocks.0.linear1.weight", (768, 768)),
+        ("model.diffusion_model.single_blocks.0.linear2.weight", (768, 768)),
+    ]
+    info2 = _ckpt(flux_keys)
+    det2, decisions2 = _classify_real(flux_keys)
+    plan2 = ConversionPlan(fmt=FORMAT_W4A8, detection=det2, decisions=decisions2,
+                           metadata_quant={}, metadata_ext={}, output_entries=[])
+    stats2 = compression_stats(info2, plan2, det2)
+    assert stats2["quantized_fraction"] == 1.0, stats2
+    assert stats2["failing_k_values"] == []
+    assert low_compression_warning(stats2) is None
+    return ("K%256 gate victims detected (3360, frac<0.5); clean dims pass silently")
 
 
 def _test_detection_safety() -> str:
@@ -6241,6 +6433,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         quant_rows.append(
             f"{d.layer}: {tuple(m.shape)} gs={d.group_size} cgs={d.convrot_groupsize}")
 
+    comp_stats = compression_stats(info, plan, detection)
+    low_comp = low_compression_warning(comp_stats)
+    if low_comp:
+        warnings.append(low_comp)
+
     if args.metadata_only:
         metadata_input_hashes = hash_checkpoint_files(info)
         meta = dict(info.metadata)
@@ -6263,8 +6460,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         report = build_report(info, plan, env, args, detection, None, {}, {},
                               {}, "", time.time() - t_start, warnings, quant_rows)
         _write_reports(args, report)
-        print(f"[dry-run] would write {len(entries)} tensors / {human_bytes(total_out)} "
-              f"to {out_path}; {plan.n_quantized} layers quantized")
+        print_console_summary(
+            out_path=out_path, input_bytes=info.total_bytes,
+            output_bytes=total_out, architecture=detection.architecture,
+            confidence=detection.confidence, n_quantized=plan.n_quantized,
+            n_kept=plan.n_kept, comp=comp_stats, validation=None,
+            elapsed=time.time() - t_start, warnings=warnings,
+            report_path=os.path.abspath(args.report) if args.report else None,
+            dry_run=True)
         return 0
 
     # ---- conversion ----
@@ -6391,6 +6594,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                           summary, input_hashes, output_sha,
                           time.time() - t_start, warnings, quant_rows)
     _write_reports(args, report)
+    print_console_summary(
+        out_path=out_path, input_bytes=info.total_bytes,
+        output_bytes=os.path.getsize(out_path),
+        architecture=detection.architecture, confidence=detection.confidence,
+        n_quantized=plan.n_quantized, n_kept=plan.n_kept, comp=comp_stats,
+        validation=summary, elapsed=time.time() - t_start, warnings=warnings,
+        report_path=os.path.abspath(args.report) if args.report else None,
+        dry_run=False)
 
     # ---- cleanup ----
     if os.path.exists(tmp_path):

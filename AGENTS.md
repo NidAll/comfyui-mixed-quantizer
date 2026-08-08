@@ -13,7 +13,7 @@ accepts only `w4a8` and defaults to it.
 - Repo (public): `https://github.com/NidAll/comfyui-w4a8-quantizer`
   (renamed from `comfyui-wxa8-quantizer`; old URL redirects)
 - Branch: `main`, SSH remote `git@github.com:NidAll/comfyui-w4a8-quantizer.git`
-- Script version: `1.2.2` (`CONVERTER_VERSION` in the script)
+- Script version: `1.2.3` (`CONVERTER_VERSION` in the script)
 
 ## Format facts (verified, do not guess)
 
@@ -47,6 +47,19 @@ fc2 K=1152, Boogu/OmniGen2 layers with K%256 != 0). Do not reintroduce adaptive
 per-layer convrot group sizes (4/16/64): they serialize and validate, but crash
 the CUDA runtime. The CUDA dequant kernel requires weight group sizes in
 {4, 8, 16} or multiples of 16 (this is `group_size`, unrelated to ConvRot).
+
+Real-model dims audit (2026-08-08, HF configs + state-dict headers): krea2
+(6144/16384), ernie_image (4096/12288), qwen_image (3072/12288), zimage
+(3840/10240), ideogram4 (4608/12288), joyimage, mage_flow, kandinsky5, wan
+(5120/13824, 1536/8960), mmdit_sd3, flux/flux2, mochi, ltxv, cosmos,
+hunyuan_video, cogvideox-5b, hidream, hidream_o1, chroma, seedvr2, pixeldit,
+lens, hunyuan3d, aura_flow, cascade-C are all clean. SDXL/SD15/SVD/cascade-B
+lose only the 320/640 low-res blocks (~3%/13%/15% of bytes). AFFECTED real
+models: pixart (hidden 1152), hydit (1408), cogvideox-2b (1920), minimax_h3
+(fc2 K=1152, ~17%), boogu (3360, ~87% passthrough), omnigen2 (2520 fails even
+K%16). Expect low-compression warnings for these. Full table in README.md
+"Real-model dimension audit". Krea2 and Z-Image have official Comfy-Org
+int8_convrot (int8_tensorwise + convrot 256) checkpoints on HF.
 
 ## Architecture registry
 
@@ -110,7 +123,7 @@ pip install --python .venv/bin/python PKG`.
 ## Common commands
 
 ```bash
-.venv/bin/python comfyui_wxa8_quantizer.py --self-test          # 19/19 required
+.venv/bin/python comfyui_wxa8_quantizer.py --self-test          # 20/20 required
 .venv/bin/python comfyui_wxa8_quantizer.py --list-architectures
 .venv/bin/python comfyui_wxa8_quantizer.py MODEL.safetensors --inspect
 .venv/bin/python comfyui_wxa8_quantizer.py MODEL.safetensors \
@@ -141,11 +154,14 @@ small regeneration tests instead of real models.
 
 ## Verification before claiming success
 
-1. `--self-test` must pass 19/19.
+1. `--self-test` must pass 20/20.
 2. Convert affected families from `testdata/make_fixtures.py` with `--validate`;
    max relL2 should be about 0.073 (chunked path about 0.085). Every quantized
    layer in the report must show `cgs=256`; layers with K%256 != 0 must appear as
-   passthrough with "divisible by convrot_groupsize=256" in the reason.
+   passthrough with "divisible by convrot_groupsize=256" in the reason. The
+   report's `-- compression --` section shows the quantized share of
+   policy-targeted 2D bytes; a share below 50% also raises the low-compression
+   warning with the failing K values.
 3. For converter changes, the CI matrix runs self-tests and a fixture
    conversion on ubuntu / windows / macos on every push.
 4. For loader questions, reproduce with the real ComfyUI path:

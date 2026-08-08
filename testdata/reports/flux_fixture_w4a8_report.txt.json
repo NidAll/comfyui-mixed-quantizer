@@ -1,6 +1,6 @@
 {
  "converter": "comfyui_wxa8_quantizer",
- "converter_version": "1.2.2",
+ "converter_version": "1.2.3",
  "format": "asym_w4a8_int8",
  "format_revision": "asym-w4a8-int8-r1",
  "architecture": "flux",
@@ -25,6 +25,14 @@
  "n_input_tensors": 23,
  "n_quantized": 16,
  "n_kept": 7,
+ "compression": {
+  "quantized_2d_layers": 16,
+  "targeted_2d_layers": 16,
+  "quantized_2d_bytes": 143130624,
+  "targeted_2d_bytes": 143130624,
+  "quantized_fraction": 1.0,
+  "failing_k_values": []
+ },
  "quantization_rows": [
   "model.diffusion_model.double_blocks.0.img_attn.proj: (768, 768) gs=16 cgs=256",
   "model.diffusion_model.double_blocks.0.img_attn.qkv: (768, 768) gs=16 cgs=256",
@@ -523,7 +531,7 @@
   {
    "name": "output-hash",
    "status": "passed",
-   "detail": "sha256=0792600dd6c86ce57cb04fb8375a4d9012fdbb5c391fb9ff567b8d6bc2f3a08e",
+   "detail": "sha256=9d2d8ec39ebe51aee8e306bdfe28633e294b4c0ab18e7d1e2d6e65ccf9241b0a",
    "reason": ""
   },
   {
@@ -555,9 +563,9 @@
  "input_hashes": {
   "testdata/flux_fixture.safetensors": "80ffa1bcc38f9c9469a4509987ab83dd5334ed591a479136cd10b6933db083cb"
  },
- "output_sha256": "0792600dd6c86ce57cb04fb8375a4d9012fdbb5c391fb9ff567b8d6bc2f3a08e",
- "elapsed_seconds": 14.925,
- "peak_rss_bytes": 1077006336,
+ "output_sha256": "9d2d8ec39ebe51aee8e306bdfe28633e294b4c0ab18e7d1e2d6e65ccf9241b0a",
+ "elapsed_seconds": 16.546,
+ "peak_rss_bytes": 1077882880,
  "environment": {
   "python": "3.11.15",
   "torch_version": "2.13.0+cu130",

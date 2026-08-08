@@ -230,7 +230,7 @@ with the runtime status of each family.
 
 ## Compatibility matrix
 
-Fixture rows were rerun with `comfyui_wxa8_quantizer.py 1.2.2` on torch 2.13.0 /
+Fixture rows were rerun with `comfyui_wxa8_quantizer.py 1.2.3` on torch 2.13.0 /
 safetensors 0.8.0 using CPU quantization. Since 1.2.2 the converter only emits
 W4A8 layers with `convrot_groupsize = 256` (the comfy-kitchen CUDA fused kernels
 implement ConvRot 256 only); 2D linears whose K is not divisible by 256 pass
@@ -262,6 +262,50 @@ when `--validate` was used).
 | (runtime) | real ComfyUI v0.30.0 + loader patch + comfy-kitchen 0.2.27 load | zimage + minimax_h3 outputs | pass (QuantizedTensor, AsymW4A8Int8Layout) | - |
 | (input form) | sharded directory | hydit fixture split in 2 shards | pass | 0.0728 |
 | (input form) | bounded-memory chunked path (32 MiB budget) | Wan + MiniMax H3 fixtures | pass | 0.0729 |
+
+### Real-model dimension audit (ConvRot-256 gate)
+
+Verified 2026-08-08 against real checkpoint configs and safetensors headers
+(HuggingFace, no downloads) plus the ComfyUI model code. W4A8 requires
+`K % 256 == 0` on every quantized layer; the table shows what the real
+architectures actually do.
+
+| family | real dims (hidden / FFN / context) | gate verdict |
+|---|---|---|
+| krea2 | 6144 / 16384 / 2560 | clean (263/265 layers, 0% of bytes fail) |
+| ernie_image | 4096 / 12288 / 3072 | clean (258/258) |
+| qwen_image | 3072 / 12288 / 3584 | clean (842/843, only img_in K=64) |
+| lumina2 / zimage | 3840 / 10240 | clean (170/170 on the real Z-Image Turbo) |
+| flux / flux2 | 3072 / 9216-12288 | clean |
+| ideogram4 | 4608 / 12288 / 53248 | clean |
+| joyimage | 3072 / 12288 / 4096 | clean |
+| mage_flow | 3072 / 12288 / 2560 | clean |
+| kandinsky5 | 1792 / 7168 | clean (Image variant 2560) |
+| wan 2.1 / 2.2 | 14B: 5120 / 13824; 1.3B: 1536 / 8960 | clean |
+| mmdit_sd3 | 1536-2048 / 6144-8192 | clean |
+| mochi / ltxv / cosmos | 3072/2048/768 class | clean |
+| hunyuan_video / hunyuanimage21 | 3072 / 12288 | clean |
+| cogvideox-5b | 3072 / 12288 | clean (2b is affected, below) |
+| hidream / hidream_o1 | 2560 / 10240; 4096 / 12288 | clean |
+| chroma / seedvr2 / pixeldit / lens | 3072 / 2560-5120 / 1536 | clean |
+| hunyuan3d / aura_flow / cascade C | 1024 / 3072 / 2048 | clean |
+| sdxl / sd15 / svd / cascade B | 320/640 low-res blocks | mostly clean: ~97%/87%/85% of transformer bytes still quantize; only the 320/640 blocks pass through |
+| ace_step | 1536 / 4096 | clean (one tiny 1152 embedder passes) |
+| **pixart** | **1152** / 4608 | **affected**: attn1 qkv/proj and mlp fc1 pass through (~55% of linear bytes) |
+| **hydit** | **1408** / 5632 | **affected**: attn qkv/proj and fc1 pass through (~50%) |
+| **cogvideox-2b** | **1920** / 7680 | **affected**: all attention and ff.net.0 pass through (~5/6) |
+| **minimax_h3** | 768 / fc2 K=1152 | **affected**: mlp.fc2 per block passes through (~17%) |
+| **boogu** | **3360** / 13568 | **affected**: only feed_forward.linear_2 quantizes (13%, ~16 GB output on the real model) |
+| **omnigen2** | **2520** (fails K%16) | **affected**: only feed_forward.linear_2 quantizes |
+
+Krea-2 and Z-Image additionally have official Comfy-Org `int8_convrot`
+checkpoints on HuggingFace using `{"format": "int8_tensorwise", "convrot":
+true, "convrot_groupsize": 256}`, which is independent confirmation that
+those architectures are ConvRot-256 compatible.
+
+When a conversion quantizes less than 50% of its policy-targeted 2D linear
+bytes, the converter prints a low-compression warning with the failing K
+values and records the breakdown in the report (see `compression`).
 
 ### Feature tests (executed)
 
