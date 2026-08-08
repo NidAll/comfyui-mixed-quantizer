@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""comfyui_wxa8_quantizer.py -- standalone W4A8 generative-model checkpoint converter.
+"""comfyui_wxa8_quantizer.py -- standalone ComfyUI-native checkpoint quantizer.
 
 Converts supported generative-model checkpoints (safetensors / sharded safetensors /
 HF-style model directories / optionally torch pickles with --trust-pickle) into a
-ComfyUI-compatible W4A8 ("asym_w4a8_int8") checkpoint.
+ComfyUI-compatible quantized checkpoint. The default mode produces W4A8
+("asym_w4a8_int8"). The experimental mixed mode (--format mixed) selects per
+layer between convrot_w4a4 / asym_w4a8_int8 / int8_tensorwise under quality
+gates; see AGENTS.md on the experimental/mixed-precision branch.
 
 This utility is fully standalone.  It does not import, require, or execute any
 ComfyUI / comfy-kitchen / ComfyUI-custom-node code at runtime.  Every inspection,
@@ -175,8 +178,39 @@ except Exception as _exc:  # pragma: no cover - import guard
 # Version / revision constants (research record; see module docstring)
 # ---------------------------------------------------------------------------
 CONVERTER_NAME = "comfyui_wxa8_quantizer"
-CONVERTER_VERSION = "1.3.0"
+CONVERTER_VERSION = "1.4.0-experimental"
 FORMAT_W4A8 = "asym_w4a8_int8"
+
+# Mixed-precision mode (experimental branch): per-layer format selection from
+# the ComfyUI-native formats convrot_w4a4 / asym_w4a8_int8 / int8_tensorwise.
+# Serialized layouts and metadata follow the ComfyUI loader contracts exactly
+# (comfy/ops.py layer_conf parsing), never a custom format name.
+FORMAT_MIXED = "mixed"
+FORMAT_W4A4 = "convrot_w4a4"
+FORMAT_INT8 = "int8_tensorwise"
+MIXED_FORMATS = (FORMAT_W4A8, FORMAT_W4A4, FORMAT_INT8)
+
+# W4A4 runtime contract: the int4 MMA kernels (comfy-kitchen, nunchaku lineage)
+# pin quant_group_size to 64 and the signed quantizer emission range to [-7, 7]
+# with rowwise absmax scales stored as fp32 [N]. convrot_groupsize is read from
+# metadata and must be a power of 4 that divides K.
+W4A4_QUANT_GROUP_SIZE = 64
+W4A4_EMISSION_MAX = 7
+W4A4_LINEAR_DTYPE = "int8"          # execution variant: "int4" or "int8"
+
+# INT8 rowwise contract: signed int8 [N, K] + fp32 per-row scale [N]
+# (dynamic rowwise activation quantization at runtime, symmetric).
+INT8_SCALE_MAX = 127
+
+# Validation recon bounds per format (weight-only relL2 against the source).
+# W4A8 uses the architecture policy bound; W4A4's symmetric rowwise int4 is
+# intrinsically ~2x noisier than the W4A8 codebook path (measured 0.14 vs
+# 0.07 on identical weights), and rowwise INT8 is ~10x cleaner.
+W4A4_MAX_REL_L2 = 0.20
+INT8_MAX_REL_L2 = 0.05
+
+MIXED_PROFILES = ("auto", "balanced", "conservative", "size-first")
+FORMAT_MIXED_REVISION = "mixed-r1"
 
 # comfy-kitchen 0.2.27 CUDA fused kernels implement ConvRot only for a 256-wide
 # Hadamard group (int8_linear.cu: "convrot fused kernel only supports group_size
@@ -1398,6 +1432,132 @@ def unpack_w4(packed: torch.Tensor) -> torch.Tensor:
     out[:, 0::2] = p & 0xF
     out[:, 1::2] = (p >> 4) & 0xF
     return out
+def unpack_int4_signed(packed: torch.Tensor) -> torch.Tensor:
+    """int8 [N, K/2] packed int4 -> int8 codes [N, K] with SIGNED nibble
+    interpretation (even column = low nibble). Mirrors comfy-kitchen
+    `_unpack_int4_row_major`; used by the W4A4 dequantization path."""
+    n, k_half = packed.shape
+    p = packed.to(torch.int32) & 0xFF
+    lo = p & 0xF
+    hi = (p >> 4) & 0xF
+    lo = torch.where(lo >= 8, lo - 16, lo)
+    hi = torch.where(hi >= 8, hi - 16, hi)
+    out = torch.empty(n, k_half * 2, dtype=torch.int8, device=packed.device)
+    out[:, 0::2] = lo.to(torch.int8)
+    out[:, 1::2] = hi.to(torch.int8)
+    return out
+
+
+def quantize_int8_tensorwise_weight(
+        weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Rowwise symmetric INT8 (int8_tensorwise, no ConvRot).
+
+    Serialized contract (matches ComfyUI TensorWiseINT8Layout + the Comfy-Org
+    int8_convrot checkpoint family): `weight` int8 [N, K], `weight_scale`
+    fp32 [N]. Runtime applies dynamic rowwise int8 activation quantization.
+    Works for any K (no divisibility requirement), which is why it is the
+    universal fallback tier in mixed mode.
+    """
+    abs_max = weight.abs().amax(dim=-1, keepdim=True)
+    scale = (abs_max.float() / float(INT8_SCALE_MAX)).clamp(min=1e-30)
+    q = (weight / scale).round().clamp_(-128.0, 127.0).to(torch.int8)
+    # scale is stored [N, 1] so both the eager dequant (q.float() * scale) and
+    # the CUDA int8_linear paths broadcast correctly on every backend
+    return q.contiguous(), scale.contiguous().to(torch.float32)
+
+
+def dequantize_int8_tensorwise_weight(
+        q: torch.Tensor, scale: torch.Tensor,
+        output_dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    s = scale.to(device=q.device, dtype=torch.float32)
+    w = q.float() * s.reshape(-1, 1)
+    return w.to(output_dtype)
+
+
+def quantize_w4a4_weight(weight: torch.Tensor,
+                         convrot_groupsize: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """ConvRot W4A4 quantization, byte-identical to comfy-kitchen's eager
+    `quantize_convrot_w4a4_weight`: regular-Hadamard weight rotation, rowwise
+    symmetric signed int4 with absmax scale = max/7, emission range [-7, 7],
+    packed int4 low=even nibble. Returns (packed int8 [N, K/2], scale fp32 [N])."""
+    h = build_hadamard(convrot_groupsize, device=weight.device, dtype=weight.dtype)
+    rot = rotate_weight(weight, h, convrot_groupsize)
+    abs_max = rot.abs().amax(dim=-1, keepdim=True).clamp(min=1e-10)
+    scale = abs_max / float(W4A4_EMISSION_MAX)
+    q = (rot / scale).round().clamp_(-float(W4A4_EMISSION_MAX),
+                                     float(W4A4_EMISSION_MAX)).to(torch.int8)
+    packed = ((q[:, 0::2] & 0xF) | ((q[:, 1::2] & 0xF) << 4)).to(torch.int8).contiguous()
+    return packed, scale.reshape(-1).contiguous().to(torch.float32)
+
+
+def dequantize_w4a4_weight(packed: torch.Tensor, scale: torch.Tensor,
+                           convrot_groupsize: int,
+                           output_dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """Inverse of quantize_w4a4_weight (matches comfy-kitchen eager dequant)."""
+    w_int = unpack_int4_signed(packed).float()
+    w_rot = w_int * scale.to(device=packed.device, dtype=torch.float32).reshape(-1, 1)
+    h = build_hadamard(convrot_groupsize, device=packed.device, dtype=torch.float32)
+    return rotate_weight(w_rot.float(), h, convrot_groupsize).to(output_dtype)
+
+
+def _pick_w4a4_convrot_group(k: int) -> int:
+    """Largest power of 4 in {16, 64, 256} dividing K (kernel-supported set)."""
+    for cgs in (256, 64, 16):
+        if k % cgs == 0:
+            return cgs
+    raise PolicyError(f"K={k} has no ConvRot-W4A4 group in {{16, 64, 256}}")
+
+
+def w4a4_weight_is_quantizable(shape: Sequence[int], dtype: torch.dtype,
+                               convrot_groupsize: Optional[int] = None
+                               ) -> Tuple[bool, str]:
+    """W4A4 eligibility: 2D float, K % 64 == 0 (kernel contract), K % cgs == 0."""
+    if len(shape) != 2:
+        return False, "not 2D"
+    if dtype not in FLOAT_DTYPES:
+        return False, f"dtype {dtype} not float"
+    k = int(shape[1])
+    if k % W4A4_QUANT_GROUP_SIZE != 0:
+        return False, f"K={k} not divisible by quant_group_size {W4A4_QUANT_GROUP_SIZE}"
+    if convrot_groupsize is None:
+        try:
+            convrot_groupsize = _pick_w4a4_convrot_group(k)
+        except PolicyError:
+            return False, f"K={k} has no supported ConvRot group"
+    if k % convrot_groupsize != 0:
+        return False, f"K={k} not divisible by convrot_groupsize {convrot_groupsize}"
+    return True, ""
+
+
+def int8_weight_is_quantizable(shape: Sequence[int], dtype: torch.dtype
+                               ) -> Tuple[bool, str]:
+    if len(shape) != 2:
+        return False, "not 2D"
+    if dtype not in FLOAT_DTYPES:
+        return False, f"dtype {dtype} not float"
+    return True, ""
+
+
+def quantized_format_bytes(n: int, k: int, fmt: str) -> int:
+    """Exact serialized byte count of the per-layer format payloads."""
+    if fmt == FORMAT_W4A8:
+        return n * (k // 2) + n * (k // 16) + n * 4 + 16 * 4
+    if fmt == FORMAT_W4A4:
+        return n * (k // 2) + n * 4
+    if fmt == FORMAT_INT8:
+        return n * k + n * 4
+    raise PolicyError(f"unknown format {fmt!r}")
+
+
+def format_scale_suffixes(fmt: str) -> Tuple[str, ...]:
+    """Output suffixes per format ('' = the packed weight slot)."""
+    if fmt == FORMAT_W4A8:
+        return ("", "_s_rel", "_s_channel", "_codebook")
+    if fmt in (FORMAT_W4A4, FORMAT_INT8):
+        return ("", "_scale")
+    raise PolicyError(f"unknown format {fmt!r}")
+
+
 
 
 def dequantize_w4a8_weight(packed: torch.Tensor, s_rel: torch.Tensor,
@@ -1446,27 +1606,39 @@ def quantize_weight_by_format(weight: torch.Tensor, fmt: str, group_size: int,
     """Quantize with the W4A8 layout; returns the per-layer output tensors
     keyed by suffix ('' for the packed weight, '_s_rel', '_s_channel',
     '_codebook', optional '_correction')."""
-    if fmt != FORMAT_W4A8:
-        raise PolicyError(f"unknown quantization format {fmt!r}")
-    packed, s_rel, s_ch, corr, cb = quantize_w4a8_weight(
-        weight, group_size=group_size, convrot_groupsize=convrot_groupsize,
-        symmetric=True, scale_dtype=torch.float8_e4m3fn, codebook=True)
-    out = {"": packed, "_s_rel": s_rel, "_s_channel": s_ch, "_codebook": cb}
-    if corr is not None:
-        out["_correction"] = corr
-    return out
+    if fmt == FORMAT_W4A8:
+        packed, s_rel, s_ch, corr, cb = quantize_w4a8_weight(
+            weight, group_size=group_size, convrot_groupsize=convrot_groupsize,
+            symmetric=True, scale_dtype=torch.float8_e4m3fn, codebook=True)
+        out = {"": packed, "_s_rel": s_rel, "_s_channel": s_ch, "_codebook": cb}
+        if corr is not None:
+            out["_correction"] = corr
+        return out
+    if fmt == FORMAT_INT8:
+        q, scale = quantize_int8_tensorwise_weight(weight)
+        return {"": q, "_scale": scale}
+    if fmt == FORMAT_W4A4:
+        packed, scale = quantize_w4a4_weight(weight, convrot_groupsize)
+        return {"": packed, "_scale": scale}
+    raise PolicyError(f"unknown quantization format {fmt!r}")
 
 
 def dequantize_weight_by_format(tensors: Dict[str, torch.Tensor], fmt: str,
                                 group_size: int, convrot_groupsize: int,
                                 output_dtype: torch.dtype) -> torch.Tensor:
-    if fmt != FORMAT_W4A8:
-        raise PolicyError(f"unknown quantization format {fmt!r}")
-    return dequantize_w4a8_weight(
-        tensors[""], tensors["_s_rel"], tensors["_s_channel"],
-        codebook=tensors.get("_codebook"), correction=tensors.get("_correction"),
-        group_size=group_size, convrot_groupsize=convrot_groupsize,
-        output_dtype=output_dtype)
+    if fmt == FORMAT_W4A8:
+        return dequantize_w4a8_weight(
+            tensors[""], tensors["_s_rel"], tensors["_s_channel"],
+            codebook=tensors.get("_codebook"), correction=tensors.get("_correction"),
+            group_size=group_size, convrot_groupsize=convrot_groupsize,
+            output_dtype=output_dtype)
+    if fmt == FORMAT_INT8:
+        return dequantize_int8_tensorwise_weight(tensors[""], tensors["_scale"],
+                                                 output_dtype)
+    if fmt == FORMAT_W4A4:
+        return dequantize_w4a4_weight(tensors[""], tensors["_scale"],
+                                      convrot_groupsize, output_dtype)
+    raise PolicyError(f"unknown quantization format {fmt!r}")
 
 
 
@@ -2663,6 +2835,7 @@ class TensorDecision:
     layer: Optional[str] = None    # layer name (key minus ".weight") when quantized
     group_size: int = 16
     convrot_groupsize: int = 256
+    format: str = FORMAT_W4A8      # per-layer format (mixed mode)
     out_dtype: Optional[torch.dtype] = None   # passthrough cast target (if any)
     quantized: bool = False        # True once actually quantized
 
@@ -2682,6 +2855,7 @@ class ConversionPlan:
     device: str = "cpu"
     chunked_layers: set = field(default_factory=set)   # layers quantized via the
                                                        # bounded-memory chunked path
+    mixed_plan: Optional[Dict[str, Any]] = None        # mixed-planner summary
 
     def quantized_layers(self) -> List[TensorDecision]:
         return [d for d in self.decisions if d.kind == DecisionKind.QUANTIZE]
@@ -2758,15 +2932,27 @@ def classify_tensors(info: CheckpointInfo, detection: DetectionResult,
                                             f"not in {policy.family} quantize set; passthrough"))
             continue
 
-        # shape / dtype gates. ConvRot is always 256-wide: the comfy-kitchen
-        # 0.2.27 CUDA fused kernels throw unless convrot_groupsize == 256, so
-        # layers whose K is not divisible by 256 pass through at original
-        # precision (they cannot run on the CUDA runtime with a smaller group).
-        ok, why = w4_weight_is_quantizable(meta.shape, meta.dtype, group_size,
-                                           W4A8_CONVROT_GROUPSIZE)
-        if not ok:
-            decisions.append(TensorDecision(name, DecisionKind.KEEP, f"not quantizable: {why}; passthrough"))
-            continue
+        # shape / dtype gates. W4A8 ConvRot is always 256-wide: the
+        # comfy-kitchen 0.2.27 CUDA fused kernels throw unless
+        # convrot_groupsize == 256, so in w4a8 mode layers whose K is not
+        # divisible by 256 pass through. Mixed mode instead keeps every 2D
+        # float linear as a candidate and lets the planner pick per-layer
+        # formats (W4A4 when K % 64 == 0, W4A8 when K % 256 == 0, INT8 for
+        # any K), so dimension-incompatible layers stay quantizable.
+        if fmt == FORMAT_W4A8:
+            ok, why = w4_weight_is_quantizable(meta.shape, meta.dtype, group_size,
+                                               W4A8_CONVROT_GROUPSIZE)
+            if not ok:
+                decisions.append(TensorDecision(name, DecisionKind.KEEP,
+                                                f"not quantizable: {why}; passthrough"))
+                continue
+        elif fmt == FORMAT_MIXED:
+            if len(meta.shape) != 2 or meta.dtype not in FLOAT_DTYPES:
+                decisions.append(TensorDecision(name, DecisionKind.KEEP,
+                                                "not a 2D float weight; passthrough"))
+                continue
+        else:
+            raise PolicyError(f"unknown quantization format {fmt!r}")
         if meta.nbytes < min_numel * meta.dtype.itemsize:
             decisions.append(TensorDecision(name, DecisionKind.KEEP,
                                             f"small tensor (<{min_numel} elements); passthrough"))
@@ -2775,7 +2961,8 @@ def classify_tensors(info: CheckpointInfo, detection: DetectionResult,
             name, DecisionKind.QUANTIZE,
             "user-forced via --include" if user_forced else "policy candidate",
             layer=layer, group_size=group_size,
-            convrot_groupsize=W4A8_CONVROT_GROUPSIZE))
+            convrot_groupsize=W4A8_CONVROT_GROUPSIZE,
+            format=fmt))
 
     return decisions
 
@@ -2786,7 +2973,7 @@ def build_output_entries(info: CheckpointInfo, decisions: List[TensorDecision],
     """Compute the exact output tensor inventory (name, dtype, shape, nbytes)
     in deterministic write order: quantized layers first (original weight slot),
     then passthrough tensors in input order."""
-    if fmt != FORMAT_W4A8:
+    if fmt not in (FORMAT_W4A8, FORMAT_MIXED):
         raise PolicyError(f"unknown quantization format {fmt!r}")
     entries: List[Dict[str, Any]] = []
     total = 0
@@ -2796,15 +2983,25 @@ def build_output_entries(info: CheckpointInfo, decisions: List[TensorDecision],
             layer = d.layer
             meta = info.by_name(d.name)
             n, k = int(meta.shape[0]), int(meta.shape[1])
-            q_shape = (n, k // 2)
-            groups = k // d.group_size
             base = f"{layer}.weight"
-            extras = [
-                (f"{layer}.weight_s_rel", torch.float8_e4m3fn, (n, groups)),
-                (f"{layer}.weight_s_channel", torch.float32, (n,)),
-                (f"{layer}.weight_codebook", torch.float32, (16,)),
-            ]
-            for ename, edtype, eshape in [(base, torch.int8, q_shape)] + extras:
+            if d.format == FORMAT_W4A8:
+                groups = k // d.group_size
+                extras = [
+                    (f"{layer}.weight_s_rel", torch.float8_e4m3fn, (n, groups)),
+                    (f"{layer}.weight_s_channel", torch.float32, (n,)),
+                    (f"{layer}.weight_codebook", torch.float32, (16,)),
+                ]
+                payload = [(base, torch.int8, (n, k // 2))] + extras
+            elif d.format == FORMAT_W4A4:
+                payload = [(base, torch.int8, (n, k // 2)),
+                           (f"{layer}.weight_scale", torch.float32, (n,))]
+            elif d.format == FORMAT_INT8:
+                payload = [(base, torch.int8, (n, k)),
+                           (f"{layer}.weight_scale", torch.float32, (n, 1))]
+            else:
+                raise PolicyError(
+                    f"unknown per-layer format {d.format!r} for {d.name!r}")
+            for ename, edtype, eshape in payload:
                 if ename in seen:
                     raise PolicyError(f"duplicate output tensor {ename!r}")
                 seen.add(ename)
@@ -3547,6 +3744,24 @@ def quantize_tensor_bounded(reader: CheckpointReader, name: str, fmt: str,
     log().info("chunked quantization for %s (%s > budget %s)",
                name, human_bytes(full_bytes), human_bytes(max_mem))
     chunk_rows = _chunk_rows_for_budget(k, n, max_mem)
+    if fmt != FORMAT_W4A8:
+        # rowwise formats chunk exactly: no codebook, no cross-row state
+        parts: Dict[str, List[torch.Tensor]] = {
+            s: [] for s in format_scale_suffixes(fmt)}
+        for r0 in range(0, n, chunk_rows):
+            r1 = min(n, r0 + chunk_rows)
+            chunk = reader.read_tensor(name)[r0:r1]
+            if compute_dtype is not None and chunk.dtype not in FP8_DTYPES:
+                chunk = chunk.to(compute_dtype)
+            if device.type == "cuda":
+                chunk = chunk.to(device)
+            part = quantize_weight_by_format(chunk, fmt, group_size,
+                                             convrot_groupsize)
+            for s in parts:
+                t = part[s]
+                parts[s].append(t.cpu() if device.type != "cpu" else t)
+            del chunk, part
+        return {s: torch.cat(v, dim=0).contiguous() for s, v in parts.items()}
     sample_size = _codebook_sample_size(max_mem, n * k)
     codebook = _gather_codebook_samples(reader, name, k, group_size,
                                         convrot_groupsize, sample_size, chunk_rows,
@@ -3708,6 +3923,319 @@ def apply_sensitivity_prepass(info: CheckpointInfo,
                 decision.kind = DecisionKind.KEEP_PRECISION
                 decision.reason = f"sensitivity fallback: {reason}"
 
+# ---------------------------------------------------------------------------
+# Mixed-precision planner (experimental branch)
+# ---------------------------------------------------------------------------
+# Per-layer format selection over the ComfyUI-native formats:
+#   W4A4 (convrot_w4a4, K % 64 == 0)  -> smallest, worst weight fidelity
+#   W4A8 (asym_w4a8_int8, K % 256 == 0) -> 4-bit weights, best 4-bit fidelity
+#   INT8 (int8_tensorwise, any K)     -> 8-bit rowwise, universal fallback
+#   BF16/FP16                         -> policy-protected or gate-failing layers
+# Selection is "cheapest acceptable" per layer under a per-layer error gate,
+# followed by a greedy global promotion loop (best quality gain per extra byte)
+# until the mean error gate passes. Quality metric: activation-aware relL2 when
+# calibration activations exist, weight-only relL2 otherwise.
+
+@dataclass(frozen=True)
+class MixedProfile:
+    name: str
+    layer_gate: float            # per-layer error gate (relL2 fraction)
+    global_gate: float           # mean error gate over selected layers
+    compression_target_bpp: float  # bytes/parameter target for quantized linear bytes
+    max_bf16_fraction: float     # max bf16 share of targeted linear bytes
+
+
+MIXED_PROFILE_DEFAULTS = {
+    # Gate defaults are set against the measured W4A8 reference: weight-only
+    # relL2 of the codebook path is ~0.073 on real dims, so a balanced profile
+    # keeps W4A8 as the workhorse (global gate just above 0.073), conservative
+    # forces promotion toward INT8 (gate below it), and size-first admits the
+    # ~0.14 W4A4 error for layers that can take it (per-layer gate 0.15).
+    "balanced": MixedProfile("balanced", 0.10, 0.080, 0.80, 0.05),
+    "conservative": MixedProfile("conservative", 0.05, 0.040, 0.90, 0.02),
+    "size-first": MixedProfile("size-first", 0.15, 0.100, 0.70, 0.10),
+}
+
+
+@dataclass
+class CandidateResult:
+    format: str
+    eligible: bool
+    reason: str = ""
+    estimated_bytes: int = 0
+    weight_rel_l2: Optional[float] = None
+    act_rel_l2: Optional[float] = None
+
+
+class MixedPlanner:
+    """Evaluate per-format candidates, select cheapest acceptable per layer,
+    then promote greedily until the global mean error gate passes."""
+
+    def __init__(self, profile_name: str,
+                 calibration: Optional[CalibrationStats],
+                 max_mem: int, device: torch.device,
+                 compute_dtype: Optional[torch.dtype],
+                 disabled_formats: Sequence[str] = (),
+                 layer_gate: Optional[float] = None,
+                 global_gate: Optional[float] = None):
+        if profile_name not in MIXED_PROFILE_DEFAULTS:
+            raise PolicyError(f"unknown mixed profile {profile_name!r}")
+        self.profile = MIXED_PROFILE_DEFAULTS[profile_name]
+        self.calibration = calibration
+        self.max_mem = max_mem
+        self.device = device
+        self.compute_dtype = compute_dtype
+        self.disabled = set(disabled_formats)
+        self.layer_gate = (layer_gate if layer_gate is not None
+                           else self.profile.layer_gate)
+        self.global_gate = (global_gate if global_gate is not None
+                            else self.profile.global_gate)
+        self.candidates: Dict[str, Dict[str, CandidateResult]] = {}
+        self.promotions: List[str] = []
+        self.summary: Dict[str, Any] = {}
+
+    # -- eligibility -------------------------------------------------------
+    def eligible_formats(self, meta: TensorMeta) -> List[str]:
+        if len(meta.shape) != 2 or meta.dtype not in FLOAT_DTYPES:
+            return []
+        k = int(meta.shape[1])
+        out: List[str] = []
+        if k % 256 == 0:
+            out.append(FORMAT_W4A8)
+        if k % W4A4_QUANT_GROUP_SIZE == 0:
+            try:
+                _pick_w4a4_convrot_group(k)
+                out.append(FORMAT_W4A4)
+            except PolicyError:
+                pass
+        out.append(FORMAT_INT8)
+        return [f for f in out if f not in self.disabled]
+
+    def cgs_for(self, k: int, fmt: str) -> int:
+        if fmt == FORMAT_W4A4:
+            return _pick_w4a4_convrot_group(k)
+        return W4A8_CONVROT_GROUPSIZE
+
+    # -- evaluation --------------------------------------------------------
+    def _activations(self, name: str) -> Optional[torch.Tensor]:
+        if self.calibration is None:
+            return None
+        for key in (name, name[:-len(".weight")]):
+            stats = self.calibration.layers.get(key)
+            if stats is not None:
+                return stats["samples"]
+        return None
+
+    def _evaluate_format(self, reader: CheckpointReader, d: TensorDecision,
+                         fmt: str) -> TensorMetrics:
+        meta = reader.info.by_name(d.name)
+        if meta is None:
+            raise PolicyError(f"planner references missing tensor {d.name!r}")
+        cgs = self.cgs_for(int(meta.shape[1]), fmt)
+        activations = self._activations(d.name)
+        if _quant_work_bytes(meta) <= self.max_mem:
+            w = reader.read_tensor(d.name)
+            if self.compute_dtype is not None and w.dtype not in FP8_DTYPES:
+                w = w.to(self.compute_dtype)
+            if self.device.type == "cuda":
+                w = w.to(self.device)
+            try:
+                q = quantize_weight_by_format(w, fmt, d.group_size, cgs)
+                dq = dequantize_weight_by_format(q, fmt, d.group_size, cgs,
+                                                 torch.float32)
+                metrics = compute_weight_metrics(w.float().cpu(), dq.cpu())
+                if activations is not None:
+                    metrics.act_rel_l2 = activation_aware_error(
+                        w.cpu(), dq.cpu(), activations)
+            finally:
+                del w
+            return metrics
+        # bounded-memory chunked path (rowwise formats chunk exactly; w4a8 uses
+        # the pre-fit codebook row chunks, identical to the reference path)
+        n, k = int(meta.shape[0]), int(meta.shape[1])
+        chunk_rows = _chunk_rows_for_budget(k, n, self.max_mem)
+        acc = _MetricAccumulator(d.name)
+        if fmt == FORMAT_W4A8:
+            sample_size = _codebook_sample_size(self.max_mem, n * k)
+            codebook = _gather_codebook_samples(
+                reader, d.name, k, d.group_size, cgs, sample_size, chunk_rows,
+                compute_dtype=self.compute_dtype)
+            for r0 in range(0, n, chunk_rows):
+                r1 = min(n, r0 + chunk_rows)
+                q = _quantize_row_chunk(reader, d.name, r0, r1, d.group_size,
+                                        cgs, codebook, self.device,
+                                        self.compute_dtype)
+                dq = dequantize_weight_by_format(q, FORMAT_W4A8, d.group_size,
+                                                 cgs, torch.float32)
+                acc.update(reader.read_tensor(d.name)[r0:r1], dq, activations)
+                del q, dq
+        else:
+            for r0 in range(0, n, chunk_rows):
+                r1 = min(n, r0 + chunk_rows)
+                chunk = reader.read_tensor(d.name)[r0:r1]
+                if self.compute_dtype is not None and chunk.dtype not in FP8_DTYPES:
+                    chunk = chunk.to(self.compute_dtype)
+                if self.device.type == "cuda":
+                    chunk = chunk.to(self.device)
+                q = quantize_weight_by_format(chunk, fmt, d.group_size, cgs)
+                dq = dequantize_weight_by_format(q, fmt, d.group_size, cgs,
+                                                 torch.float32)
+                acc.update(chunk.cpu().float(), dq.cpu(), activations)
+                del chunk, q, dq
+        return acc.finish()
+
+    # -- planning ----------------------------------------------------------
+    def plan(self, info: CheckpointInfo,
+             decisions: List[TensorDecision]) -> Dict[str, Any]:
+        with CheckpointReader(info) as reader:
+            for d in decisions:
+                if d.kind != DecisionKind.QUANTIZE:
+                    continue
+                meta = info.by_name(d.name)
+                if meta is None:
+                    raise PolicyError(
+                        f"mixed planner references missing tensor {d.name!r}")
+                n, k = int(meta.shape[0]), int(meta.shape[1])
+                cands: Dict[str, CandidateResult] = {}
+                for fmt in self.eligible_formats(meta):
+                    cand = CandidateResult(
+                        format=fmt, eligible=True,
+                        estimated_bytes=quantized_format_bytes(n, k, fmt))
+                    metrics = self._evaluate_format(reader, d, fmt)
+                    cand.weight_rel_l2 = metrics.rel_l2
+                    cand.act_rel_l2 = metrics.act_rel_l2
+                    cands[fmt] = cand
+                if not cands:
+                    cands[FORMAT_INT8] = CandidateResult(
+                        format=FORMAT_INT8, eligible=False,
+                        reason="disabled formats leave no candidate")
+                self.candidates[d.name] = cands
+
+        selected, kept = self.select(info, decisions)
+        promoted = self.promote(info, decisions) if self.global_gate is not None else []
+        self.summary = self._summarize(info, decisions)
+        self.summary.update({
+            "selected": selected, "kept": kept, "promotions": promoted,
+        })
+        return self.summary
+
+    def _error_of(self, cand: CandidateResult) -> Optional[float]:
+        if cand is None:
+            return None
+        return (cand.act_rel_l2 if cand.act_rel_l2 is not None
+                else cand.weight_rel_l2)
+
+    def select(self, info: CheckpointInfo,
+               decisions: List[TensorDecision]) -> Tuple[int, int]:
+        selected = 0
+        kept = 0
+        for d in decisions:
+            if d.kind != DecisionKind.QUANTIZE:
+                continue
+            cands = self.candidates.get(d.name, {})
+            ordered = sorted(
+                (c for c in cands.values() if c.eligible),
+                key=lambda c: (c.estimated_bytes,
+                                c.format != FORMAT_INT8))
+            chosen = None
+            for cand in ordered:
+                err = self._error_of(cand)
+                if err is not None and err <= self.layer_gate:
+                    chosen = cand
+                    break
+            if chosen is None:
+                d.kind = DecisionKind.KEEP_PRECISION
+                d.reason = ("mixed planner: no candidate within quality gate "
+                            f"(gate {self.layer_gate})")
+                kept += 1
+                continue
+            meta = info.by_name(d.name)
+            d.format = chosen.format
+            d.convrot_groupsize = self.cgs_for(int(meta.shape[1]), chosen.format)
+            d.reason = f"mixed planner: {chosen.format}"
+            selected += 1
+        return selected, kept
+
+    def global_mean_error(self, decisions: List[TensorDecision]) -> Optional[float]:
+        errors: List[float] = []
+        for d in decisions:
+            if d.kind != DecisionKind.QUANTIZE:
+                continue
+            cand = self.candidates.get(d.name, {}).get(d.format)
+            err = self._error_of(cand)
+            if err is not None:
+                errors.append(err)
+        if not errors:
+            return None
+        return sum(errors) / len(errors)
+
+    def promote(self, info: CheckpointInfo,
+                decisions: List[TensorDecision]) -> List[str]:
+        """Greedy: repeatedly promote the layer with the best error reduction
+        per extra byte until the global mean gate passes or no promotion helps."""
+        while True:
+            mean = self.global_mean_error(decisions)
+            if mean is None or mean <= self.global_gate:
+                break
+            best: Optional[Tuple[float, TensorDecision, CandidateResult]] = None
+            for d in decisions:
+                if d.kind != DecisionKind.QUANTIZE:
+                    continue
+                meta = info.by_name(d.name)
+                n, k = int(meta.shape[0]), int(meta.shape[1])
+                cur = self.candidates.get(d.name, {}).get(d.format)
+                cur_err = self._error_of(cur)
+                if cur_err is None:
+                    continue
+                cur_bytes = quantized_format_bytes(n, k, d.format)
+                for fmt, cand in self.candidates.get(d.name, {}).items():
+                    if fmt == d.format or not cand.eligible:
+                        continue
+                    cand_err = self._error_of(cand)
+                    if cand_err is None or cand_err >= cur_err:
+                        continue
+                    extra = max(cand.estimated_bytes - cur_bytes, 1)
+                    ratio = (cur_err - cand_err) / float(extra)
+                    if best is None or ratio > best[0]:
+                        best = (ratio, d, cand)
+            if best is None:
+                break
+            _, d, cand = best
+            meta = info.by_name(d.name)
+            d.format = cand.format
+            d.convrot_groupsize = self.cgs_for(int(meta.shape[1]), cand.format)
+            d.reason = f"mixed planner (promoted): {cand.format}"
+            self.promotions.append(
+                f"{d.name}:{cand.format} (mean {self.global_mean_error(decisions):.4f})")
+        return self.promotions
+
+    def _summarize(self, info: CheckpointInfo,
+                   decisions: List[TensorDecision]) -> Dict[str, Any]:
+        counts: Dict[str, int] = {}
+        layer_params: Dict[str, int] = {}
+        layer_bytes: Dict[str, int] = {}
+        for d in decisions:
+            if d.kind != DecisionKind.QUANTIZE:
+                continue
+            meta = info.by_name(d.name)
+            n, k = int(meta.shape[0]), int(meta.shape[1])
+            counts[d.format] = counts.get(d.format, 0) + 1
+            layer_params[d.format] = layer_params.get(d.format, 0) + n * k
+            layer_bytes[d.format] = layer_bytes.get(
+                d.format, 0) + quantized_format_bytes(n, k, d.format)
+        mean = self.global_mean_error(decisions)
+        return {
+            "profile": self.profile.name,
+            "layer_gate": self.layer_gate,
+            "global_gate": self.global_gate,
+            "global_mean_error": mean,
+            "counts": counts,
+            "layer_params": layer_params,
+            "layer_bytes": layer_bytes,
+        }
+
+
+
 
 # ---------------------------------------------------------------------------
 # Conversion engine (streaming, resumable, atomic)
@@ -3787,11 +4315,21 @@ def _plan_hash(info: CheckpointInfo, plan: ConversionPlan, args: Any,
         "calibration_source": getattr(args, "calibration_source", None),
         "calibration_samples": getattr(args, "calibration_samples", None),
         "calibration_cache": getattr(args, "calibration_cache", None),
+        "profile": getattr(args, "profile", "auto"),
+        "target_runtime": getattr(args, "target_runtime", "auto"),
+        "quality_gate": getattr(args, "quality_gate", None),
+        "global_error_gate": getattr(args, "global_error_gate", None),
+        "max_linear_bytes_per_param": getattr(args, "max_linear_bytes_per_param", None),
+        "w4a4_linear_dtype": getattr(args, "w4a4_linear_dtype", "int8"),
+        "disable_w4a4": getattr(args, "disable_w4a4", False),
+        "disable_w4a8": getattr(args, "disable_w4a8", False),
+        "disable_int8": getattr(args, "disable_int8", False),
         "source_sha256": source_hashes,
         "decisions": [{
             "name": d.name, "kind": d.kind.value, "layer": d.layer,
             "group_size": d.group_size,
             "convrot_groupsize": d.convrot_groupsize,
+            "format": d.format,
             "out_dtype": torch_dtype_name(d.out_dtype) if d.out_dtype else None,
         } for d in plan.decisions],
         "entries": [{
@@ -3938,13 +4476,22 @@ class ConversionEngine:
         if (int(post_stat.st_dev), int(post_stat.st_ino)) != identity:
             raise OutputError("staged output was replaced during resume verification")
 
+    _SUFFIX_TO_OUTPUT = {
+        "": ".weight",
+        "_s_rel": ".weight_s_rel",
+        "_s_channel": ".weight_s_channel",
+        "_codebook": ".weight_codebook",
+        "_correction": ".weight_correction",
+        "_scale": ".weight_scale",
+    }
+
     @staticmethod
     def _decision_output_names(d: TensorDecision) -> List[str]:
         if d.kind == DecisionKind.QUANTIZE:
             if d.layer is None:
                 raise PolicyError(f"quantized tensor {d.name!r} has no layer name")
-            return [d.layer + suffix for suffix in
-                    (".weight", ".weight_s_rel", ".weight_s_channel", ".weight_codebook")]
+            return [d.layer + ConversionEngine._SUFFIX_TO_OUTPUT[suffix]
+                    for suffix in format_scale_suffixes(d.format)]
         return [d.name]
 
     def _record_entry(self, name: str, data_sha256: str,
@@ -4048,7 +4595,7 @@ class ConversionEngine:
                         d, entries_by_name, max_mem, device, compute_dtype)
                 else:
                     quant_tensors = quantize_tensor_bounded(
-                        self.reader, d.name, self.plan.fmt, d.group_size,
+                        self.reader, d.name, d.format, d.group_size,
                         d.convrot_groupsize, max_mem, device,
                         compute_dtype=compute_dtype)
                     self._write_quantized(d, quant_tensors, entries_by_name)
@@ -4091,9 +4638,7 @@ class ConversionEngine:
             raise PolicyError(f"quantized tensor {d.name!r} has no layer name")
         if self.writer is None:
             raise OutputError("cannot write quantized tensor before writer initialization")
-        suffix_map = {"": ".weight", "_s_rel": ".weight_s_rel",
-                      "_s_channel": ".weight_s_channel", "_codebook": ".weight_codebook",
-                      "_correction": ".weight_correction"}
+        suffix_map = dict(ConversionEngine._SUFFIX_TO_OUTPUT)
         for suffix, t in tensors.items():
             out_name = d.layer + suffix_map[suffix]
             data = tensor_to_bytes(t)
@@ -4113,6 +4658,10 @@ class ConversionEngine:
         if meta is None:
             raise PolicyError(f"conversion plan references missing tensor {d.name!r}")
         n, k = int(meta.shape[0]), int(meta.shape[1])
+        if d.format != FORMAT_W4A8:
+            self._write_quantized_rowwise_chunked(d, entries_by_name, max_mem,
+                                                  device, compute_dtype)
+            return
         chunk_rows = _chunk_rows_for_budget(k, n, max_mem)
         sample_size = _codebook_sample_size(max_mem, n * k)
         codebook = _gather_codebook_samples(
@@ -4145,6 +4694,47 @@ class ConversionEngine:
                                entries_by_name)
         self._record_entry(codebook_name, hashlib.sha256(codebook_data).hexdigest(),
                            entries_by_name)
+
+    def _write_quantized_rowwise_chunked(
+            self, d: TensorDecision,
+            entries_by_name: Dict[str, Dict[str, Any]],
+            max_mem: int, device: torch.device,
+            compute_dtype: Optional[torch.dtype]) -> None:
+        """Chunked writer for the rowwise formats (INT8 / W4A4): rows are
+        independent, so each chunk quantizes exactly and scales stream out."""
+        if d.layer is None or self.writer is None:
+            raise PolicyError("chunked rowwise write needs a layer and open writer")
+        meta = self.info.by_name(d.name)
+        if meta is None:
+            raise PolicyError(f"conversion plan references missing tensor {d.name!r}")
+        n, k = int(meta.shape[0]), int(meta.shape[1])
+        chunk_rows = _chunk_rows_for_budget(k, n, max_mem)
+        suffixes = format_scale_suffixes(d.format)
+        output_suffixes = {s: ConversionEngine._SUFFIX_TO_OUTPUT[s] for s in suffixes}
+        hashers = {s: hashlib.sha256() for s in suffixes}
+        row_bytes = {
+            s: entries_by_name[d.layer + output_suffixes[s]]["nbytes"] // n
+            for s in suffixes
+        }
+        for r0 in range(0, n, chunk_rows):
+            r1 = min(n, r0 + chunk_rows)
+            chunk = self.reader.read_tensor(d.name)[r0:r1]
+            if compute_dtype is not None and chunk.dtype not in FP8_DTYPES:
+                chunk = chunk.to(compute_dtype)
+            if device.type == "cuda":
+                chunk = chunk.to(device)
+            part = quantize_weight_by_format(chunk, d.format, d.group_size,
+                                             d.convrot_groupsize)
+            for suffix in suffixes:
+                name = d.layer + output_suffixes[suffix]
+                data = tensor_to_bytes(part[suffix].cpu() if device.type != "cpu"
+                                       else part[suffix])
+                self.writer.write_tensor_slice(name, r0 * row_bytes[suffix], data)
+                hashers[suffix].update(data)
+            del chunk, part
+        for suffix in suffixes:
+            self._record_entry(d.layer + output_suffixes[suffix],
+                               hashers[suffix].hexdigest(), entries_by_name)
 
     def _write_passthrough(self, d: TensorDecision,
                            entries_by_name: Dict[str, Dict[str, Any]]) -> None:
@@ -4207,12 +4797,24 @@ def build_quant_metadata(info: CheckpointInfo, plan: ConversionPlan) -> Dict[str
     for d in plan.quantized_layers():
         if d.layer is None:
             raise PolicyError(f"quantized tensor {d.name!r} has no layer name")
-        layers[d.layer] = {
-            "format": plan.fmt,
-            "group_size": d.group_size,
-            "convrot": True,
-            "convrot_groupsize": d.convrot_groupsize,
-        }
+        if d.format == FORMAT_W4A8:
+            layers[d.layer] = {
+                "format": FORMAT_W4A8,
+                "group_size": d.group_size,
+                "convrot": True,
+                "convrot_groupsize": d.convrot_groupsize,
+            }
+        elif d.format == FORMAT_W4A4:
+            layers[d.layer] = {
+                "format": FORMAT_W4A4,
+                "convrot_groupsize": d.convrot_groupsize,
+                "quant_group_size": W4A4_QUANT_GROUP_SIZE,
+                "linear_dtype": W4A4_LINEAR_DTYPE,
+            }
+        elif d.format == FORMAT_INT8:
+            layers[d.layer] = {"format": FORMAT_INT8}
+        else:
+            raise PolicyError(f"unknown per-layer format {d.format!r}")
     return {"layers": layers}
 
 
@@ -4264,9 +4866,13 @@ def build_extension_metadata(info: CheckpointInfo, plan: ConversionPlan,
             "sha256": _portable_hash_manifest(info.files, input_hashes),
         },
         "quantization": {
-            "weight_bits": 4,
+            "weight_bits": 4 if plan.fmt == FORMAT_W4A8 else "mixed",
             "activation_bits": 8,
-            "weight_quantization": "per-group 16-entry symmetric Lloyd-Max codebook",
+            "weight_quantization": (
+                "per-group 16-entry symmetric Lloyd-Max codebook"
+                if plan.fmt == FORMAT_W4A8 else
+                "per-layer mixed: convrot_w4a4 rowwise int4 / asym_w4a8_int8 "
+                "codebook / int8_tensorwise rowwise int8"),
             "activation_quantization": "runtime dynamic symmetric int8 per input row after ConvRot",
             "activation_scale": "fp32 amax(row)/127, clamped to at least 1e-30",
             "activation_rounding": "nearest integer, clamped to [-128,127]",
@@ -4278,6 +4884,10 @@ def build_extension_metadata(info: CheckpointInfo, plan: ConversionPlan,
             "symmetric": True,
             "n_quantized_layers": len(quant_layers),
             "n_kept_tensors": plan.n_kept,
+            "formats": sorted({d.format for d in quant_layers}),
+            "mixed_profile": (plan.mixed_plan or {}).get("profile"),
+            "mixed_global_mean_error": (plan.mixed_plan or {}).get(
+                "global_mean_error"),
             "compute_dtype": getattr(args, "compute_dtype", "auto"),
             "effective_compute_dtype": torch_dtype_name(
                 getattr(args, "_compute_dtype_tensor", torch.float32)),
@@ -4306,7 +4916,9 @@ def build_extension_metadata(info: CheckpointInfo, plan: ConversionPlan,
                 "required_revision": COMFY_KITCHEN_REV,
                 "pr": 90,
                 "merged": True,
-                "layout": "AsymW4A8Int8Layout",
+                "layout": ("AsymW4A8Int8Layout" if plan.fmt == FORMAT_W4A8 else
+                           "AsymW4A8Int8Layout / TensorCoreConvRotW4A4Layout / "
+                           "TensorWiseINT8Layout"),
             },
             "comfyui": {
                 "required_pr": COMFYUI_PR,
@@ -4502,7 +5114,7 @@ class Validator:
                     and all(isinstance(digest, str)
                             and re.fullmatch(r"[0-9a-f]{64}", digest)
                             for digest in source_hashes.values())
-                    and quant_block.get("weight_bits") == 4
+                    and quant_block.get("weight_bits") in (4, "mixed")
                     and quant_block.get("activation_bits") == 8
                     and quant_block.get("packing") == "int4-nibble-lsb"
                     and quant_block.get("scale_dtype") == "fp8_e4m3fn"
@@ -4551,16 +5163,30 @@ class Validator:
                 decision_by_layer = {
                     decision.layer: decision for decision in self.plan.quantized_layers()
                 }
-                conf_ok = all(
-                    isinstance(value, dict)
-                    and value.get("format") == self.plan.fmt
-                    and value.get("group_size") ==
-                    decision_by_layer.get(layer).group_size
-                    and value.get("convrot") is True
-                    and value.get("convrot_groupsize") ==
-                    decision_by_layer.get(layer).convrot_groupsize
-                    for layer, value in layers.items()
-                    if layer in decision_by_layer)
+                conf_ok = True
+                for layer, value in layers.items():
+                    dec = decision_by_layer.get(layer)
+                    if dec is None or not isinstance(value, dict):
+                        conf_ok = False
+                        continue
+                    lfmt = value.get("format")
+                    if lfmt != dec.format or lfmt not in MIXED_FORMATS:
+                        conf_ok = False
+                        continue
+                    if lfmt == FORMAT_W4A8:
+                        conf_ok = conf_ok and (
+                            value.get("group_size") == dec.group_size
+                            and value.get("convrot") is True
+                            and value.get("convrot_groupsize") ==
+                            dec.convrot_groupsize)
+                    elif lfmt == FORMAT_W4A4:
+                        conf_ok = conf_ok and (
+                            value.get("convrot_groupsize") ==
+                            dec.convrot_groupsize
+                            and value.get("quant_group_size") ==
+                            W4A4_QUANT_GROUP_SIZE
+                            and value.get("linear_dtype") in ("int4", "int8"))
+                    # int8_tensorwise: format field only
                 conf_ok = conf_ok and not mism
                 self.check("metadata-layer-conf", conf_ok,
                            "format/group/ConvRot fields valid" if conf_ok else
@@ -4576,46 +5202,73 @@ class Validator:
                 try:
                     with safe_open(out_path, framework="pt") as inv_st:
                         for layer, conf in layers.items():
+                            lfmt = conf.get("format")
                             try:
                                 gs = int(conf.get("group_size", 0))
                                 cgs = int(conf.get("convrot_groupsize", 0))
                             except (TypeError, ValueError):
                                 gs = cgs = 0
-                            if (conf.get("format") != FORMAT_W4A8
-                                    or conf.get("convrot") is not True
-                                    or cgs != W4A8_CONVROT_GROUPSIZE
-                                    or gs != 16):
-                                inv_ok = False
-                                inv_bad.append(f"{layer}: conf {conf}")
-                                continue
                             w = inv_st.get_slice(layer + ".weight")
-                            srel = inv_st.get_slice(layer + ".weight_s_rel")
-                            sch = inv_st.get_slice(layer + ".weight_s_channel")
-                            cb = inv_st.get_slice(layer + ".weight_codebook")
                             n, k2 = w.get_shape()
-                            k = k2 * 2
-                            if (tuple(w.get_shape()) != (n, k // 2)
-                                    or tuple(srel.get_shape()) != (n, k // gs)
-                                    or tuple(sch.get_shape()) != (n,)
-                                    or tuple(cb.get_shape()) != (16,)
-                                    or k % gs != 0 or k % cgs != 0):
-                                inv_ok = False
-                                inv_bad.append(f"{layer}: shapes w={w.get_shape()} "
-                                               f"s_rel={srel.get_shape()} "
-                                               f"s_ch={sch.get_shape()} cb={cb.get_shape()}")
-                                continue
-                            if self.info is not None:
-                                src_meta = self.info.by_name(layer + ".weight")
-                                if src_meta is None or int(src_meta.shape[1]) % 256 != 0:
+                            if lfmt == FORMAT_W4A8:
+                                srel = inv_st.get_slice(layer + ".weight_s_rel")
+                                sch = inv_st.get_slice(layer + ".weight_s_channel")
+                                cb = inv_st.get_slice(layer + ".weight_codebook")
+                                k = k2 * 2
+                                if (conf.get("convrot") is not True
+                                        or cgs != W4A8_CONVROT_GROUPSIZE
+                                        or gs != 16
+                                        or tuple(w.get_shape()) != (n, k // 2)
+                                        or tuple(srel.get_shape()) != (n, k // gs)
+                                        or tuple(sch.get_shape()) != (n,)
+                                        or tuple(cb.get_shape()) != (16,)
+                                        or k % gs != 0 or k % cgs != 0):
                                     inv_ok = False
-                                    inv_bad.append(f"{layer}: source K not divisible by 256")
+                                    inv_bad.append(f"{layer}: w4a8 conf/shape "
+                                                   f"{conf} w={w.get_shape()}")
+                                    continue
+                                if self.info is not None:
+                                    src_meta = self.info.by_name(layer + ".weight")
+                                    if src_meta is None or int(src_meta.shape[1]) % 256 != 0:
+                                        inv_ok = False
+                                        inv_bad.append(
+                                            f"{layer}: source K not divisible by 256")
+                            elif lfmt == FORMAT_W4A4:
+                                scale = inv_st.get_slice(layer + ".weight_scale")
+                                k = k2 * 2
+                                if (tuple(w.get_shape()) != (n, k // 2)
+                                        or tuple(scale.get_shape()) != (n,)
+                                        or k % W4A4_QUANT_GROUP_SIZE != 0
+                                        or k % cgs != 0
+                                        or int(conf.get("quant_group_size", 0)) !=
+                                        W4A4_QUANT_GROUP_SIZE
+                                        or conf.get("linear_dtype") not in
+                                        ("int4", "int8")
+                                        or cgs < 16
+                                        or not _is_power_of_four(cgs)):
+                                    inv_ok = False
+                                    inv_bad.append(f"{layer}: w4a4 conf/shape "
+                                                   f"{conf} w={w.get_shape()} "
+                                                   f"scale={scale.get_shape()}")
+                            elif lfmt == FORMAT_INT8:
+                                scale = inv_st.get_slice(layer + ".weight_scale")
+                                if (tuple(w.get_shape()) != (n, k2)
+                                        or tuple(scale.get_shape()) not in
+                                        ((n,), (n, 1))):
+                                    inv_ok = False
+                                    inv_bad.append(f"{layer}: int8 shape "
+                                                   f"w={w.get_shape()} "
+                                                   f"scale={scale.get_shape()}")
+                            else:
+                                inv_ok = False
+                                inv_bad.append(f"{layer}: unknown format {lfmt!r}")
                 except Exception as e:
                     inv_ok = False
                     inv_bad.append(str(e))
                 self.check(
                     "metadata-runtime-contract", inv_ok,
-                    "convrot=256, group_size=16, exact shapes, K%256==0" if inv_ok
-                    else "; ".join(inv_bad[:4]) or "invalid")
+                    "per-format runtime contract (shapes, scales, K rules) "
+                    "valid" if inv_ok else "; ".join(inv_bad[:4]) or "invalid")
 
             except Exception as e:
                 self.check("metadata-json", False, f"unparseable: {e}")
@@ -4676,13 +5329,13 @@ class Validator:
                                         if len(sample) > 16 else [])
                 sample = list({id(d): d for d in sample}.values())
             worst: Dict[str, float] = {}
+            bounds_used: Dict[str, float] = {}
             for d in sample:
                 if d.layer is None:
                     self.check(f"recon-{d.name}", False,
                                "quantized decision has no layer name")
                     continue
                 try:
-                    cb = st.get_tensor(d.layer + ".weight_codebook")
                     orig = self.info.by_name(d.name)
                     if orig is not None and reader is not None:
                         max_mem = getattr(args, "max_memory", 2 * 1024**3)
@@ -4690,55 +5343,91 @@ class Validator:
                             d.name in getattr(self.plan, "chunked_layers", set())
                             or _quant_work_bytes(orig) > max_mem
                         )
+                        recon_bound = {
+                            FORMAT_W4A8: self.plan.detection.policy.max_rel_l2,
+                            FORMAT_W4A4: W4A4_MAX_REL_L2,
+                            FORMAT_INT8: INT8_MAX_REL_L2,
+                        }.get(d.format, self.plan.detection.policy.max_rel_l2)
+                        bounds_used[d.layer] = recon_bound
+                        pack_ok = True
                         if bounded:
                             n, k = int(orig.shape[0]), int(orig.shape[1])
                             chunk_rows = _chunk_rows_for_budget(k, n, max_mem)
                             acc = _MetricAccumulator(d.name)
-                            pack_ok = True
                             original_view = reader.read_tensor(d.name)
                             packed_slice = st.get_slice(d.layer + ".weight")
-                            s_rel_slice = st.get_slice(d.layer + ".weight_s_rel")
-                            s_ch_slice = st.get_slice(d.layer + ".weight_s_channel")
-                            for r0 in range(0, n, chunk_rows):
-                                r1 = min(n, r0 + chunk_rows)
-                                packed = packed_slice[r0:r1]
-                                s_rel = s_rel_slice[r0:r1]
-                                s_ch = s_ch_slice[r0:r1]
+                            if d.format == FORMAT_W4A8:
+                                cb = st.get_tensor(d.layer + ".weight_codebook")
+                                s_rel_slice = st.get_slice(d.layer + ".weight_s_rel")
+                                s_ch_slice = st.get_slice(d.layer + ".weight_s_channel")
+                                for r0 in range(0, n, chunk_rows):
+                                    r1 = min(n, r0 + chunk_rows)
+                                    packed = packed_slice[r0:r1]
+                                    s_rel = s_rel_slice[r0:r1]
+                                    s_ch = s_ch_slice[r0:r1]
+                                    dq = dequantize_w4a8_weight(
+                                        packed, s_rel, s_ch, codebook=cb,
+                                        group_size=d.group_size,
+                                        convrot_groupsize=d.convrot_groupsize,
+                                        output_dtype=torch.float32)
+                                    acc.update(original_view[r0:r1], dq, None)
+                                    rt = unpack_w4(packed)
+                                    repacked = (
+                                        (rt[:, 0::2] & 0xF)
+                                        | ((rt[:, 1::2] & 0xF) << 4)
+                                    ).to(torch.int8)
+                                    pack_ok = pack_ok and bool(torch.equal(repacked, packed))
+                                    del packed, s_rel, s_ch, dq, rt, repacked
+                            else:
+                                scale_slice = st.get_slice(d.layer + ".weight_scale")
+                                for r0 in range(0, n, chunk_rows):
+                                    r1 = min(n, r0 + chunk_rows)
+                                    packed = packed_slice[r0:r1]
+                                    scale = scale_slice[r0:r1]
+                                    dq = dequantize_weight_by_format(
+                                        {"": packed, "_scale": scale},
+                                        d.format, d.group_size,
+                                        d.convrot_groupsize, torch.float32)
+                                    acc.update(original_view[r0:r1], dq, None)
+                                    if d.format == FORMAT_W4A4:
+                                        rt = unpack_int4_signed(packed)
+                                        repacked = (
+                                            (rt[:, 0::2] & 0xF)
+                                            | ((rt[:, 1::2] & 0xF) << 4)
+                                        ).to(torch.int8)
+                                        pack_ok = pack_ok and bool(torch.equal(repacked, packed))
+                                    del packed, scale, dq, rt, repacked
+                            m = acc.finish()
+                        else:
+                            packed = st.get_tensor(d.layer + ".weight")
+                            if d.format == FORMAT_W4A8:
+                                cb = st.get_tensor(d.layer + ".weight_codebook")
+                                s_rel = st.get_tensor(d.layer + ".weight_s_rel")
+                                s_ch = st.get_tensor(d.layer + ".weight_s_channel")
                                 dq = dequantize_w4a8_weight(
                                     packed, s_rel, s_ch, codebook=cb,
                                     group_size=d.group_size,
                                     convrot_groupsize=d.convrot_groupsize,
                                     output_dtype=torch.float32)
-                                acc.update(original_view[r0:r1], dq, None)
-                                rt = unpack_w4(packed)
+                            else:
+                                scale = st.get_tensor(d.layer + ".weight_scale")
+                                dq = dequantize_weight_by_format(
+                                    {"": packed, "_scale": scale},
+                                    d.format, d.group_size,
+                                    d.convrot_groupsize, torch.float32)
+                            orig_t = reader.read_tensor(d.name).float()
+                            m = compute_weight_metrics(orig_t, dq)
+                            if d.format == FORMAT_W4A4:
+                                rt = unpack_int4_signed(packed)
                                 repacked = (
                                     (rt[:, 0::2] & 0xF)
                                     | ((rt[:, 1::2] & 0xF) << 4)
                                 ).to(torch.int8)
-                                pack_ok = pack_ok and bool(torch.equal(repacked, packed))
-                                del packed, s_rel, s_ch, dq, rt, repacked
-                            m = acc.finish()
-                        else:
-                            packed = st.get_tensor(d.layer + ".weight")
-                            s_rel = st.get_tensor(d.layer + ".weight_s_rel")
-                            s_ch = st.get_tensor(d.layer + ".weight_s_channel")
-                            orig_t = reader.read_tensor(d.name).float()
-                            dq = dequantize_w4a8_weight(
-                                packed, s_rel, s_ch, codebook=cb,
-                                group_size=d.group_size,
-                                convrot_groupsize=d.convrot_groupsize,
-                                output_dtype=torch.float32)
-                            m = compute_weight_metrics(orig_t, dq)
-                            rt = unpack_w4(packed)
-                            repacked = (
-                                (rt[:, 0::2] & 0xF)
-                                | ((rt[:, 1::2] & 0xF) << 4)
-                            ).to(torch.int8)
-                            pack_ok = bool(torch.equal(repacked, packed))
+                                pack_ok = bool(torch.equal(repacked, packed))
                         worst[d.layer] = m.rel_l2
-                        if m.rel_l2 > self.plan.detection.policy.max_rel_l2:
+                        if m.rel_l2 > recon_bound:
                             self.check(f"recon-{d.layer}", False,
-                                       f"relL2 {m.rel_l2:.4f} > {self.plan.detection.policy.max_rel_l2}")
+                                       f"relL2 {m.rel_l2:.4f} > {recon_bound}")
                         elif m.cosine < self.plan.detection.policy.min_cosine:
                             self.check(f"recon-{d.layer}", False,
                                        f"cosine {m.cosine:.4f} < {self.plan.detection.policy.min_cosine}")
@@ -4752,9 +5441,11 @@ class Validator:
                     self.check(f"recon-{d.layer}", False, f"error: {e}")
             if worst:
                 mx = max(worst.values())
-                self.check("reconstruction-error-bound", mx <= self.plan.detection.policy.max_rel_l2,
+                mx_bound = max(bounds_used.values()) if bounds_used else \
+                    self.plan.detection.policy.max_rel_l2
+                self.check("reconstruction-error-bound", mx <= mx_bound,
                            f"max {'full' if full_validation else 'sampled'} relL2 {mx:.4f} "
-                           f"(policy bound {self.plan.detection.policy.max_rel_l2})")
+                           f"(per-format bound {mx_bound})")
 
         # ---- scale validation ----
         scale_ok = True
@@ -4766,6 +5457,28 @@ class Validator:
                 scale_detail = f"{d.name}: quantized decision has no layer name"
                 break
             try:
+                if d.format == FORMAT_W4A4:
+                    scale = st.get_tensor(d.layer + ".weight_scale")
+                    finite = bool(torch.isfinite(scale).all())
+                    valid_range = bool((scale > 0).all())
+                    if not finite or not valid_range:
+                        scale_ok = False
+                        scale_detail = (
+                            f"{d.layer}: non-finite or non-positive W4A4 scales")
+                        break
+                    n_scale += 1
+                    continue
+                if d.format == FORMAT_INT8:
+                    scale = st.get_tensor(d.layer + ".weight_scale")
+                    finite = bool(torch.isfinite(scale).all())
+                    valid_range = bool((scale > 0).all())
+                    if not finite or not valid_range:
+                        scale_ok = False
+                        scale_detail = (
+                            f"{d.layer}: non-finite or non-positive INT8 scales")
+                        break
+                    n_scale += 1
+                    continue
                 cb = st.get_tensor(d.layer + ".weight_codebook").float()
                 orig = self.info.by_name(d.name)
                 max_mem = getattr(args, "max_memory", 2 * 1024**3)
@@ -4826,11 +5539,11 @@ class Validator:
                 compute_dtype = getattr(args, "_compute_dtype_tensor", torch.float32)
                 max_mem = getattr(args, "max_memory", 2 * 1024**3)
                 out1 = quantize_tensor_bounded(
-                    reader, d0.name, self.plan.fmt, d0.group_size,
+                    reader, d0.name, d0.format, d0.group_size,
                     d0.convrot_groupsize, max_mem, torch.device("cpu"),
                     compute_dtype=compute_dtype)
                 out2 = quantize_tensor_bounded(
-                    reader, d0.name, self.plan.fmt, d0.group_size,
+                    reader, d0.name, d0.format, d0.group_size,
                     d0.convrot_groupsize, max_mem, torch.device("cpu"),
                     compute_dtype=compute_dtype)
                 det = all(torch.equal(out1[k], out2[k]) for k in out1)
@@ -5200,6 +5913,26 @@ def render_text_report(report: Dict[str, Any]) -> str:
                     name, bl["layers"], human_bytes(bl["bytes"]), ktxt))
     else:
         a("  no policy-targeted 2D linear layers")
+    mixed = report.get("mixed_plan") or {}
+    if mixed:
+        a("")
+        a("-- mixed precision --")
+        a(f"  profile        : {mixed.get('profile')} (layer gate "
+          f"{mixed.get('layer_gate')}, global gate {mixed.get('global_gate')})")
+        a("  global mean err: "
+          + (f"{mixed.get('global_mean_error'):.4f}" if mixed.get("global_mean_error") is not None else "n/a"))
+        a(f"  promotions     : {len(mixed.get('promotions') or [])}")
+        counts = mixed.get("counts") or {}
+        params = mixed.get("layer_params") or {}
+        bytes_ = mixed.get("layer_bytes") or {}
+        total_p = sum(params.values()) or 1
+        for fmt in MIXED_FORMATS:
+            if counts.get(fmt):
+                a(f"  {fmt:22s}: {counts[fmt]:4d} layers, "
+                  f"{100*params.get(fmt,0)/total_p:5.1f}% of quantized params, "
+                  f"{human_bytes(bytes_.get(fmt,0))}")
+        a(f"  quantized linear payload: "
+          f"{sum(bytes_.values())/total_p:.3f} bytes/parameter")
     a("")
     a("-- quantization --")
     for row in report.get("quantization_rows", []):
@@ -5259,6 +5992,7 @@ def build_report(info: CheckpointInfo, plan: ConversionPlan, env: EnvironmentInf
         "n_kept": plan.n_kept,
         "compression": compression_stats(info, plan, result),
         "group_histogram": _group_histogram(plan),
+        "mixed_plan": plan.mixed_plan,
         "quantization_rows": quant_rows,
         "tensor_decisions": [
             {"name": item.name, "decision": item.kind.value,
@@ -5300,7 +6034,8 @@ def print_console_summary(*, out_path: str, input_bytes: int, output_bytes: int,
                           validation: Optional[Dict[str, Any]],
                           elapsed: float, warnings: List[str],
                           report_path: Optional[str] = None,
-                          dry_run: bool = False) -> None:
+                          dry_run: bool = False,
+                          mixed_plan: Optional[Dict[str, Any]] = None) -> None:
     """Concise, human-friendly terminal summary printed after a conversion
     (or dry run). Plain ASCII when piped; colored when interactive."""
     saved = (1.0 - output_bytes / input_bytes) if input_bytes else 0.0
@@ -5333,7 +6068,20 @@ def print_console_summary(*, out_path: str, input_bytes: int, output_bytes: int,
           "2D linear bytes); " + f"{n_kept} kept")
     else:
         a(f"  quantized   : {n_quantized} layers; {n_kept} kept")
-    a(f"  format      : {FORMAT_W4A8}  group_size={group_size}  convrot_groupsize=256")
+    if mixed_plan:
+        counts = mixed_plan.get("counts") or {}
+        dist = ", ".join(
+            f"{fmt.split('_')[0].upper() if fmt == FORMAT_INT8 else fmt.split('_')[0].upper()}"
+            f"x{counts.get(fmt, 0)}"
+            for fmt in MIXED_FORMATS if counts.get(fmt))
+        a(f"  format      : {FORMAT_MIXED}  profile={mixed_plan.get('profile')}  "
+          f"[{dist}]")
+        mean = mixed_plan.get("global_mean_error")
+        a(f"  gates       : layer<={mixed_plan.get('layer_gate')}  "
+          f"global_mean<={mixed_plan.get('global_gate')}"
+          + (f"  (mean {mean:.4f})" if mean is not None else ""))
+    else:
+        a(f"  format      : {FORMAT_W4A8}  group_size={group_size}  convrot_groupsize=256")
     a(f"  validation  : {v_txt}")
     if report_path:
         a(f"  report      : {report_path}")
@@ -5361,9 +6109,42 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "or (with --trust-pickle) a torch pickle checkpoint")
     p.add_argument("--output", metavar="PATH", default=None,
                    help="output checkpoint path (required for conversion)")
-    p.add_argument("--format", choices=["w4a8"], default="w4a8",
-                   help="quantization format (only the ComfyUI reference w4a8 "
-                        "format is supported)")
+    p.add_argument("--format", choices=["w4a8", "mixed"], default="w4a8",
+                   help="quantization format: w4a8 (single-format reference "
+                        "path) or mixed (experimental per-layer optimizer "
+                        "over convrot_w4a4 / asym_w4a8_int8 / int8_tensorwise)")
+    p.add_argument("--profile", choices=list(MIXED_PROFILES), default="auto",
+                   help="mixed-mode profile: auto detects the runtime (GPU -> "
+                        "balanced, CPU -> conservative); balanced, conservative "
+                        "and size-first set the quality/compression tradeoff")
+    p.add_argument("--target-runtime", choices=["auto", "nvidia", "amd", "cpu"],
+                   default="auto",
+                   help="target inference runtime used for format eligibility; "
+                        "auto probes torch (CUDA/ROCm/CPU)")
+    p.add_argument("--quality-gate", type=float, default=None, metavar="F",
+                   help="mixed mode: per-layer error gate override (relL2 "
+                        "fraction; default from the profile)")
+    p.add_argument("--global-error-gate", type=float, default=None, metavar="F",
+                   help="mixed mode: global mean-error gate override; the "
+                        "planner promotes layers until this passes")
+    p.add_argument("--max-linear-bytes-per-param", type=float, default=None,
+                   metavar="F",
+                   help="mixed mode: compression target in bytes/parameter for "
+                        "the quantized linear payload (warned when exceeded)")
+    p.add_argument("--w4a4-linear-dtype", choices=["int4", "int8"], default="int8",
+                   help="convrot_w4a4 execution variant: int4 (true W4A4) or "
+                        "int8 (4-bit weights through the int8 path; the "
+                        "default). Execution property only, never a quality "
+                        "fallback")
+    p.add_argument("--disable-w4a4", action="store_true",
+                   help="mixed mode: never select convrot_w4a4 layers")
+    p.add_argument("--disable-w4a8", action="store_true",
+                   help="mixed mode: never select asym_w4a8_int8 layers")
+    p.add_argument("--disable-int8", action="store_true",
+                   help="mixed mode: never select int8_tensorwise layers")
+    p.add_argument("--require-calibration", action="store_true",
+                   help="mixed mode: refuse planning without calibration "
+                        "activations (--calibration-source)")
     p.add_argument("--architecture", default="auto",
                    help="auto or an architecture name from --list-architectures")
     p.add_argument("--device", choices=["auto", "cpu", "cuda", "rocm"], default="auto",
@@ -5482,22 +6263,25 @@ def plan_from_output(output_path: str, detection: DetectionResult,
         if not isinstance(layer, str) or not layer or not isinstance(conf, dict):
             raise ValidationError(
                 f"{output_path}: malformed quantized-layer metadata entry")
+        lfmt = conf.get("format")
+        if lfmt not in MIXED_FORMATS:
+            raise ValidationError(
+                f"{output_path}: incompatible format metadata for {layer!r} "
+                f"(unknown per-layer format {lfmt!r})")
+        if fmt == FORMAT_MIXED:
+            pass
+        elif lfmt != fmt:
+            raise ValidationError(
+                f"{output_path}: incompatible format metadata for {layer!r}")
         try:
             group_size = int(conf.get("group_size", 16))
             convrot_groupsize = int(conf.get("convrot_groupsize", 256))
         except (TypeError, ValueError) as e:
             raise ValidationError(
                 f"{output_path}: invalid group metadata for {layer!r}") from e
-        if conf.get("format") != fmt or group_size <= 0 or convrot_groupsize <= 0:
+        if group_size <= 0 or convrot_groupsize <= 0:
             raise ValidationError(
-                f"{output_path}: incompatible format/group metadata for {layer!r}")
-        if convrot_groupsize != W4A8_CONVROT_GROUPSIZE:
-            raise ValidationError(
-                f"{output_path}: layer {layer!r} uses convrot_groupsize "
-                f"{convrot_groupsize}, but the comfy-kitchen 0.2.27 CUDA "
-                f"runtime only supports {W4A8_CONVROT_GROUPSIZE} (K must be "
-                "divisible by 256). Re-convert the checkpoint with converter "
-                f">= 1.2.2; incompatible layers now pass through.")
+                f"{output_path}: invalid group metadata for {layer!r}")
         source_name = f"{layer}.weight"
         if info is not None:
             source_meta = info.by_name(source_name)
@@ -5505,16 +6289,52 @@ def plan_from_output(output_path: str, detection: DetectionResult,
                 raise ValidationError(
                     f"{output_path}: quantized layer {layer!r} has no matching "
                     "2D weight in the supplied original checkpoint")
-            try:
-                validate_w4_shape(
-                    int(source_meta.shape[1]), group_size, convrot_groupsize)
-            except PolicyError as e:
-                raise ValidationError(
-                    f"{output_path}: invalid W4A8 shape metadata for {layer!r}: {e}") from e
+            k = int(source_meta.shape[1])
+            if lfmt == FORMAT_W4A8:
+                if convrot_groupsize != W4A8_CONVROT_GROUPSIZE:
+                    raise ValidationError(
+                        f"{output_path}: layer {layer!r} uses convrot_groupsize "
+                        f"{convrot_groupsize}, but the comfy-kitchen 0.2.27 CUDA "
+                        f"runtime only supports {W4A8_CONVROT_GROUPSIZE} (K must "
+                        "be divisible by 256). Re-convert the checkpoint with "
+                        "converter >= 1.2.2; incompatible layers now pass through.")
+                try:
+                    validate_w4_shape(k, group_size, convrot_groupsize)
+                except PolicyError as e:
+                    raise ValidationError(
+                        f"{output_path}: invalid W4A8 shape metadata for "
+                        f"{layer!r}: {e}") from e
+            elif lfmt == FORMAT_W4A4:
+                try:
+                    if k % W4A4_QUANT_GROUP_SIZE != 0:
+                        raise PolicyError(
+                            f"K={k} not divisible by quant_group_size "
+                            f"{W4A4_QUANT_GROUP_SIZE}")
+                    if k % convrot_groupsize != 0:
+                        raise PolicyError(
+                            f"K={k} not divisible by convrot_groupsize "
+                            f"{convrot_groupsize}")
+                    if int(conf.get("quant_group_size", W4A4_QUANT_GROUP_SIZE)) \
+                            != W4A4_QUANT_GROUP_SIZE:
+                        raise PolicyError("quant_group_size must be 64")
+                    if conf.get("linear_dtype", W4A4_LINEAR_DTYPE) \
+                            not in ("int4", "int8"):
+                        raise PolicyError("linear_dtype must be int4 or int8")
+                    if convrot_groupsize < 16 or \
+                            not _is_power_of_four(convrot_groupsize):
+                        raise PolicyError(
+                            f"convrot_groupsize {convrot_groupsize} not a "
+                            "supported power of 4")
+                except PolicyError as e:
+                    raise ValidationError(
+                        f"{output_path}: invalid W4A4 shape metadata for "
+                        f"{layer!r}: {e}") from e
+            elif lfmt == FORMAT_INT8:
+                pass  # int8_tensorwise without ConvRot has no shape constraint
         decisions.append(TensorDecision(
             source_name, DecisionKind.QUANTIZE, "reconstructed from output metadata",
             layer=layer, group_size=group_size,
-            convrot_groupsize=convrot_groupsize))
+            convrot_groupsize=convrot_groupsize, format=lfmt))
     quantized_names = {f"{layer}.weight" for layer in layers}
     if info is not None:
         for tensor in info.tensors:
@@ -5604,6 +6424,11 @@ def run_self_tests() -> int:
         ("real-dim-gate", _test_real_dim_gate),
         ("policy-miss", _test_policy_miss),
         ("metadata-fuzz", _test_metadata_fuzz),
+        ("w4a4-golden", _test_w4a4_golden),
+        ("int8-golden", _test_int8_golden),
+        ("mixed-eligibility", _test_mixed_eligibility),
+        ("mixed-planning", _test_mixed_planning),
+        ("mixed-e2e", _test_mixed_e2e),
         ("fail-on-low-compression", _test_fail_on_low_compression),
         ("architecture-detection-safety", _test_detection_safety),
         ("golden-vectors-vs-reference", _test_golden_vectors),
@@ -6783,6 +7608,210 @@ def _test_e2e_mini_model_w4a8() -> str:
             "validation inventory and deterministic serialization verified")
 
 
+
+
+def _test_w4a4_golden() -> str:
+    """W4A4 golden vector: quantize must match comfy-kitchen's eager
+    implementation byte-for-byte (packed int4 + rowwise fp32 scales) on a
+    fixed seed-7 weight; dequant roundtrip stays within the int4 bound."""
+    torch.manual_seed(7)
+    w = torch.randn(6, 256) * 0.05
+    assert hashlib.sha256(w.numpy().tobytes()).hexdigest() == \
+        "78390001b8020812bfea3d4d85d16210eea0d64ff98eda8c8b266aa88387534a"
+    packed, scale = quantize_w4a4_weight(w, 256)
+    assert packed.dtype == torch.int8 and packed.shape == (6, 128)
+    assert hashlib.sha256(packed.numpy().tobytes()).hexdigest() == \
+        "944ce3da265f31370f3e5f6af945ab642c709aa43ad6eed27f152e498858730d"
+    assert hashlib.sha256(scale.numpy().tobytes()).hexdigest() == \
+        "5d0c422e4ae16e0eb3ff3b2348cd63e985a8036b1c9c3557bf5229be37675d53"
+    assert torch.allclose(scale, torch.tensor(
+        [0.021357248, 0.022243505, 0.018726815, 0.025281796,
+         0.021947617, 0.019980142]), rtol=1e-6, atol=1e-9)
+    dq = dequantize_w4a4_weight(packed, scale, 256, torch.float32)
+    m = compute_weight_metrics(w, dq)
+    assert m.rel_l2 < 0.20 and m.cosine > 0.98, (m.rel_l2, m.cosine)
+    # packed nibbles survive a signed round trip
+    rt = unpack_int4_signed(packed)
+    repacked = ((rt[:, 0::2] & 0xF) | ((rt[:, 1::2] & 0xF) << 4)).to(torch.int8)
+    assert torch.equal(repacked, packed)
+    return ("W4A4 golden packed/scale byte-exact vs comfy-kitchen; "
+            f"roundtrip relL2 {m.rel_l2:.4f}")
+
+
+def _test_int8_golden() -> str:
+    """INT8 golden vector: rowwise int8 quantize matches comfy-kitchen's eager
+    quantize_int8_rowwise byte-for-byte on the same fixed weight."""
+    torch.manual_seed(7)
+    w = torch.randn(6, 256) * 0.05
+    q, scale = quantize_int8_tensorwise_weight(w)
+    assert q.dtype == torch.int8 and q.shape == (6, 256)
+    assert hashlib.sha256(q.numpy().tobytes()).hexdigest() == \
+        "14963d71a305d43aec5ed2440120c383351b2b5ad861282b9089e2be800fc21e"
+    assert hashlib.sha256(scale.numpy().tobytes()).hexdigest() == \
+        "369ef81799e1da37986b040a3c8d3b10a50a93ab10daabba7c8ae9217c1548a8"
+    assert torch.allclose(scale.reshape(-1), torch.tensor(
+        [0.001189211, 0.001393344, 0.001371189, 0.001160474,
+         0.001261787, 0.00115588]), rtol=1e-6, atol=1e-9)
+    assert scale.shape == (6, 1)
+    dq = dequantize_int8_tensorwise_weight(q, scale, torch.float32)
+    m = compute_weight_metrics(w, dq)
+    assert m.rel_l2 < 0.05 and m.cosine > 0.999, (m.rel_l2, m.cosine)
+    return ("INT8 golden q/scale byte-exact vs comfy-kitchen; "
+            f"roundtrip relL2 {m.rel_l2:.4f}")
+
+
+def _test_mixed_eligibility() -> str:
+    """Per-format eligibility matrix on the real awkward dims."""
+    ok_w4a4 = [k for k in (1152, 1408, 1920, 768, 640, 320, 13568, 6144)
+               if w4a4_weight_is_quantizable((8, k), torch.bfloat16)[0]]
+    assert ok_w4a4 == [1152, 1408, 1920, 768, 640, 320, 13568, 6144], ok_w4a4
+    bad_w4a4 = [k for k in (3360, 2520)
+                if w4a4_weight_is_quantizable((8, k), torch.bfloat16)[0]]
+    assert bad_w4a4 == [], bad_w4a4
+    ok_int8 = [k for k in (3360, 2520, 1152, 5, 17)
+               if int8_weight_is_quantizable((8, k), torch.bfloat16)[0]]
+    assert ok_int8 == [3360, 2520, 1152, 5, 17], ok_int8
+    ok_w4a8 = [k for k in (13568, 6144, 768)
+               if w4_weight_is_quantizable((8, k), torch.bfloat16, 16, 256)[0]]
+    assert ok_w4a8 == [13568, 6144, 768], ok_w4a8
+    return ("eligibility: W4A4 needs K%64 (1152/1408/1920 yes, 3360/2520 no), "
+            "INT8 any K, W4A8 needs K%256")
+
+
+def _test_mixed_planning() -> str:
+    """MixedPlanner on the real Boogu dims: K=3360 layers go INT8, K=13568
+    layers stay W4A8, output is smaller than the w4a8-only fallback plan."""
+    d = _tmpdir()
+    src_path = os.path.join(d, "boogu_mixed.safetensors")
+    _make_boogu_real_dims_checkpoint(src_path, n=64, n_fail=5, n_ok=2)
+    info = discover_checkpoint(src_path)
+    det = detect_architecture(
+        info, shape_lookup=lambda n: (info.by_name(n).shape if info.by_name(n) else None))
+    decisions = classify_tensors(info, det, FORMAT_MIXED, None, [], [], [],
+                                 None, None)
+    planner = MixedPlanner("balanced", None, 2 * 1024**3, torch.device("cpu"),
+                           None)
+    summary = planner.plan(info, decisions)
+    by_fmt = summary["counts"]
+    assert by_fmt.get(FORMAT_INT8, 0) >= 5, by_fmt
+    assert by_fmt.get(FORMAT_W4A8, 0) >= 2, by_fmt
+    for ddec in decisions:
+        if ddec.kind != DecisionKind.QUANTIZE:
+            continue
+        k = int(info.by_name(ddec.name).shape[1])
+        if k == 3360:
+            assert ddec.format == FORMAT_INT8, ddec
+        elif k == 13568:
+            assert ddec.format == FORMAT_W4A8, ddec
+    # mixed payload must be smaller than w4a8-only (bf16 fallback) payload
+    entries, mixed_bytes = build_output_entries(info, decisions, FORMAT_MIXED, None)
+    dec_w4a8 = classify_tensors(info, det, FORMAT_W4A8, None, [], [], [],
+                                None, None)
+    entries8, bytes8 = build_output_entries(info, dec_w4a8, FORMAT_W4A8, None)
+    assert mixed_bytes < bytes8, (mixed_bytes, bytes8)
+    assert summary["global_mean_error"] is not None
+    # heterogeneous metadata
+    plan = ConversionPlan(fmt=FORMAT_MIXED, detection=det, decisions=decisions,
+                          metadata_quant={}, metadata_ext={}, output_entries=entries)
+    plan.mixed_plan = summary
+    qm = build_quant_metadata(info, plan)
+    fmts = {conf["format"] for conf in qm["layers"].values()}
+    assert fmts == {FORMAT_W4A8, FORMAT_INT8}, fmts
+    return (f"mixed plan: {by_fmt[FORMAT_INT8]} INT8 + {by_fmt[FORMAT_W4A8]} "
+            f"W4A8 layers, {human_bytes(mixed_bytes)} vs w4a8-only "
+            f"{human_bytes(bytes8)}; heterogeneous metadata")
+
+
+def _test_mixed_e2e() -> str:
+    """End-to-end mixed conversion + validation on the Boogu real-dims
+    fixture: INT8 fallback layers serialize, validate and reload."""
+    d = _tmpdir()
+    src_path = os.path.join(d, "boogu_e2e.safetensors")
+    _make_boogu_real_dims_checkpoint(src_path, n=48, n_fail=4, n_ok=2)
+    out = os.path.join(d, "out_mixed.safetensors")
+    args = _selftest_args(out, FORMAT_MIXED, extra={
+        "validate": True, "profile": "balanced", "format": "mixed",
+        "target_runtime": "cpu", "quality_gate": None, "global_error_gate": None,
+        "max_linear_bytes_per_param": None, "w4a4_linear_dtype": "int8",
+        "disable_w4a4": False, "disable_w4a8": False, "disable_int8": False,
+        "require_calibration": False})
+    dec = classify_tensors(info := discover_checkpoint(src_path),
+                           det := detect_architecture(
+                               info, shape_lookup=lambda n: (
+                                   info.by_name(n).shape if info.by_name(n) else None)),
+                           FORMAT_MIXED, None, [], [], [], None, None)
+    planner = MixedPlanner("balanced", None, 2 * 1024**3, torch.device("cpu"), None)
+    summary = planner.plan(info, dec)
+    entries, total = build_output_entries(info, dec, FORMAT_MIXED, None)
+    plan = ConversionPlan(fmt=FORMAT_MIXED, detection=det, decisions=dec,
+                          metadata_quant={}, metadata_ext={}, output_entries=entries)
+    plan.total_out_bytes = total
+    plan.n_quantized = len(dec)
+    plan.n_kept = 0
+    plan.mixed_plan = summary
+    plan.metadata_quant = build_quant_metadata(info, plan)
+    engine = ConversionEngine(info, plan, args, out + ".state.json",
+                              out + ".tmp", out)
+    engine.run()
+    engine.close()
+    assert os.path.exists(out)
+    meta = dict(info.metadata)
+    meta[METADATA_KEY_QUANT] = json_dumps(plan.metadata_quant)
+    meta[METADATA_KEY_EXT] = json_dumps(build_extension_metadata(
+        info, plan, inspect_environment(), args, None, None,
+        hash_checkpoint_files(info), sha256_safetensors_payload(out),
+        {"status": "selftest"}, []))
+    republish_with_metadata(out, out, meta, entries)
+    validation_plan = plan_from_output(out, det, FORMAT_MIXED, info)
+    validator = Validator(info, validation_plan, out, args, inspect_environment())
+    with CheckpointReader(info) as validation_reader:
+        summary_v = validator.run(reader=validation_reader)
+    assert summary_v["n_failed"] == 0, summary_v
+    with safe_open(out, framework="pt") as st:
+        qm = json.loads(st.metadata()[METADATA_KEY_QUANT])
+        fmts = {conf["format"] for conf in qm["layers"].values()}
+        assert fmts == {FORMAT_W4A8, FORMAT_INT8}, fmts
+    # reload each format through comfy-kitchen layouts and run one forward
+    try:
+        import comfy_kitchen  # noqa: F401
+        from comfy_kitchen.tensor.base import QuantizedTensor, get_layout_class
+    except Exception:
+        return ("mixed e2e: heterogeneous checkpoint converted, validated "
+                f"(n_failed=0), metadata {sorted(fmts)}; comfy-kitchen not "
+                "installed for layout reload")
+    with safe_open(out, framework="pt") as st:
+        ok_fwd = True
+        for layer, conf in qm["layers"].items():
+            lfmt = conf["format"]
+            w_slice = st.get_slice(layer + ".weight")
+            n = w_slice.get_shape()[0]
+            if lfmt == FORMAT_INT8:
+                layout = get_layout_class("TensorWiseINT8Layout")
+                scale = st.get_tensor(layer + ".weight_scale")
+                params = layout.Params(
+                    scale=scale, orig_dtype=torch.float32,
+                    orig_shape=(n, w_slice.get_shape()[1]))
+            elif lfmt == FORMAT_W4A8:
+                layout = get_layout_class("AsymW4A8Int8Layout")
+                params = layout.Params(
+                    scale=st.get_tensor(layer + ".weight_s_rel").view(
+                        torch.float8_e4m3fn),
+                    s_channel=st.get_tensor(layer + ".weight_s_channel"),
+                    codebook=st.get_tensor(layer + ".weight_codebook"),
+                    group_size=conf["group_size"],
+                    convrot_groupsize=conf["convrot_groupsize"],
+                    orig_dtype=torch.float32,
+                    orig_shape=(n, w_slice.get_shape()[1] * 2))
+            else:
+                continue
+            qt = QuantizedTensor(
+                st.get_tensor(layer + ".weight"), layout.__name__, params)
+            dq = qt.dequantize()
+            ok_fwd = ok_fwd and torch.isfinite(dq).all() and dq.numel() > 0
+        assert ok_fwd
+    return ("mixed e2e: heterogeneous checkpoint converted, validated "
+            f"(n_failed=0), metadata {sorted(fmts)}, layouts reload + dequant OK")
+
 def _selftest_args(out: str, fmt: str, resume: bool = False, overwrite: bool = False,
                    extra: Optional[Dict[str, Any]] = None) -> argparse.Namespace:
     ns = argparse.Namespace(
@@ -6933,7 +7962,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.validation_only:
         if not args.output or not os.path.exists(args.output):
             parser.error("--validation-only requires an existing --output file")
-        fmt = FORMAT_W4A8
+        if args.format == "w4a8":
+            fmt = FORMAT_W4A8
+        elif args.format == "mixed":
+            fmt = FORMAT_MIXED
+        else:
+            parser.error(f"--format must be w4a8 or mixed, got {args.format!r}")
         plan = plan_from_output(args.output, detection, fmt, info)
         validator = Validator(info, plan, args.output, args, env)
         validation_input_hashes = hash_checkpoint_files(info)
@@ -6946,7 +7980,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             shape = tuple(tensor.shape) if tensor is not None else "missing"
             quant_rows.append(
                 f"{decision.layer}: {shape} gs={decision.group_size} "
-                f"cgs={decision.convrot_groupsize}")
+                f"cgs={decision.convrot_groupsize} "
+                f"fmt={decision.format}")
         report = build_report(info, plan, env, args, detection, None, {},
                               summary, validation_input_hashes,
                               summary.get("output_sha256", ""),
@@ -6954,7 +7989,54 @@ def main(argv: Optional[List[str]] = None) -> int:
         _write_reports(args, report)
         return 0 if summary["n_failed"] == 0 else 2
 
-    fmt = FORMAT_W4A8
+    if args.format == "w4a8":
+        fmt = FORMAT_W4A8
+    elif args.format == "mixed":
+        fmt = FORMAT_MIXED
+    else:
+        parser.error(f"--format must be w4a8 or mixed, got {args.format!r}")
+
+    # ---- mixed-mode runtime + profile resolution (auto) ----
+    # Auto detects the GPU (NVIDIA CUDA, AMD ROCm, or CPU) and picks the
+    # balanced profile on an accelerator, conservative on CPU.  The detected
+    # architecture is already known here; a calibration-free balanced run is
+    # allowed but reported as weight-gated rather than activation-gated.
+    effective_runtime = "auto"
+    if args.target_runtime != "auto":
+        effective_runtime = args.target_runtime
+    elif torch.cuda.is_available():
+        if getattr(torch.version, "hip", None) is not None:
+            effective_runtime = "amd"
+        else:
+            effective_runtime = "nvidia"
+    else:
+        effective_runtime = "cpu"
+    if fmt == FORMAT_MIXED:
+        profile_name = args.profile
+        if profile_name == "auto":
+            profile_name = "balanced" if effective_runtime != "cpu" else "conservative"
+            warnings.append(
+                f"auto profile: {profile_name} for target runtime "
+                f"{effective_runtime} (set --profile to override)")
+        if args.require_calibration and not args.calibration_source:
+            parser.error("--require-calibration needs --calibration-source")
+        disabled_formats = []
+        if args.disable_w4a4:
+            disabled_formats.append(FORMAT_W4A4)
+        if args.disable_w4a8:
+            disabled_formats.append(FORMAT_W4A8)
+        if args.disable_int8:
+            disabled_formats.append(FORMAT_INT8)
+        if len(disabled_formats) == 3:
+            parser.error("at least one quantized format must stay enabled in mixed mode")
+        if args.w4a4_linear_dtype == "int4" and effective_runtime == "cpu":
+            warnings.append(
+                "linear_dtype=int4 on CPU uses the eager dequant path; "
+                "int8 is faster there")
+        globals()["W4A4_LINEAR_DTYPE"] = args.w4a4_linear_dtype
+        args._mixed_profile_name = profile_name
+        args._mixed_disabled_formats = disabled_formats
+        args._effective_runtime = effective_runtime
 
     if args.output is None:
         parser.error("--output is required")
@@ -7021,12 +8103,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             warnings.append("--device rocm requested but a ROCm backend is "
                             "unavailable; CPU used")
 
-    # Sensitivity decisions are a planning operation.  They must be complete
-    # before output shapes and offsets are frozen.
+    # Sensitivity / mixed planning is a planning operation.  It must be
+    # complete before output shapes and offsets are frozen.
     needs_sensitivity_prepass = (
-        args.sensitivity_threshold is not None
-        or args.error_threshold is not None
-        or args.calibration_source is not None
+        fmt == FORMAT_W4A8
+        and (args.sensitivity_threshold is not None
+             or args.error_threshold is not None
+             or args.calibration_source is not None)
     )
     prepass_source_hashes = (
         hash_checkpoint_files(info, refresh=True)
@@ -7038,7 +8121,41 @@ def main(argv: Optional[List[str]] = None) -> int:
                                        args.calibration_samples, args.calibration_cache,
                                        args.max_memory)
     sensitivity = None
-    if needs_sensitivity_prepass:
+    mixed_planner = None
+    if fmt == FORMAT_MIXED:
+        profile_name = getattr(args, "_mixed_profile_name", "balanced")
+        layer_gate = args.quality_gate
+        if layer_gate is None and args.error_threshold is not None:
+            layer_gate = args.error_threshold
+        mixed_planner = MixedPlanner(
+            profile_name, calibration, args.max_memory, effective_device,
+            compute_dtype,
+            disabled_formats=getattr(args, "_mixed_disabled_formats", ()),
+            layer_gate=layer_gate,
+            global_gate=args.global_error_gate)
+        mixed_plan = mixed_planner.plan(info, decisions)
+        if not calibration:
+            warnings.append(
+                "mixed planner: no calibration activations, quality gates use "
+                "weight-only reconstruction error (pass --calibration-source "
+                "for activation-aware gates)")
+        if mixed_plan["promotions"]:
+            warnings.append(
+                f"mixed planner: global gate required {len(mixed_plan['promotions'])} "
+                "promotion(s): " + "; ".join(mixed_plan["promotions"][:3]) +
+                (" ..." if len(mixed_plan["promotions"]) > 3 else ""))
+        if mixed_plan["kept"]:
+            warnings.append(
+                f"mixed planner kept {mixed_plan['kept']} layer(s) at original "
+                "precision (no candidate within the quality gate)")
+        if profile_name != "balanced" and args.quality_gate is None \
+                and args.global_error_gate is None:
+            warnings.append(
+                f"mixed profile {profile_name}: layer gate "
+                f"{mixed_planner.layer_gate}, global gate "
+                f"{mixed_planner.global_gate} (override with --quality-gate / "
+                "--global-error-gate)")
+    elif needs_sensitivity_prepass:
         sensitivity = SensitivityAnalyzer(
             args.sensitivity_threshold,
             args.error_threshold if args.error_threshold is not None
@@ -7060,6 +8177,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     plan = ConversionPlan(fmt=fmt, detection=detection, decisions=decisions,
                           metadata_quant={}, metadata_ext={}, output_entries=[])
     plan.device = effective_backend
+    if mixed_planner is not None:
+        plan.mixed_plan = mixed_planner.summary
     entries, total_out = build_output_entries(info, decisions, fmt, out_dtype)
     plan.output_entries = entries
     plan.total_out_bytes = total_out
@@ -7081,7 +8200,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     for d in plan.quantized_layers():
         m = info.by_name(d.name)
         quant_rows.append(
-            f"{d.layer}: {tuple(m.shape)} gs={d.group_size} cgs={d.convrot_groupsize}")
+            f"{d.layer}: {tuple(m.shape)} gs={d.group_size} "
+            f"cgs={d.convrot_groupsize} fmt={d.format}")
 
     comp_stats = compression_stats(info, plan, detection)
     effective_group_size = (plan.quantized_layers()[0].group_size
@@ -7134,7 +8254,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             n_kept=plan.n_kept, comp=comp_stats, group_size=effective_group_size,
             validation=None, elapsed=time.time() - t_start, warnings=warnings,
             report_path=os.path.abspath(args.report) if args.report else None,
-            dry_run=True)
+            dry_run=True, mixed_plan=plan.mixed_plan)
         return 0
 
     # ---- conversion ----
@@ -7269,7 +8389,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         group_size=effective_group_size, validation=summary,
         elapsed=time.time() - t_start, warnings=warnings,
         report_path=os.path.abspath(args.report) if args.report else None,
-        dry_run=False)
+        dry_run=False, mixed_plan=plan.mixed_plan)
 
     # ---- cleanup ----
     if os.path.exists(tmp_path):
