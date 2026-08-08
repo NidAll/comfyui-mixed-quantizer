@@ -10,12 +10,16 @@ This branch (`experimental/mixed-precision`) adds `--format mixed`: a
 per-layer optimizer over the ComfyUI-native formats `convrot_w4a4`,
 `asym_w4a8_int8`, and `int8_tensorwise`. It is experimental and not merged to
 main. `--format w4a8` remains the default and is byte-identical to main
-v1.3.0 (golden vectors and the 30/30 self-test suite prove it).
+v1.3.0 (golden vectors and the 35/35 self-test suite prove it).
 
 - Local path: `/home/nidall/projects/testdeepseek/quantizationscripts_w4a8_w3a8`
 - Repo (public): `https://github.com/NidAll/comfyui-w4a8-quantizer`
 - Branch: `experimental/mixed-precision` (do not merge to main without review)
 - Script version: `1.4.0-experimental` (`CONVERTER_VERSION`)
+- Audit status: P0 items closed (hard quality/compression gates, BF16
+  promotion candidate, runtime-output calibration metric, per-format runtime
+  compatibility probe). Remaining certification gaps are documented in the
+  README limitations (real-model three-layout forward, LoRA/offload).
 
 ## Format facts (verified, do not guess)
 
@@ -59,26 +63,47 @@ required (CUDA fused kernels are ConvRot-256-only).
 ## Mixed mode design
 
 `MixedPlanner` (in the converter): per-layer candidate evaluation (quantize +
-dequantize each eligible format, error vs source and vs calibration
-activations when present), cheapest-acceptable selection under the profile's
-per-layer gate, then a greedy promotion loop (best error reduction per extra
-byte) until the global mean gate passes. Selection and promotion mutate
-`TensorDecision.format` / `.convrot_groupsize` and must run BEFORE
+dequantize each eligible format; with calibration activations the error is
+the RUNTIME OUTPUT error, an exact eager-path emulation: activation rotation,
+dynamic rowwise activation quantization (int8, or int4 for the W4A4 int4
+variant), and the scaled quantized GEMM), cheapest-acceptable selection under
+the profile's per-layer gate, then a greedy promotion loop (best error
+reduction per extra byte, original precision included as the final rescue)
+until the PARAM-WEIGHTED global mean gate passes. Selection and promotion
+mutate `TensorDecision.format` / `.convrot_groupsize` and must run BEFORE
 `build_output_entries` (output shapes and offsets depend on per-layer
 formats).
 
+`--target-runtime` feeds `RuntimeCapabilities` (`runtime_capabilities_for`)
+into eligibility: nvidia = all three formats accelerated (verified on the RTX
+3050), amd = HIP/triton paths (not certified here), cpu = eager fallback for
+all three. Unsupported formats get `eligible=False` with the reason recorded.
+Before conversion `_check_runtime_compatibility` fails closed: every selected
+format must exist in the installed ComfyUI quant_ops registry (when comfy is
+installed) and every required layout must exist in comfy-kitchen (when
+installed); neither installed -> warning only.
+
 Profiles (`MIXED_PROFILE_DEFAULTS`):
 
-| Profile | layer gate | global gate | notes |
-| ------- | ---------: | ----------: | ----- |
-| balanced | 0.10 | 0.08 | GPU default via `--profile auto` |
-| conservative | 0.05 | 0.04 | CPU default via `--profile auto` |
-| size-first | 0.15 | 0.10 | admits W4A4 (~0.14 error) |
+| Profile | layer gate | global gate | B/param target | max original share |
+| ------- | ---------: | ----------: | -------------: | -----------------: |
+| balanced | 0.10 | 0.08 | 0.90 | 0.05 |
+| conservative | 0.05 | 0.04 | 1.05 | 0.02 |
+| size-first | 0.15 | 0.10 | 0.75 | 0.10 |
 
 Gate defaults are anchored to the measured W4A8 weight error (~0.073). Do not
-"improve" them without re-measuring on real dims. `--quality-gate` and
-`--global-error-gate` override; without calibration the gates use weight-only
-error and the planner warns.
+"improve" them without re-measuring on real dims. `--quality-gate`,
+`--global-error-gate`, `--max-linear-bytes-per-param`, and
+`--max-bf16-fraction` override; without calibration the quality gates use
+weight-only error and the planner warns.
+
+Gates are HARD (audit P0 fixes): `_enforce_gates` raises QualityGateError
+(weighted mean error above the global gate, or a plan that quantizes nothing)
+and CompressionGateError (effective targeted bpp above target, or
+original-precision share above the limit). The global mean is PARAM-WEIGHTED
+by layer params, not a plain average. BF16/FP16 is a real promotion candidate
+(original bytes, zero error): a layer can be promoted INT8 -> original, and
+an all-original plan is rejected, never published.
 
 ## Environment
 
@@ -90,7 +115,7 @@ reset). `.venv` has torch 2.13.0+cu130 and comfy-kitchen 0.2.28.
 ## Common commands
 
 ```bash
-.venv/bin/python comfyui_wxa8_quantizer.py --self-test          # 30/30 required
+.venv/bin/python comfyui_wxa8_quantizer.py --self-test          # 35/35 required
 .venv/bin/python comfyui_wxa8_quantizer.py --list-architectures
 .venv/bin/python comfyui_wxa8_quantizer.py MODEL.safetensors --inspect
 
@@ -117,9 +142,11 @@ mixed balanced = 16 W4A8 + 4 INT8; wan mixed size-first = 10 W4A8 + 9 W4A4 +
 
 ## Verification before claiming success
 
-1. `--self-test` must pass 30/30 (includes W4A4/INT8 golden byte digests,
+1. `--self-test` must pass 35/35 (includes W4A4/INT8 golden byte digests,
    eligibility matrix, mixed planning on real Boogu dims, mixed e2e with
-   comfy-kitchen layout reload).
+   comfy-kitchen layout reload, hard gate failures, BF16 promotion, runtime
+   capability matrix, runtime-output metric vs eager kernels, architecture
+   sync).
 2. All fixture families must pass `--validate` in BOTH `--format w4a8`
    (regression; max relL2 about 0.073) and `--format mixed --profile balanced`
    (0 failed).
@@ -132,6 +159,12 @@ mixed balanced = 16 W4A8 + 4 INT8; wan mixed size-first = 10 W4A8 + 9 W4A4 +
    `load_torch_file -> convert_old_quants -> load_diffusion_model_state_dict`,
    then check weights are `QuantizedTensor` with the expected layout classes
    (`TensorCoreConvRotW4A4Layout`, `AsymW4A8Int8Layout`, `TensorWiseINT8Layout`).
+   `testdata/comfyui_smoke.py` now asserts the layout of every quantized layer
+   against its metadata format for both w4a8 and mixed checkpoints.
+6. `testdata/comfyui_architecture_sync.py` must pass against the pinned
+   ComfyUI revision (CI tarball mode) and against the local
+   `research/ComfyUI` checkout when present. The nightly workflow checks
+   ComfyUI main and fails naming any new unaccounted class.
 
 ## Known behavior, do not "fix" it
 
@@ -145,6 +178,18 @@ mixed balanced = 16 W4A8 + 4 INT8; wan mixed size-first = 10 W4A8 + 9 W4A4 +
   code (quantize dispatch, output entries, engine writers, metadata builders,
   plan_from_output, Validator) must keep `--format w4a8` outputs unchanged;
   the golden-vector and deterministic-conversion self-tests guard this.
+- Extension metadata is schema-versioned: w4a8 outputs use `comfy_wxa8/v1`
+  (W4A8-global fields), mixed outputs use `comfy_wxa8/v2` (`mode: mixed`,
+  per-format contracts, distribution, gates, runtime status). Never write
+  W4A8-global fields (fp8 scales, codebook packing) into a v2 block.
+- The global quality metric is the PARAM-WEIGHTED mean over quantized layers.
+  `global_mean_error(info, decisions)` needs `info` now; callers must pass it.
+- The calibration metric simulates the runtime operation
+  (`runtime_output_rel_l2` / `_simulate_quantized_chunk`): activation
+  rotation, activation quantization, scaled GEMM. It is NOT
+  `(dequant(W)-W)X`. The self-test cross-checks the W4A4-int4 simulation
+  against comfy-kitchen's eager `convrot_w4a4_linear` (must agree within
+  0.02).
 - ConvRot for W4A8 is 256-only. W4A4 may use cgs 16/64/256 per layer.
 - Only 2D linear weights are quantized. Convolutions, embeddings, norms,
   heads, and modulations pass through with the reason recorded.

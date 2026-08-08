@@ -118,11 +118,21 @@ Selection is "cheapest acceptable": the smallest candidate whose error is
 below the profile's per-layer gate wins. If no candidate passes, the layer
 stays at original precision with the reason recorded.
 
-After local selection, a global gate runs on the mean error over all selected
-layers. If it fails, the planner promotes greedily: it repeatedly upgrades the
-layer with the best error reduction per extra byte (W4A4 to W4A8, W4A8 to
-INT8) until the gate passes or no promotion helps. Promotions are listed in
-the report and in the console warnings.
+After local selection, a global gate runs on the parameter-weighted mean
+error over all selected layers (a huge FFN counts more than a small
+projection). If it fails, the planner promotes greedily: it repeatedly
+upgrades the layer with the best error reduction per extra byte (W4A4 to
+W4A8, W4A8 to INT8, and INT8 all the way to original precision when that is
+the cheapest way to buy quality) until the gate passes. Promotions are listed
+in the report and in the console warnings.
+
+The gates are hard. A plan that cannot meet its gates is not published:
+QualityGateError and CompressionGateError abort the conversion with the
+measured numbers and the override that would let it through. A plan that
+quantizes nothing is rejected as a passthrough-only checkpoint. The
+compression gates enforce the profile's effective bytes/parameter target and
+its original-precision share of the targeted linear payload, both reported in
+the console summary and the report.
 
 Eligibility rules per format:
 
@@ -136,26 +146,47 @@ candidate set, which is useful for A/B experiments.
 
 The `linear_dtype` field of `convrot_w4a4` is an execution property, not a
 quality fallback. It selects the int4 or int8 activation path in ComfyUI and
-never changes the stored 4-bit weights. The default is `int8` (better
-activation fidelity, works on every backend including eager); `int4` is the
-true W4A4 path.
+never changes the stored 4-bit weights. The default is `int8`. One caveat:
+the comfy-kitchen eager backend accepts both values but always executes the
+int4 activation path; `linear_dtype=int8` only changes the CUDA kernels. The
+planner's runtime metric simulates the selected variant, so a CPU-only
+conversion evaluates the int4 path.
+
+`--target-runtime` feeds a real capability matrix into the planner.
+Eligibility is per format and per backend: nvidia reports all three formats
+accelerated, amd reports the HIP/triton paths, cpu reports eager fallback for
+every format. A format the target runtime cannot run is excluded from the
+candidates with the reason recorded, and the report lists the support status
+per format (accelerated vs eager fallback vs unsupported).
 
 ## Profiles and gates
 
-| Profile | Layer gate | Global mean gate | Use |
-| ------- | ---------: | ---------------: | --- |
-| balanced | 0.10 | 0.08 | default on GPU; W4A8 workhorse, INT8 for awkward dims |
-| conservative | 0.05 | 0.04 | CPU default; pushes W4A8 toward INT8, highest fidelity |
-| size-first | 0.15 | 0.10 | admits W4A4 (error ~0.14), smallest output |
+| Profile | Layer gate | Global mean gate | B/param target | Max original share |
+| ------- | ---------: | ---------------: | -------------: | -----------------: |
+| balanced | 0.10 | 0.08 | 0.90 | 5% |
+| conservative | 0.05 | 0.04 | 1.05 | 2% |
+| size-first | 0.15 | 0.10 | 0.75 | 10% |
 
 The defaults are set against measured W4A8 behavior: the codebook path has
 weight-only relL2 around 0.073, so the balanced global gate sits just above it
 and the conservative gate sits below it. `--quality-gate F` and
 `--global-error-gate F` override both. Without calibration the gates use
 weight-only reconstruction error and the planner prints a warning;
-`--calibration-source` switches them to activation-aware error.
-`--max-linear-bytes-per-param F` sets a compression target for the quantized
-linear payload, reported in the summary.
+`--calibration-source` switches them to runtime-output error.
+
+The calibration metric is the real quantized operation, not a
+reconstructed-weight approximation. For every candidate the planner emulates
+the eager runtime path exactly: activation rotation (ConvRot formats),
+dynamic rowwise activation quantization (int8, or int4 for the W4A4 int4
+variant), and the scaled quantized GEMM. The error is the mean over samples
+of ||Y_quant - Y_bf16|| / ||Y_bf16||. The emulation is cross-checked against
+comfy-kitchen's eager kernels in the self-tests (int8 error 0.011, W4A4-int4
+0.204, W4A4-int8 0.143 on the golden activation set).
+
+Compression is enforced, not advisory. `--max-linear-bytes-per-param F`
+replaces the profile's effective bytes/parameter target and
+`--max-bf16-fraction F` replaces the original-precision share limit; a plan
+that misses either aborts with CompressionGateError.
 
 ## Main options
 
@@ -165,7 +196,8 @@ linear payload, reported in the summary.
 --target-runtime auto|nvidia|amd|cpu
 --quality-gate F               per-layer error gate override
 --global-error-gate F          global mean error gate override
---max-linear-bytes-per-param F compression target for the linear payload
+--max-linear-bytes-per-param F hard bytes/parameter target (profile default)
+--max-bf16-fraction F          hard original-precision share limit
 --w4a4-linear-dtype int4|int8  convrot_w4a4 execution variant (default int8)
 --disable-w4a4 / --disable-w4a8 / --disable-int8
 --require-calibration          refuse planning without activation data
@@ -220,8 +252,30 @@ own format and parameters:
 ```
 
 ComfyUI reads each entry into its own `.comfy_quant` record. No custom format
-name is introduced. The `comfy_wxa8` extension block records the profile,
-gates, promotions, and the per-format distribution.
+name is introduced.
+
+The `comfy_wxa8` extension block is schema-versioned. Single-format W4A8
+outputs use `comfy_wxa8/v1` with the W4A8-global fields (fp8 scales, codebook
+packing, format revision). Mixed outputs use `comfy_wxa8/v2`: a `mode:
+"mixed"` marker, per-format contract details (weight bits, scale dtype,
+packing, ConvRot), the distribution (layer counts, params, bytes per format,
+kept payload, effective bytes/parameter, original-precision share, weighted
+global error, promotions), the profile and gates, and the runtime target with
+per-format support status. The v2 revision is `mixed-r1`, never the W4A8
+revision.
+
+## Runtime compatibility
+
+Before conversion, the mixed mode probes the machine statically (installed
+package source, never a runtime import). Every selected format must exist in
+the installed ComfyUI `quant_ops.py` registry and every required layout
+(`AsymW4A8Int8Layout`, `TensorCoreConvRotW4A4Layout`, `TensorWiseINT8Layout`)
+must exist in the installed comfy-kitchen. A missing format or layout aborts
+the conversion with RuntimeCompatibilityError and suggests the `--disable-*`
+escape. When neither package is installed the probe is unavailable and the
+per-format runtime-contract validators remain the verification layer, with a
+warning. `--validate` re-checks the same per-format requirements after the
+conversion.
 
 ## Architecture support
 
@@ -234,10 +288,13 @@ closed unless `--architecture` is given.
 
 ## Validation
 
-* `--self-test`: 30 embedded checks, including golden vectors for W4A4 and
+* `--self-test`: 35 embedded checks, including golden vectors for W4A4 and
   INT8 (byte-identical to comfy-kitchen's eager implementations), the
-  eligibility matrix, mixed planning on real Boogu dims, and an end-to-end
-  mixed conversion with layout reload through comfy-kitchen.
+  eligibility matrix, mixed planning on real Boogu dims, hard-failure tests
+  for every gate, BF16 promotion, the runtime capability matrix, the
+  runtime-output metric cross-checked against comfy-kitchen's eager kernels,
+  an end-to-end mixed conversion with layout reload, and an architecture
+  coverage sync against the pinned ComfyUI revision.
 * `--validate`: reopens the output, checks the inventory, shapes, dtypes,
   per-format metadata and runtime contract (each format has its own shape and
   K rules), scales, packing round trips, reconstruction error against the
@@ -246,12 +303,30 @@ closed unless `--architecture` is given.
 * `testdata/cuda_smoke.py`: CUDA regression for the fused W4A8 kernels, the
   INT8 non-ConvRot path at K=3360, W4A4 at K=1152 with cgs=16 in both
   `linear_dtype` variants, and a full mixed checkpoint through the kernels.
-  9/9 checks pass on an RTX 3050.
+  9/9 checks pass on an RTX 3050. The workflow runs on release tags, pushes
+  to the default branch, and PRs touching the converter, in addition to
+  manual dispatch.
+* `testdata/comfyui_smoke.py`: real ComfyUI load path for W4A8 and mixed
+  checkpoints. It reads the per-layer metadata and asserts each quantized
+  module's layout matches its format (TensorCoreConvRotW4A4Layout /
+  AsymW4A8Int8Layout / TensorWiseINT8Layout), then runs one diffusion-model
+  forward. A full three-layout forward still needs the real checkpoint on a
+  ComfyUI >= v0.31.0 machine.
+* `testdata/comfyui_architecture_sync.py`: compares the embedded registry
+  (43 families) with ComfyUI's `supported_models.py` class set. CI runs it
+  against the pinned research revision; a nightly workflow runs it against
+  ComfyUI main and fails naming any newly added, unaccounted class.
 
 ## Known limitations
 
-* Mixed mode is experimental. The per-layer gates are weight-based without
-  calibration; activation-aware gates need `--calibration-source`.
+* Mixed mode is experimental. The quality gates are weight-based without
+  calibration; runtime-output gates need `--calibration-source`. The gates
+  are hard either way: an unmet gate aborts the conversion instead of
+  publishing a checkpoint that misses its targets.
+* The W4A4/W4A8/INT8 quality characteristics assume the CUDA kernels for
+  `linear_dtype=int8`. On the eager backend, W4A4 always runs the int4
+  activation path, which is noisier; the planner simulates the variant you
+  selected, so a CPU conversion is evaluated on the int4 path.
 * The ComfyUI loader accepts the three formats individually and mixed
   checkpoints load them per layer, but a full one-step model forward with all
   three layouts in one model has only been exercised at kernel level. The
