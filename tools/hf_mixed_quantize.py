@@ -39,6 +39,7 @@ import json
 import os
 import subprocess
 import sys
+import urllib.parse
 import urllib.request
 
 CONVERTER_URL = ("https://raw.githubusercontent.com/NidAll/"
@@ -46,6 +47,30 @@ CONVERTER_URL = ("https://raw.githubusercontent.com/NidAll/"
 GPU_LEAK_PATTERNS = ("3050", "3060", "3070", "3080", "3090", "4060", "4070",
                      "4080", "4090", "Tesla", "GeForce", "Quadro", "RTX",
                      "Radeon", "RX ", "gfx9", "gfx10", "gfx11", "gfx12")
+
+
+def parse_hf_url(url: str) -> tuple[str, str, str]:
+    """Parse a Hugging Face blob/resolve URL into (repo_id, revision,
+    filename).
+
+    Accepts:
+      https://huggingface.co/org/repo/blob/main/path/file.safetensors
+      https://huggingface.co/org/repo/resolve/main/path/file.safetensors
+      https://huggingface.co/org/repo/resolve/<commit>/path/file.safetensors
+    """
+    parts = urllib.parse.urlsplit(url)
+    if parts.netloc not in ("huggingface.co", "hf.co"):
+        raise SystemExit(f"not a Hugging Face URL: {url}")
+    seg = [s for s in parts.path.split("/") if s]
+    if len(seg) < 4 or seg[2] not in ("blob", "resolve"):
+        raise SystemExit(
+            f"expected .../org/repo/blob|resolve/<rev>/<path>, got: {url}")
+    repo_id = f"{seg[0]}/{seg[1]}"
+    revision = seg[3]
+    filename = "/".join(seg[4:])
+    if not filename:
+        raise SystemExit(f"no file path in URL: {url}")
+    return repo_id, revision, filename
 
 
 def resolve_token() -> str:
@@ -72,6 +97,11 @@ def fetch_converter(dest: str) -> str:
 
 def download_model(args, token: str) -> str:
     from huggingface_hub import hf_hub_download, snapshot_download
+    if args.hf_url:
+        repo_id, revision, filename = parse_hf_url(args.hf_url)
+        print(f"downloading {repo_id}/{filename} @ {revision}")
+        return hf_hub_download(repo_id=repo_id, filename=filename,
+                               revision=revision, token=token)
     if args.hf_filename:
         print(f"downloading {args.hf_model}/{args.hf_filename}")
         return hf_hub_download(repo_id=args.hf_model, filename=args.hf_filename,
@@ -100,15 +130,21 @@ def upload(args, output: str, token: str) -> str:
     from huggingface_hub import HfApi
     api = HfApi(token=token)
     base = os.path.basename(args.output)
+    source_label = (args.hf_model
+                    if args.hf_model else
+                    (parse_hf_url(args.hf_url)[0] if args.hf_url
+                     else args.local_model))
     repo_name = args.repo_name or (
-        os.path.basename(args.hf_model or args.local_model).replace(".", "-")
-        + "-mixed-w4a8")
+        os.path.basename(source_label).replace(".", "-") + "-mixed-w4a8")
     repo_id = api.create_repo(repo_id=repo_name, private=not args.public,
                               exist_ok=True).repo_id
     print(f"uploading {base} to {repo_id} ({os.path.getsize(output)} bytes)")
     api.upload_file(path_or_fileobj=output, path_in_repo=base, repo_id=repo_id)
     readme = README_TEMPLATE.format(
-        source_model=args.hf_model or os.path.basename(args.local_model),
+        source_model=(args.hf_model
+                     if args.hf_model else
+                     (parse_hf_url(args.hf_url)[0] if args.hf_url
+                      else os.path.basename(args.local_model))),
         filename=base,
         profile=args.profile,
         version="1.4.0",
@@ -161,6 +197,10 @@ def main() -> int:
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--hf-model", default=None,
                      help="Hugging Face repo id (e.g. author/model)")
+    src.add_argument("--hf-url", default=None,
+                     help="full Hugging Face blob/resolve URL of the model "
+                          "file, e.g. "
+                          "https://huggingface.co/org/repo/blob/main/path/model.safetensors")
     src.add_argument("--local-model", default=None,
                      help="local checkpoint instead of a HF download")
     ap.add_argument("--hf-filename", default=None,
@@ -185,7 +225,7 @@ def main() -> int:
     workdir = os.path.dirname(os.path.abspath(args.output)) or "."
     os.makedirs(workdir, exist_ok=True)
 
-    if args.hf_model:
+    if args.hf_model or args.hf_url:
         token = resolve_token()
         model_path = download_model(args, token)
     else:
