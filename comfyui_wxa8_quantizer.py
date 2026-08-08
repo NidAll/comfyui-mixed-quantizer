@@ -197,7 +197,7 @@ FORMAT_ORIGINAL = "original"   # planner-only candidate: keep at source precisio
 # metadata and must be a power of 4 that divides K.
 W4A4_QUANT_GROUP_SIZE = 64
 W4A4_EMISSION_MAX = 7
-W4A4_LINEAR_DTYPE = "int8"          # execution variant: "int4" or "int8"
+DEFAULT_W4A4_LINEAR_DTYPE = "int8"  # default execution variant: "int4" or "int8"
 
 # INT8 rowwise contract: signed int8 [N, K] + fp32 per-row scale [N]
 # (dynamic rowwise activation quantization at runtime, symmetric).
@@ -362,12 +362,105 @@ class EnvironmentInfo:
     comfy_kitchen_has_w4a4_layout: bool = False
     comfy_kitchen_has_int8_layout: bool = False
     comfy_kitchen_rev: Optional[str] = None
-    comfy_kitchen_has_w4a8_layout: bool = False
     has_comfy_quant_ops: bool = False
     comfyui_quant_algos: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return dataclasses.asdict(self)
+
+
+@dataclass(frozen=True)
+class RuntimeCertificate:
+    """Runtime certificate produced by tools/runtime_certify.py on the
+    target inference machine: which formats actually loaded and executed,
+    with the observed effective W4A4 activation precision."""
+    backend: str
+    gpu: Optional[str]
+    cuda_capability: Optional[Tuple[int, int]]
+    rocm_arch: Optional[str]
+    formats: Dict[str, Dict[str, Any]]
+
+
+def load_runtime_certificate(path: str) -> RuntimeCertificate:
+    """Parse and validate a runtime certificate JSON file.
+
+    The certificate is produced by tools/runtime_certify.py (a companion
+    script that MAY import comfy-kitchen; the converter itself stays
+    standalone)."""
+    try:
+        payload = _load_json_object(path, "runtime certificate", nofollow=True)
+    except Exception as e:
+        raise RuntimeCompatibilityError(
+            f"cannot read runtime certificate {path}: {e}") from e
+    if not isinstance(payload, dict):
+        raise RuntimeCompatibilityError(
+            f"runtime certificate {path} is not a JSON object")
+    if payload.get("schema") != "comfy-wxa8-runtime-cert/v1":
+        raise RuntimeCompatibilityError(
+            f"unsupported runtime certificate schema in {path}: "
+            f"{payload.get('schema')!r}")
+    backend = payload.get("backend")
+    if backend not in ("nvidia", "amd", "cpu"):
+        raise RuntimeCompatibilityError(
+            f"runtime certificate has unknown backend {backend!r}")
+    formats = payload.get("formats")
+    if not isinstance(formats, dict):
+        raise RuntimeCompatibilityError(
+            "runtime certificate has no formats object")
+    known = set(MIXED_FORMATS)
+    unknown = set(formats) - known
+    if unknown:
+        raise RuntimeCompatibilityError(
+            f"runtime certificate lists unknown formats: {sorted(unknown)}")
+    cap = payload.get("cuda_capability")
+    if isinstance(cap, (list, tuple)) and len(cap) == 2:
+        cap = (int(cap[0]), int(cap[1]))
+    else:
+        cap = None
+    return RuntimeCertificate(
+        backend=backend,
+        gpu=payload.get("gpu"),
+        cuda_capability=cap,
+        rocm_arch=payload.get("rocm_arch"),
+        formats={fmt: conf for fmt, conf in formats.items()
+                 if isinstance(conf, dict)},
+    )
+
+
+def _check_runtime_certificate(cert: RuntimeCertificate,
+                               runtime: RuntimeCapabilities,
+                               required_formats: Sequence[str]) -> None:
+    """The certificate must cover the target backend and every selected
+    format must have actually loaded and executed on the certified machine."""
+    if cert.backend != runtime.target:
+        raise RuntimeCompatibilityError(
+            f"runtime certificate is for backend {cert.backend!r} but the "
+            f"target runtime is {runtime.target!r}; regenerate the "
+            "certificate with tools/runtime_certify.py on the target machine")
+    if (runtime.cuda_capability is not None
+            and cert.cuda_capability is not None
+            and cert.cuda_capability != runtime.cuda_capability):
+        raise RuntimeCompatibilityError(
+            f"runtime certificate compute capability "
+            f"{cert.cuda_capability} does not match the local GPU "
+            f"{runtime.cuda_capability}")
+    for fmt in required_formats:
+        conf = cert.formats.get(fmt)
+        if not isinstance(conf, dict):
+            raise RuntimeCompatibilityError(
+                f"runtime certificate does not cover format {fmt!r}")
+        if not conf.get("load") or not conf.get("forward"):
+            raise RuntimeCompatibilityError(
+                f"runtime certificate shows format {fmt!r} did not load and "
+                "forward on the target machine")
+    if FORMAT_W4A4 in required_formats:
+        conf = cert.formats.get(FORMAT_W4A4, {})
+        bits = (conf.get("effective_activation_bits")
+                or conf.get("activation_bits"))
+        if bits not in (4, 8):
+            raise RuntimeCompatibilityError(
+                "runtime certificate lacks the observed W4A4 activation "
+                "bits")
 
 
 def inspect_environment() -> EnvironmentInfo:
@@ -1628,6 +1721,9 @@ def dequantize_w4a8_weight(packed: torch.Tensor, s_rel: torch.Tensor,
     weight_rotated = weight_rotated.view(n, k)
     return rotate_int8_convrot_weight(weight_rotated, convrot_groupsize).to(output_dtype)
 
+# DO NOT consolidate this with dequantize_w4a8_weight().
+# One returns the runtime-basis INT8 weight; the other returns the physical
+# FP weight (inverse-rotated). The planner's simulation needs the former.
 def decode_w4a8_runtime_weight(packed: torch.Tensor, s_rel: torch.Tensor,
                                 codebook: Optional[torch.Tensor],
                                 group_size: int) -> torch.Tensor:
@@ -2886,6 +2982,7 @@ class TensorDecision:
     group_size: int = 16
     convrot_groupsize: int = 256
     format: str = FORMAT_W4A8      # per-layer format (mixed mode)
+    linear_dtype: Optional[str] = None   # W4A4 execution variant (per decision)
     out_dtype: Optional[torch.dtype] = None   # passthrough cast target (if any)
     quantized: bool = False        # True once actually quantized
 
@@ -4116,12 +4213,16 @@ class FormatRuntimeCapability:
 
     loadable: the target ComfyUI/comfy-kitchen can deserialize the format.
     executable: a compute path exists (possibly eager fallback).
-    accelerated: an optimized kernel exists for the backend.
+    accelerated: None = not proven, True/False = expected accelerated /
+                 expected fallback from static analysis.
+    certified: True only after a real runtime probe executed the format
+               (tools/runtime_certify.py on the target machine).
     """
     loadable: bool
     executable: bool
-    accelerated: bool
-    backend: str
+    accelerated: Optional[bool]
+    certified: bool = False
+    backend: str = "unknown"
     reason: str = ""
 
     @property
@@ -4131,18 +4232,31 @@ class FormatRuntimeCapability:
     def describe(self) -> str:
         if not self.supported:
             return f"unsupported: {self.reason}" if self.reason else "unsupported"
-        if self.accelerated:
-            return "accelerated"
-        return "eager fallback"
+        if self.certified:
+            if self.accelerated:
+                return "runtime-certified accelerated"
+            return "runtime-certified fallback"
+        if self.accelerated is True:
+            return "expected accelerated (not certified)"
+        if self.accelerated is False:
+            return "eager/fallback"
+        return "supported; acceleration unknown"
 
 
 @dataclass(frozen=True)
 class RuntimeCapabilities:
-    """What the target runtime can actually execute, per format."""
+    """What the target runtime can actually execute, per format, plus the
+    hardware the static model was built for."""
     target: str
     w4a4: FormatRuntimeCapability
     w4a8: FormatRuntimeCapability
     int8: FormatRuntimeCapability
+    gpu_name: Optional[str] = None
+    cuda_capability: Optional[Tuple[int, int]] = None
+    rocm_arch: Optional[str] = None
+    torch_cuda: Optional[str] = None
+    torch_hip: Optional[str] = None
+    runtime_certified: bool = False
 
     _ATTR = {FORMAT_W4A4: "w4a4", FORMAT_W4A8: "w4a8", FORMAT_INT8: "int8"}
 
@@ -4156,48 +4270,144 @@ class RuntimeCapabilities:
         return self.capability(fmt).describe()
 
 
-def resolve_w4a4_activation_bits(target_runtime: str,
-                                 requested_linear_dtype: str) -> int:
-    """Effective W4A4 activation precision on the target runtime.
+def rocm_matrix_core_supported(rocm_arch: Optional[str]) -> bool:
+    """Whether a ROCm architecture has the matrix-core paths ComfyUI's
+    automatic INT8/Triton acceleration relies on. gfx10 (RDNA1/2) is
+    intentionally excluded; RDNA3/3.5/4 (gfx11/gfx12) and the CDNA gfx9
+    parts are matrix-core capable."""
+    if not rocm_arch:
+        return False
+    arch = rocm_arch.split(":")[0]
+    if arch.startswith(("gfx11", "gfx12")):
+        return True
+    return arch in {
+        "gfx908", "gfx90a", "gfx940", "gfx941", "gfx942", "gfx950",
+    }
 
-    The comfy-kitchen eager backend accepts linear_dtype int4/int8 but always
-    executes the int4 activation path. CUDA/HIP honor the request. The
-    planner simulates the EFFECTIVE mode, so the same checkpoint may receive
-    different candidate errors (and therefore a different plan) per target."""
-    if target_runtime == "cpu":
-        return 4
-    return 8 if requested_linear_dtype == "int8" else 4
+
+@dataclass(frozen=True)
+class W4A4ExecutionMode:
+    """Effective W4A4 execution semantics on a target runtime.
+
+    activation_bits: the activation precision the runtime will actually use.
+    path: the dispatch path name (eager-int4, cuda-native-int4, cuda-int8,
+          hip-int4-request, unknown-conservative).
+    certain: True when the mode is proven (eager, explicit int8 request,
+             SM8x native INT4, or a runtime certificate). False when the
+             dispatch depends on compiled kernels or shapes.
+    reason: human-readable justification.
+    """
+    activation_bits: int
+    path: str
+    certain: bool
+    reason: str
 
 
-def runtime_capabilities_for(backend: str) -> RuntimeCapabilities:
-    """Verified capability matrix.
+def resolve_w4a4_execution_mode(
+    runtime: RuntimeCapabilities,
+    requested_linear_dtype: str,
+) -> W4A4ExecutionMode:
+    """Effective W4A4 execution mode, mirroring the comfy-kitchen CUDA
+    dispatcher (verified against 0.2.28):
+
+      linear_dtype int8 -> INT8 activation branch, unconditionally.
+      linear_dtype int4 -> native SM8x INT4 MMA when major == 8; Turing
+      (SM 7.5) may select the compiled Turing INT4 path depending on shape
+      and kernel availability; everything else falls back to INT8.
+      eager (cpu)     -> always the int4 activation path.
+    """
+    if runtime.target == "cpu":
+        return W4A4ExecutionMode(
+            4, "eager-int4", True,
+            "comfy-kitchen eager always executes the int4 activation path")
+    if requested_linear_dtype == "int8":
+        return W4A4ExecutionMode(
+            8, f"{runtime.target}-int8", True,
+            "linear_dtype explicitly requests INT8 execution")
+    if runtime.target == "nvidia":
+        sm = runtime.cuda_capability
+        if sm is not None and sm[0] == 8:
+            return W4A4ExecutionMode(
+                4, "cuda-native-int4", True,
+                "current comfy-kitchen native INT4 MMA supports SM8x")
+        if sm == (7, 5):
+            return W4A4ExecutionMode(
+                8, "cuda-dispatch-uncertain", False,
+                "Turing may select INT4 depending on compiled kernels and "
+                "activation shape; conservative A8 simulation unless "
+                "runtime-certified")
+        return W4A4ExecutionMode(
+            8, "cuda-int8-fallback", True,
+            "comfy-kitchen routes non-SM8x INT4 requests through the INT8 "
+            "fallback")
+    if runtime.target == "amd":
+        return W4A4ExecutionMode(
+            4, "hip-int4-request", False,
+            "must be runtime-certified on the target HIP backend")
+    return W4A4ExecutionMode(
+        8, "unknown-conservative", False,
+        "unknown runtime; conservatively model A8")
+
+
+def runtime_capabilities_for(
+        backend: str,
+        env: Optional[EnvironmentInfo] = None) -> RuntimeCapabilities:
+    """Capability matrix built from the target backend plus (when available)
+    the actual hardware data collected by the environment probe.
 
     nvidia: fused CUDA kernels for W4A8 (ConvRot 256), INT8 tensor-core
     (non-ConvRot rowwise verified at any K), and W4A4 MMA (cgs 16/64/256).
-    amd: HIP/triton kernels exist for all three (w4a4 linear present in the
-    HIP backend; not independently certified on RDNA here).
+    amd: HIP/triton kernels exist for all three, but "accelerated" is only
+    expected on matrix-core-capable architectures (gfx11/gfx12 and CDNA
+    gfx9); RDNA1/2 stay on fallback paths, matching ComfyUI's gating.
     cpu: eager implementations of all three; the eager W4A4 path always
     executes int4 activations regardless of linear_dtype.
+
+    Nothing here is runtime-certified; certification comes from
+    tools/runtime_certify.py via --runtime-certificate.
     """
+    gpu_name = env.cuda_device if env is not None else None
+    cuda_cap = env.cuda_capability if env is not None else None
+    rocm_arch = env.rocm_arch if env is not None else None
+    torch_cuda = env.torch_cuda if env is not None else None
+    torch_hip = env.torch_hip if env is not None else None
+
+    def _fmt(loadable: bool, executable: bool, accelerated: Optional[bool],
+             backend: str, reason: str = "") -> FormatRuntimeCapability:
+        return FormatRuntimeCapability(loadable, executable, accelerated,
+                                       False, backend, reason)
+
     if backend == "nvidia":
         return RuntimeCapabilities(
             target="nvidia",
-            w4a4=FormatRuntimeCapability(True, True, True, "cuda"),
-            w4a8=FormatRuntimeCapability(True, True, True, "cuda"),
-            int8=FormatRuntimeCapability(True, True, True, "cuda"))
+            w4a4=_fmt(True, True, True, "cuda"),
+            w4a8=_fmt(True, True, True, "cuda"),
+            int8=_fmt(True, True, True, "cuda"),
+            gpu_name=gpu_name, cuda_capability=cuda_cap,
+            rocm_arch=rocm_arch, torch_cuda=torch_cuda, torch_hip=torch_hip)
     if backend == "amd":
+        matrix_core = rocm_matrix_core_supported(rocm_arch)
         return RuntimeCapabilities(
             target="amd",
-            w4a4=FormatRuntimeCapability(True, True, True, "hip"),
-            w4a8=FormatRuntimeCapability(True, True, True, "triton/hip"),
-            int8=FormatRuntimeCapability(True, True, True, "triton/hip"))
+            w4a4=_fmt(True, True, matrix_core, "hip",
+                      reason=("no matrix-core path on this ROCm arch"
+                              if not matrix_core else "")),
+            w4a8=_fmt(True, True, matrix_core, "triton/hip",
+                      reason=("no matrix-core path on this ROCm arch"
+                              if not matrix_core else "")),
+            int8=_fmt(True, True, matrix_core, "triton/hip",
+                      reason=("no matrix-core path on this ROCm arch"
+                              if not matrix_core else "")),
+            gpu_name=gpu_name, cuda_capability=cuda_cap,
+            rocm_arch=rocm_arch, torch_cuda=torch_cuda, torch_hip=torch_hip)
     return RuntimeCapabilities(
         target="cpu",
-        w4a4=FormatRuntimeCapability(
-            True, True, False, "eager",
-            reason="eager always executes the int4 activation path"),
-        w4a8=FormatRuntimeCapability(True, True, False, "eager"),
-        int8=FormatRuntimeCapability(True, True, False, "eager"))
+        w4a4=_fmt(True, True, False, "eager",
+                  reason="eager always executes the int4 activation path"),
+        w4a8=_fmt(True, True, False, "eager"),
+        int8=_fmt(True, True, False, "eager"),
+        gpu_name=gpu_name, cuda_capability=cuda_cap,
+        rocm_arch=rocm_arch, torch_cuda=torch_cuda, torch_hip=torch_hip)
 
 
 @dataclass
@@ -4211,6 +4421,9 @@ class CandidateResult:
     # reproducibility record for the W4A4 execution variant
     requested_linear_dtype: Optional[str] = None
     effective_activation_bits: Optional[int] = None
+    effective_runtime_path: Optional[str] = None
+    runtime_certified: bool = False
+    runtime_certain: bool = False
     backend: Optional[str] = None
 
 
@@ -4232,7 +4445,8 @@ class MixedPlanner:
                  runtime: Optional[RuntimeCapabilities] = None,
                  compression_target_bpp: Optional[float] = None,
                  max_bf16_fraction: Optional[float] = None,
-                 linear_dtype: str = W4A4_LINEAR_DTYPE):
+                 linear_dtype: str = DEFAULT_W4A4_LINEAR_DTYPE,
+                 runtime_certificate: Optional["RuntimeCertificate"] = None):
         if profile_name not in MIXED_PROFILE_DEFAULTS:
             raise PolicyError(f"unknown mixed profile {profile_name!r}")
         self.profile = MIXED_PROFILE_DEFAULTS[profile_name]
@@ -4244,8 +4458,7 @@ class MixedPlanner:
         self.runtime = runtime if runtime is not None \
             else runtime_capabilities_for("cpu")
         self.linear_dtype = linear_dtype
-        self.effective_w4a4_bits = resolve_w4a4_activation_bits(
-            self.runtime.target, linear_dtype)
+        self.runtime_certificate = runtime_certificate
         self.layer_gate = (layer_gate if layer_gate is not None
                            else self.profile.layer_gate)
         self.global_gate = (global_gate if global_gate is not None
@@ -4290,6 +4503,33 @@ class MixedPlanner:
         return W4A8_CONVROT_GROUPSIZE
 
     # -- evaluation --------------------------------------------------------
+    def _w4a4_scoring_modes(self) -> Tuple[List[int], W4A4ExecutionMode]:
+        """Activation-bit modes to score a W4A4 candidate with. Certain
+        modes evaluate one value; uncertain modes evaluate BOTH and the
+        caller takes the worst (max) error, so the planner never
+        optimistically assumes a dispatch it cannot prove."""
+        mode = self.w4a4_execution_mode_for_candidate()
+        if mode.certain:
+            return [mode.activation_bits], mode
+        return [4, 8], mode
+
+    def w4a4_execution_mode_for_candidate(self) -> W4A4ExecutionMode:
+        """Effective W4A4 execution mode for candidate evaluation: a runtime
+        certificate (observed on the target machine) wins over the static
+        dispatch model. Uncertain static modes are handled by the caller
+        through worst-case evaluation of both A4 and A8."""
+        if (self.runtime_certificate is not None
+                and self.runtime_certificate.formats.get(FORMAT_W4A4)):
+            conf = self.runtime_certificate.formats[FORMAT_W4A4]
+            bits = (conf.get("effective_activation_bits")
+                    or conf.get("activation_bits"))
+            if bits in (4, 8):
+                return W4A4ExecutionMode(
+                    int(bits), "certified", True,
+                    "observed on the target machine "
+                    f"({self.runtime_certificate.gpu or 'gpu'})")
+        return resolve_w4a4_execution_mode(self.runtime, self.linear_dtype)
+
     def _activations(self, name: str) -> Optional[torch.Tensor]:
         if self.calibration is None:
             return None
@@ -4318,10 +4558,22 @@ class MixedPlanner:
                                                  torch.float32)
                 metrics = compute_weight_metrics(w.float().cpu(), dq.cpu())
                 if activations is not None:
-                    metrics.act_rel_l2 = runtime_output_rel_l2(
-                        w.cpu(), {k: v.cpu() for k, v in q.items()}, fmt,
-                        d.group_size, cgs, activations,
-                        w4a4_activation_bits=self.effective_w4a4_bits)
+                    if fmt == FORMAT_W4A4:
+                        modes, _mode = self._w4a4_scoring_modes()
+                        errs = [
+                            runtime_output_rel_l2(
+                                w.cpu(),
+                                {k: v.cpu() for k, v in q.items()}, fmt,
+                                d.group_size, cgs, activations,
+                                w4a4_activation_bits=bits)
+                            for bits in modes
+                        ]
+                        metrics.act_rel_l2 = max(errs)  # worst case
+                    else:
+                        metrics.act_rel_l2 = runtime_output_rel_l2(
+                            w.cpu(), {k: v.cpu() for k, v in q.items()}, fmt,
+                            d.group_size, cgs, activations,
+                            w4a4_activation_bits=8)
             finally:
                 del w
             return metrics
@@ -4332,7 +4584,9 @@ class MixedPlanner:
         chunk_rows = _chunk_rows_for_budget(k, n, self.max_mem)
         acc = _MetricAccumulator(d.name)
         out_acc = None
+        out_accs = None
         act_q = act_scale = None
+        act_qs = act_scales = None
         if activations is not None:
             x = activations.float()
             if fmt in (FORMAT_W4A4, FORMAT_W4A8):
@@ -4340,11 +4594,21 @@ class MixedPlanner:
                 x_rot = rotate_activation(x, h, cgs)
             else:
                 x_rot = x
-            if fmt == FORMAT_W4A4 and self.effective_w4a4_bits == 4:
-                act_q, act_scale = _act_quant_int4(x_rot)
+            n_samples = int(activations.shape[0])
+            if fmt == FORMAT_W4A4:
+                modes, _mode = self._w4a4_scoring_modes()
+                out_accs = {bits: _OutputErrorAccumulator(n_samples)
+                            for bits in modes}
+                act_qs = {}
+                act_scales = {}
+                for bits in modes:
+                    if bits == 4:
+                        act_qs[bits], act_scales[bits] = _act_quant_int4(x_rot)
+                    else:
+                        act_qs[bits], act_scales[bits] = _act_quant_int8(x_rot)
             else:
                 act_q, act_scale = _act_quant_int8(x_rot)
-            out_acc = _OutputErrorAccumulator(int(activations.shape[0]))
+                out_acc = _OutputErrorAccumulator(n_samples)
         if fmt == FORMAT_W4A8:
             sample_size = _codebook_sample_size(self.max_mem, n * k)
             codebook = _gather_codebook_samples(
@@ -4362,7 +4626,7 @@ class MixedPlanner:
                 if out_acc is not None:
                     y_q = _simulate_quantized_chunk(
                         orig_chunk, q, fmt, d.group_size, cgs, act_q,
-                        act_scale, self.linear_dtype)
+                        act_scale, "int8")
                     y_ref = activations.float() @ orig_chunk.float().T
                     out_acc.update(y_q.cpu(), y_ref.cpu())
                 del q, dq
@@ -4381,13 +4645,24 @@ class MixedPlanner:
                 if out_acc is not None:
                     y_q = _simulate_quantized_chunk(
                         chunk.cpu(), {k: v.cpu() for k, v in q.items()}, fmt,
-                        d.group_size, cgs, act_q, act_scale, self.linear_dtype)
+                        d.group_size, cgs, act_q, act_scale, "int8")
                     y_ref = activations.float() @ chunk.cpu().float().T
                     out_acc.update(y_q, y_ref)
+                if out_accs is not None:
+                    y_ref = activations.float() @ chunk.cpu().float().T
+                    for bits, oacc in out_accs.items():
+                        y_q = _simulate_quantized_chunk(
+                            chunk.cpu(), {k: v.cpu() for k, v in q.items()},
+                            fmt, d.group_size, cgs, act_qs[bits],
+                            act_scales[bits],
+                            "int4" if bits == 4 else "int8")
+                        oacc.update(y_q, y_ref)
                 del chunk, q, dq
         metrics = acc.finish()
         if out_acc is not None:
             metrics.act_rel_l2 = out_acc.finish()
+        if out_accs is not None:
+            metrics.act_rel_l2 = max(oacc.finish() for oacc in out_accs.values())
         return metrics
 
     # -- planning ----------------------------------------------------------
@@ -4403,7 +4678,9 @@ class MixedPlanner:
                         f"mixed planner references missing tensor {d.name!r}")
                 n, k = int(meta.shape[0]), int(meta.shape[1])
                 cands: Dict[str, CandidateResult] = {}
+                w4a4_mode = self.w4a4_execution_mode_for_candidate()
                 for fmt in self.eligible_formats(meta):
+                    mode = (w4a4_mode if fmt == FORMAT_W4A4 else None)
                     cand = CandidateResult(
                         format=fmt, eligible=True,
                         estimated_bytes=quantized_format_bytes(n, k, fmt),
@@ -4411,10 +4688,16 @@ class MixedPlanner:
                         requested_linear_dtype=(
                             self.linear_dtype if fmt == FORMAT_W4A4 else None),
                         effective_activation_bits=(
-                            self.effective_w4a4_bits if fmt == FORMAT_W4A4
-                            else None),
-                        backend=self.runtime.target if fmt == FORMAT_W4A4
-                                else None)
+                            mode.activation_bits if mode is not None and
+                            mode.certain else None),
+                        effective_runtime_path=(
+                            mode.path if mode is not None else None),
+                        runtime_certified=(
+                            self.runtime_certificate is not None),
+                        runtime_certain=(
+                            mode.certain if mode is not None else None),
+                        backend=(self.runtime.target if fmt == FORMAT_W4A4
+                                 else None))
                     metrics = self._evaluate_format(reader, d, fmt)
                     cand.weight_rel_l2 = metrics.rel_l2
                     cand.act_rel_l2 = metrics.act_rel_l2
@@ -4456,6 +4739,7 @@ class MixedPlanner:
         self.summary.update({
             "selected": selected, "kept": kept, "promotions": promoted,
             "runtime_backend": self.runtime.target,
+            "w4a4_linear_dtype": self.linear_dtype,
         })
         return self.summary
 
@@ -4499,6 +4783,8 @@ class MixedPlanner:
                 continue
             d.format = chosen.format
             d.convrot_groupsize = self.cgs_for(int(meta.shape[1]), chosen.format)
+            d.linear_dtype = (self.linear_dtype if chosen.format == FORMAT_W4A4
+                              else None)
             d.reason = f"mixed planner: {chosen.format}"
             selected += 1
         return selected, kept
@@ -4598,22 +4884,24 @@ class MixedPlanner:
             if best is None:
                 break
             _, d, cand = best
-            mean_after = self.global_mean_error(info, decisions)
-            mean_txt = ("n/a" if mean_after is None
-                        else f"{mean_after:.4f}")
             if cand.format == FORMAT_ORIGINAL:
                 d.kind = DecisionKind.KEEP_PRECISION
                 d.format = FORMAT_ORIGINAL
                 d.reason = "mixed planner (promoted): original precision"
-                self.promotions.append(
-                    f"{d.name}:original (mean {mean_txt})")
-                continue
-            meta = info.by_name(d.name)
-            d.format = cand.format
-            d.convrot_groupsize = self.cgs_for(int(meta.shape[1]), cand.format)
-            d.reason = f"mixed planner (promoted): {cand.format}"
+            else:
+                meta = info.by_name(d.name)
+                d.format = cand.format
+                d.convrot_groupsize = self.cgs_for(
+                    int(meta.shape[1]), cand.format)
+                d.linear_dtype = (self.linear_dtype
+                                  if cand.format == FORMAT_W4A4 else None)
+                d.reason = f"mixed planner (promoted): {cand.format}"
+            # measure AFTER applying, so the log shows the new mean
+            mean_after = self.global_mean_error(info, decisions)
+            mean_txt = ("n/a" if mean_after is None
+                        else f"{mean_after:.4f}")
             self.promotions.append(
-                f"{d.name}:{cand.format} (mean {mean_txt})")
+                f"{d.name}:{cand.format} (weighted error -> {mean_txt})")
         return self.promotions
 
     # -- hard gates --------------------------------------------------------
@@ -4658,6 +4946,7 @@ class MixedPlanner:
         quant_bytes = 0
         kept_bytes = 0
         params = 0
+        kept_params = 0
         kept_by_name: List[Tuple[str, int]] = []
         for d in self._targeted:
             meta = info.by_name(d.name)
@@ -4667,12 +4956,14 @@ class MixedPlanner:
                 quant_bytes += quantized_format_bytes(n, k, d.format)
             else:
                 kept_bytes += meta.nbytes
+                kept_params += n * k
                 kept_by_name.append((d.name, meta.nbytes))
         effective_bpp = (quant_bytes + kept_bytes) / max(params, 1)
-        bf16_fraction = kept_bytes / max(quant_bytes + kept_bytes, 1)
+        original_byte_fraction = kept_bytes / max(quant_bytes + kept_bytes, 1)
+        original_param_fraction = kept_params / max(params, 1)
         if self.compression_target_bpp is not None \
                 and effective_bpp > self.compression_target_bpp:
-            kept_share = 100 * bf16_fraction
+            kept_share = 100 * original_byte_fraction
             top_kept = ", ".join(name for name, _ in
                                  sorted(kept_by_name, key=lambda kv: -kv[1])[:3])
             raise CompressionGateError(
@@ -4680,22 +4971,26 @@ class MixedPlanner:
                 f"{effective_bpp:.4f} bytes/parameter > target "
                 f"{self.compression_target_bpp:.4f} (profile "
                 f"{self.profile.name}). {kept_share:.1f}% of the targeted "
-                f"payload is at original precision; largest kept layers: "
-                f"{top_kept or 'none'}. Raise "
-                "--max-linear-bytes-per-param or --max-bf16-fraction, or "
-                "loosen the quality gates.")
-        if bf16_fraction > self.max_bf16_fraction:
+                f"output bytes are at original precision "
+                f"({100*original_param_fraction:.1f}% of parameters); "
+                f"largest kept layers: {top_kept or 'none'}. Raise "
+                "--max-linear-bytes-per-param or "
+                "--max-original-byte-fraction, or loosen the quality gates.")
+        if original_byte_fraction > self.max_bf16_fraction:
             top_kept = ", ".join(name for name, _ in
                                  sorted(kept_by_name, key=lambda kv: -kv[1])[:3])
             raise CompressionGateError(
-                f"compression gate failed: {100*bf16_fraction:.1f}% of the "
-                f"targeted linear payload kept at original precision > "
+                f"compression gate failed: "
+                f"{100*original_byte_fraction:.1f}% of the targeted output "
+                f"bytes kept at original precision > "
                 f"{100*self.max_bf16_fraction:.1f}% (profile "
-                f"{self.profile.name}). Largest kept layers: "
-                f"{top_kept or 'none'}. Raise --max-bf16-fraction or loosen "
-                "the quality gates.")
+                f"{self.profile.name}); {100*original_param_fraction:.1f}% "
+                f"of parameters. Largest kept layers: {top_kept or 'none'}. "
+                "Raise --max-original-byte-fraction or loosen the quality "
+                "gates.")
         self._effective_bpp = effective_bpp
-        self._bf16_fraction = bf16_fraction
+        self._original_byte_fraction = original_byte_fraction
+        self._original_param_fraction = original_param_fraction
 
     def _summarize(self, info: CheckpointInfo,
                    decisions: List[TensorDecision]) -> Dict[str, Any]:
@@ -4730,7 +5025,10 @@ class MixedPlanner:
             "kept_params": kept_params,
             "kept_bytes": kept_bytes,
             "effective_bpp": getattr(self, "_effective_bpp", None),
-            "bf16_fraction": getattr(self, "_bf16_fraction", None),
+            "original_precision_parameter_fraction": getattr(
+                self, "_original_param_fraction", None),
+            "original_precision_output_byte_fraction": getattr(
+                self, "_original_byte_fraction", None),
             "compression_target_bpp": self.compression_target_bpp,
             "max_bf16_fraction": self.max_bf16_fraction,
             "candidates": {
@@ -4743,17 +5041,26 @@ class MixedPlanner:
                         "act_rel_l2": cand.act_rel_l2,
                         "requested_linear_dtype": cand.requested_linear_dtype,
                         "effective_activation_bits": cand.effective_activation_bits,
+                        "effective_runtime_path": cand.effective_runtime_path,
+                        "runtime_certified": cand.runtime_certified,
+                        "runtime_certain": cand.runtime_certain,
+                        "backend": cand.backend,
                     } for fmt, cand in cands.items()
                 } for name, cands in self.candidates.items()
             },
             "runtime": {
                 "backend": self.runtime.target,
-                "w4a4_effective_activation_bits": self.effective_w4a4_bits,
+                "gpu_name": self.runtime.gpu_name,
+                "cuda_capability": list(self.runtime.cuda_capability)
+                if self.runtime.cuda_capability else None,
+                "rocm_arch": self.runtime.rocm_arch,
+                "runtime_certified": self.runtime.runtime_certified,
                 "formats": {
                     fmt: {
                         "loadable": self.runtime.capability(fmt).loadable,
                         "executable": self.runtime.capability(fmt).executable,
                         "accelerated": self.runtime.capability(fmt).accelerated,
+                        "certified": self.runtime.capability(fmt).certified,
                         "backend": self.runtime.capability(fmt).backend,
                         "reason": self.runtime.capability(fmt).reason,
                         "status": self.runtime.describe(fmt),
@@ -4847,6 +5154,12 @@ def _plan_hash(info: CheckpointInfo, plan: ConversionPlan, args: Any,
         "max_linear_bytes_per_param": getattr(args, "max_linear_bytes_per_param", None),
         "max_bf16_fraction": getattr(args, "max_bf16_fraction", None),
         "w4a4_linear_dtype": getattr(args, "w4a4_linear_dtype", "int8"),
+        "runtime_backend": getattr(args, "_effective_runtime", "auto"),
+        "runtime_gpu": (getattr(args, "_runtime_gpu_name", None)
+                        or getattr(args, "_effective_runtime", None)),
+        "runtime_certificate_sha256": (
+            sha256_file(args.runtime_certificate)
+            if getattr(args, "runtime_certificate", None) else None),
         "disable_w4a4": getattr(args, "disable_w4a4", False),
         "disable_w4a8": getattr(args, "disable_w4a8", False),
         "disable_int8": getattr(args, "disable_int8", False),
@@ -5391,7 +5704,7 @@ def build_quant_metadata(info: CheckpointInfo, plan: ConversionPlan) -> Dict[str
                 "format": FORMAT_W4A4,
                 "convrot_groupsize": d.convrot_groupsize,
                 "quant_group_size": W4A4_QUANT_GROUP_SIZE,
-                "linear_dtype": W4A4_LINEAR_DTYPE,
+                "linear_dtype": d.linear_dtype or DEFAULT_W4A4_LINEAR_DTYPE,
             }
         elif d.format == FORMAT_INT8:
             layers[d.layer] = {"format": FORMAT_INT8}
@@ -5452,7 +5765,8 @@ def build_extension_metadata(info: CheckpointInfo, plan: ConversionPlan,
                 "runtime_activation_bits": "backend-dependent: eager always "
                                            "executes A4; CUDA/HIP honor "
                                            "linear_dtype",
-                "linear_dtype": W4A4_LINEAR_DTYPE,
+                "linear_dtype": (plan.mixed_plan or {}).get(
+                    "w4a4_linear_dtype", DEFAULT_W4A4_LINEAR_DTYPE),
                 "weight_quantization": "rowwise symmetric signed int4 "
                                        "(absmax/7, range [-7,7])",
                 "scale_dtype": "fp32 rowwise [N]",
@@ -5489,7 +5803,10 @@ def build_extension_metadata(info: CheckpointInfo, plan: ConversionPlan,
                 "kept_params": mp.get("kept_params") or 0,
                 "kept_bytes": mp.get("kept_bytes") or 0,
                 "effective_bytes_per_param": mp.get("effective_bpp"),
-                "original_precision_fraction": mp.get("bf16_fraction"),
+                "original_precision_parameter_fraction": mp.get(
+                    "original_precision_parameter_fraction"),
+                "original_precision_output_byte_fraction": mp.get(
+                    "original_precision_output_byte_fraction"),
                 "global_mean_error": mp.get("global_mean_error"),
                 "promotions": mp.get("promotions") or [],
             },
@@ -5497,6 +5814,23 @@ def build_extension_metadata(info: CheckpointInfo, plan: ConversionPlan,
             "layer_gate": mp.get("layer_gate"),
             "global_gate": mp.get("global_gate"),
             "runtime_backend": mp.get("runtime_backend"),
+            "w4a4_runtime": {
+                "requested_linear_dtype": (plan.mixed_plan or {}).get(
+                    "w4a4_linear_dtype", DEFAULT_W4A4_LINEAR_DTYPE),
+                "target": (plan.mixed_plan or {}).get(
+                    "runtime_backend"),
+                "gpu": (plan.mixed_plan or {}).get("runtime", {}).get(
+                    "gpu_name"),
+                "cuda_capability": (plan.mixed_plan or {}).get(
+                    "runtime", {}).get("cuda_capability"),
+                "rocm_arch": (plan.mixed_plan or {}).get(
+                    "runtime", {}).get("rocm_arch"),
+                "effective_activation_bits": "per candidate (see report)",
+                "certified": bool((plan.mixed_plan or {}).get(
+                    "runtime", {}).get("runtime_certified")),
+                "note": "custom fields live in the namespaced extension "
+                        "block only; official ComfyUI metadata stays native",
+            },
             "quality_validation": {
                 "level": ("calibrated" if calibration is not None
                           else "unverified"),
@@ -6651,9 +6985,12 @@ def render_text_report(report: Dict[str, Any]) -> str:
         if mixed.get("effective_bpp") is not None:
             a(f"  effective targeted      : {mixed['effective_bpp']:.3f} "
               f"bytes/parameter (target {mixed.get('compression_target_bpp')})")
-            a(f"  original-precision share: "
-              f"{100*(mixed.get('bf16_fraction') or 0):.1f}% of targeted bytes "
-              f"(max {100*(mixed.get('max_bf16_fraction') or 0):.1f}%)")
+            a(f"  original precision      : "
+              f"{100*(mixed.get('original_precision_parameter_fraction') or 0):.1f}% "
+              f"of params, "
+              f"{100*(mixed.get('original_precision_output_byte_fraction') or 0):.1f}% "
+              f"of output bytes (max "
+              f"{100*(mixed.get('max_bf16_fraction') or 0):.1f}%)")
         runtime = mixed.get("runtime") or {}
         if runtime.get("formats"):
             a("  runtime target          : " + runtime.get("backend", "?") +
@@ -6852,8 +7189,9 @@ def print_console_summary(*, out_path: str, input_bytes: int, output_bytes: int,
         if mixed_plan.get("effective_bpp") is not None:
             a(f"  compression : {mixed_plan['effective_bpp']:.3f} bytes/param "
               f"(target {mixed_plan.get('compression_target_bpp')}); "
-              f"{100*(mixed_plan.get('bf16_fraction') or 0):.1f}% original "
-              f"(max {100*(mixed_plan.get('max_bf16_fraction') or 0):.1f}%)")
+              f"{100*(mixed_plan.get('original_precision_parameter_fraction') or 0):.1f}% "
+              f"params original (max "
+              f"{100*(mixed_plan.get('max_bf16_fraction') or 0):.1f}% bytes)")
     else:
         a(f"  format      : {FORMAT_W4A8}  group_size={group_size}  convrot_groupsize=256")
     a(f"  validation  : {v_txt}")
@@ -6895,6 +7233,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    default="auto",
                    help="target inference runtime used for format eligibility; "
                         "auto probes torch (CUDA/ROCm/CPU)")
+    p.add_argument("--runtime-certificate", metavar="PATH", default=None,
+                   help="mixed mode: JSON certificate produced by "
+                        "tools/runtime_certify.py on the target inference "
+                        "machine; overrides static W4A4 dispatch guesses with "
+                        "observed behavior")
+    p.add_argument("--require-runtime-certificate", action="store_true",
+                   help="mixed mode: refuse conversion unless every selected "
+                        "format is runtime-certified on the target machine")
     p.add_argument("--quality-gate", type=float, default=None, metavar="F",
                    help="mixed mode: per-layer error gate override (relL2 "
                         "fraction; default from the profile)")
@@ -6906,10 +7252,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="mixed mode: hard compression target in bytes/parameter "
                         "for the targeted linear payload (overrides the profile; "
                         "conversion fails when exceeded)")
-    p.add_argument("--max-bf16-fraction", type=float, default=None, metavar="F",
-                   help="mixed mode: hard limit on the share of the targeted "
-                        "linear payload kept at original precision (overrides "
-                        "the profile; conversion fails when exceeded)")
+    p.add_argument("--max-bf16-fraction", "--max-original-byte-fraction",
+                   type=float, default=None, dest="max_bf16_fraction",
+                   metavar="F",
+                   help="mixed mode: hard limit on the fraction of final "
+                        "targeted serialized bytes occupied by "
+                        "original-precision tensors (legacy option name "
+                        "--max-bf16-fraction; the alias "
+                        "--max-original-byte-fraction is preferred)")
     p.add_argument("--w4a4-linear-dtype", choices=["int4", "int8"], default="int8",
                    help="convrot_w4a4 execution variant: int4 (true W4A4) or "
                         "int8 (4-bit weights through the int8 path; the "
@@ -7096,7 +7446,7 @@ def plan_from_output(output_path: str, detection: DetectionResult,
                     if int(conf.get("quant_group_size", W4A4_QUANT_GROUP_SIZE)) \
                             != W4A4_QUANT_GROUP_SIZE:
                         raise PolicyError("quant_group_size must be 64")
-                    if conf.get("linear_dtype", W4A4_LINEAR_DTYPE) \
+                    if conf.get("linear_dtype", DEFAULT_W4A4_LINEAR_DTYPE) \
                             not in ("int4", "int8"):
                         raise PolicyError("linear_dtype must be int4 or int8")
                     if convrot_groupsize < 16 or \
@@ -8724,11 +9074,11 @@ def _test_mixed_runtime_caps() -> str:
     dec = classify_tensors(info, det, FORMAT_MIXED, None, [], [], [], None, None)
     caps = RuntimeCapabilities(
         target="limited",
-        w4a4=FormatRuntimeCapability(False, False, False, "limited",
+        w4a4=FormatRuntimeCapability(False, False, False, False, "limited",
                                      reason="no w4a4 kernels"),
-        w4a8=FormatRuntimeCapability(False, False, False, "limited",
+        w4a8=FormatRuntimeCapability(False, False, False, False, "limited",
                                      reason="no w4a8 kernels"),
-        int8=FormatRuntimeCapability(True, True, True, "limited"))
+        int8=FormatRuntimeCapability(True, True, True, False, "limited"))
     planner = MixedPlanner("balanced", None, 2 * 1024**3, torch.device("cpu"),
                            None, runtime=caps, compression_target_bpp=1.10)
     summary = planner.plan(info, dec)
@@ -8738,26 +9088,44 @@ def _test_mixed_runtime_caps() -> str:
     assert "not supported on target runtime limited" in first[FORMAT_W4A4].reason
     assert first[FORMAT_INT8].eligible is True
     assert summary["runtime"]["backend"] == "limited"
-    assert summary["runtime"]["formats"][FORMAT_INT8]["status"] == "accelerated"
+    assert summary["runtime"]["formats"][FORMAT_INT8]["status"] == \
+        "expected accelerated (not certified)"
     assert summary["runtime"]["formats"][FORMAT_W4A4]["loadable"] is False
-    # cpu runtime reports eager fallback everywhere and A4 for W4A4
+    # cpu runtime reports eager fallback and certain A4 for W4A4
     planner = MixedPlanner("balanced", None, 2 * 1024**3, torch.device("cpu"),
                            None, runtime=runtime_capabilities_for("cpu"),
                            linear_dtype="int8")
     planner.plan(info, list(dec))
     assert planner.summary["runtime"]["formats"][FORMAT_W4A8]["status"] == \
-        "eager fallback"
-    assert planner.effective_w4a4_bits == 4, \
+        "eager/fallback"
+    mode = planner.w4a4_execution_mode_for_candidate()
+    assert mode.activation_bits == 4 and mode.certain, \
         "eager must simulate the int4 activation path"
-    assert planner.summary["runtime"]["w4a4_effective_activation_bits"] == 4
-    # cuda honors the requested linear_dtype
+    # cuda SM8x honors requested int4 via native MMA; int8 request is certain
+    nv8 = runtime_capabilities_for("nvidia")
     planner = MixedPlanner("balanced", None, 2 * 1024**3, torch.device("cpu"),
-                           None, runtime=runtime_capabilities_for("nvidia"),
-                           linear_dtype="int8")
+                           None, runtime=nv8, linear_dtype="int8")
     planner.plan(info, list(dec))
-    assert planner.effective_w4a4_bits == 8
-    return ("runtime capability matrix: unsupported formats excluded with "
-            "reason; cpu = eager fallback + A4; cuda honors linear_dtype")
+    assert planner.w4a4_execution_mode_for_candidate().activation_bits == 8
+    # SM8x + requested int4 -> certain native A4
+    nv8 = dataclasses.replace(nv8, cuda_capability=(8, 9))
+    planner = MixedPlanner("balanced", None, 2 * 1024**3, torch.device("cpu"),
+                           None, runtime=nv8, linear_dtype="int4")
+    mode = planner.w4a4_execution_mode_for_candidate()
+    assert mode.activation_bits == 4 and mode.certain and \
+        mode.path == "cuda-native-int4", mode
+    # Turing (7.5) + int4 -> uncertain; worst-case evaluation must kick in
+    nv75 = dataclasses.replace(runtime_capabilities_for("nvidia"),
+                               cuda_capability=(7, 5))
+    planner = MixedPlanner("balanced", None, 2 * 1024**3, torch.device("cpu"),
+                           None, runtime=nv75, linear_dtype="int4")
+    mode = planner.w4a4_execution_mode_for_candidate()
+    assert not mode.certain, mode
+    modes, _ = planner._w4a4_scoring_modes()
+    assert modes == [4, 8], modes
+    return ("runtime capability matrix: unsupported excluded; cpu = eager "
+            "fallback + certain A4; cuda SM8x native INT4; Turing "
+            "uncertain -> worst-case A4/A8 evaluation")
 
 
 def _test_mixed_runtime_metric() -> str:
@@ -9169,7 +9537,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "W4A4 linear_dtype note: the comfy-kitchen eager backend "
                 "accepts int4/int8 but always executes the int4 activation "
                 "path; linear_dtype=int8 only changes the CUDA kernels")
-        globals()["W4A4_LINEAR_DTYPE"] = args.w4a4_linear_dtype
         args._mixed_profile_name = profile_name
         args._mixed_disabled_formats = disabled_formats
         args._effective_runtime = effective_runtime
@@ -9263,7 +9630,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         layer_gate = args.quality_gate
         if layer_gate is None and args.error_threshold is not None:
             layer_gate = args.error_threshold
-        runtime_caps = runtime_capabilities_for(effective_runtime)
+        runtime_caps = runtime_capabilities_for(effective_runtime, env)
+        certificate = None
+        if args.runtime_certificate:
+            certificate = load_runtime_certificate(args.runtime_certificate)
+            warnings.append(
+                f"runtime certificate loaded: backend={certificate.backend}, "
+                f"gpu={certificate.gpu or 'unknown'}, formats="
+                f"{sorted(certificate.formats)}")
         mixed_planner = MixedPlanner(
             profile_name, calibration, args.max_memory, effective_device,
             compute_dtype,
@@ -9273,9 +9647,33 @@ def main(argv: Optional[List[str]] = None) -> int:
             runtime=runtime_caps,
             compression_target_bpp=args.max_linear_bytes_per_param,
             max_bf16_fraction=args.max_bf16_fraction,
-            linear_dtype=args.w4a4_linear_dtype)
+            linear_dtype=args.w4a4_linear_dtype,
+            runtime_certificate=certificate)
+        if args.require_runtime_certificate and certificate is None:
+            raise RuntimeCompatibilityError(
+                "--require-runtime-certificate needs --runtime-certificate "
+                "(produce it with tools/runtime_certify.py on the target "
+                "inference machine)")
         mixed_plan = mixed_planner.plan(info, decisions)
+        args._runtime_gpu_name = runtime_caps.gpu_name
         _check_runtime_compatibility(env, mixed_planner, decisions, warnings)
+        if certificate is not None:
+            required = sorted({
+                d.format for d in decisions
+                if d.kind == DecisionKind.QUANTIZE
+                and d.format in MIXED_FORMATS})
+            _check_runtime_certificate(certificate, runtime_caps, required)
+            # mark only the formats the certificate actually exercised
+            cap_map = {FORMAT_W4A4: ("w4a4", runtime_caps.w4a4),
+                       FORMAT_W4A8: ("w4a8", runtime_caps.w4a8),
+                       FORMAT_INT8: ("int8", runtime_caps.int8)}
+            certed = {
+                field: dataclasses.replace(cap, certified=True)
+                for fmt, (field, cap) in cap_map.items()
+                if fmt in certificate.formats}
+            runtime_caps = dataclasses.replace(
+                runtime_caps, runtime_certified=True, **certed)
+            mixed_planner.runtime = runtime_caps
         if not calibration:
             warnings.append(
                 "mixed planner: no calibration activations, quality gates use "
