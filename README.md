@@ -401,6 +401,14 @@ closed unless `--architecture` is given.
   (`--strip-gpu-identity`), verifies the strip, and uploads the result plus
   a generic README to a new repo in the user's HF account (private by
   default).
+* `tools/hf_mixed_quantize_optimized.py`: faster variant of the same flow.
+  Enables the hf_transfer downloader (2-5x faster downloads), skips the
+  converter's source-relative `--validate` by default (the hard per-layer
+  quality gates already run during planning; this removes two full source
+  reads plus the validation copy) and runs a fast metadata sanity check
+  instead, preflights disk space before the download, and prints
+  phase-by-phase timing. Opt back into the full check with `--validate`;
+  the original script is unchanged.
 * CI: the GitHub workflows were removed for now and live in git history
   (`ci.yml`, `cuda-smoke.yml`, `nightly-sync.yml`, `release-compat.yml`).
   Until they are restored, run the self-tests, fixture conversions,

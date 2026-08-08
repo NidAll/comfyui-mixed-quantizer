@@ -162,6 +162,12 @@ Same as main: uv venv, no model checkpoints stored locally. GPU is an RTX
 real here. `research/ComfyUI` is v0.30.0 + loader patch (gitignored, do not
 reset). `.venv` has torch 2.13.0+cu130 and comfy-kitchen 0.2.28.
 
+Tools: `tools/hf_mixed_quantize.py` (original Colab flow) and
+`tools/hf_mixed_quantize_optimized.py` (same flow, faster: hf_transfer
+download, `--validate` opt-in instead of always-on, disk preflight, phase
+timing). The optimized variant is the one to recommend for real conversions;
+the original stays for reference.
+
 Install: `uv pip install --python .venv/bin/python -r requirements.txt`
 (core converter plus huggingface_hub for the Colab download/upload flow);
 `-r requirements-optional.txt` adds comfy-kitchen + packaging for the
