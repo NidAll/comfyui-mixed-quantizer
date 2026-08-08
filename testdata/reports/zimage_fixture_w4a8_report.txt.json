@@ -1,6 +1,6 @@
 {
  "converter": "comfyui_wxa8_quantizer",
- "converter_version": "1.2.3",
+ "converter_version": "1.3.0",
  "format": "asym_w4a8_int8",
  "format_revision": "asym-w4a8-int8-r1",
  "architecture": "lumina2",
@@ -29,7 +29,84 @@
   "quantized_2d_bytes": 50331648,
   "targeted_2d_bytes": 50331648,
   "quantized_fraction": 1.0,
-  "failing_k_values": []
+  "failing_k_values": [],
+  "buckets": {
+   "quantized": {
+    "layers": 20,
+    "bytes": 50331648,
+    "k_values": [
+     768,
+     1024
+    ]
+   },
+   "convrot_rejected": {
+    "layers": 0,
+    "bytes": 0,
+    "k_values": []
+   },
+   "shape_rejected": {
+    "layers": 0,
+    "bytes": 0,
+    "k_values": []
+   },
+   "small_tensor": {
+    "layers": 0,
+    "bytes": 0,
+    "k_values": []
+   },
+   "keep_precision": {
+    "layers": 0,
+    "bytes": 0,
+    "k_values": []
+   },
+   "sensitivity_kept": {
+    "layers": 0,
+    "bytes": 0,
+    "k_values": []
+   },
+   "policy_kept": {
+    "layers": 9,
+    "bytes": 1861120,
+    "k_values": [
+     64,
+     256,
+     384
+    ]
+   },
+   "user_forced": {
+    "layers": 0,
+    "bytes": 0,
+    "k_values": []
+   },
+   "user_excluded": {
+    "layers": 0,
+    "bytes": 0,
+    "k_values": []
+   },
+   "not_in_quantize_set": {
+    "layers": 0,
+    "bytes": 0,
+    "k_values": []
+   },
+   "unrecognized": {
+    "layers": 0,
+    "bytes": 0,
+    "k_values": []
+   },
+   "outside_prefix": {
+    "layers": 0,
+    "bytes": 0,
+    "k_values": []
+   }
+  }
+ },
+ "group_histogram": {
+  "convrot_groupsize": {
+   "256": 20
+  },
+  "group_size": {
+   "16": 20
+  }
  },
  "quantization_rows": [
   "model.diffusion_model.context_refiner.0.attention.out: (384, 768) gs=16 cgs=256",
@@ -411,6 +488,18 @@
    "reason": ""
   },
   {
+   "name": "metadata-runtime-contract",
+   "status": "passed",
+   "detail": "convrot=256, group_size=16, exact shapes, K%256==0",
+   "reason": ""
+  },
+  {
+   "name": "passthrough-integrity",
+   "status": "passed",
+   "detail": "15 passthrough tensors byte-identical",
+   "reason": ""
+  },
+  {
    "name": "recon-model.diffusion_model.context_refiner.0.attention.out",
    "status": "passed",
    "detail": "relL2=0.0727 snr=22.8dB cos=0.9974",
@@ -677,7 +766,7 @@
   {
    "name": "output-hash",
    "status": "passed",
-   "detail": "sha256=c2a0329e2f2cd150bc93d61e00874782610371eaed3e00402f56b6ff4ba696e8",
+   "detail": "sha256=1e1e65e3ff188762748c58a95fd45d8d0e5bd6c19b2271e28737110328cd6fe3",
    "reason": ""
   },
   {
@@ -709,9 +798,9 @@
  "input_hashes": {
   "testdata/zimage_fixture.safetensors": "e9d66e7066205af67032eec075f66d51cb4b02395874efaf64e07fd05f723936"
  },
- "output_sha256": "c2a0329e2f2cd150bc93d61e00874782610371eaed3e00402f56b6ff4ba696e8",
- "elapsed_seconds": 10.038,
- "peak_rss_bytes": 692539392,
+ "output_sha256": "1e1e65e3ff188762748c58a95fd45d8d0e5bd6c19b2271e28737110328cd6fe3",
+ "elapsed_seconds": 10.558,
+ "peak_rss_bytes": 695820288,
  "environment": {
   "python": "3.11.15",
   "torch_version": "2.13.0+cu130",

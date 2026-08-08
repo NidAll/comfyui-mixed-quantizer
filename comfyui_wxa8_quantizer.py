@@ -175,7 +175,7 @@ except Exception as _exc:  # pragma: no cover - import guard
 # Version / revision constants (research record; see module docstring)
 # ---------------------------------------------------------------------------
 CONVERTER_NAME = "comfyui_wxa8_quantizer"
-CONVERTER_VERSION = "1.2.3"
+CONVERTER_VERSION = "1.3.0"
 FORMAT_W4A8 = "asym_w4a8_int8"
 
 # comfy-kitchen 0.2.27 CUDA fused kernels implement ConvRot only for a 256-wide
@@ -184,6 +184,12 @@ FORMAT_W4A8 = "asym_w4a8_int8"
 # by 256 pass through at original precision instead of being quantized with a
 # smaller ConvRot group.
 W4A8_CONVROT_GROUPSIZE = 256
+
+# Revision of the numerical quantization algorithm (packing, codebook fitting,
+# scale computation). Bumped only when the stored bytes would change; part of
+# the resume-state plan hash so partial outputs from a different algorithm are
+# refused instead of resumed.
+QUANT_ALGORITHM_REVISION = "lloydmax-codebook-r1"
 FORMAT_W4A8_REVISION = "asym-w4a8-int8-r1"
 MAX_SAFETENSORS_HEADER_SIZE = 100_000_000
 METADATA_KEY_QUANT = "_quantization_metadata"     # official key read by ComfyUI
@@ -2744,7 +2750,8 @@ def classify_tensors(info: CheckpointInfo, detection: DetectionResult,
 
         # quantize patterns are written against full keys (including ".weight")
         candidate = bool(q_re.search(rel)) if policy.quantize else True
-        if include_re is not None and include_re.search(name):
+        user_forced = include_re is not None and include_re.search(name)
+        if user_forced:
             candidate = True
         if not candidate:
             decisions.append(TensorDecision(name, DecisionKind.KEEP,
@@ -2765,7 +2772,8 @@ def classify_tensors(info: CheckpointInfo, detection: DetectionResult,
                                             f"small tensor (<{min_numel} elements); passthrough"))
             continue
         decisions.append(TensorDecision(
-            name, DecisionKind.QUANTIZE, "policy candidate",
+            name, DecisionKind.QUANTIZE,
+            "user-forced via --include" if user_forced else "policy candidate",
             layer=layer, group_size=group_size,
             convrot_groupsize=W4A8_CONVROT_GROUPSIZE))
 
@@ -3758,7 +3766,10 @@ def _plan_hash(info: CheckpointInfo, plan: ConversionPlan, args: Any,
                source_hashes: Dict[str, str]) -> str:
     h = hashlib.sha256()
     options = {
+        "converter_version": CONVERTER_VERSION,
         "format": plan.fmt,
+        "format_revision": FORMAT_W4A8_REVISION,
+        "algorithm_revision": QUANT_ALGORITHM_REVISION,
         "architecture": plan.detection.architecture,
         "prefix": plan.detection.unet_prefix,
         "group_size": getattr(args, "group_size", None),
@@ -4205,6 +4216,26 @@ def build_quant_metadata(info: CheckpointInfo, plan: ConversionPlan) -> Dict[str
     return {"layers": layers}
 
 
+def _architecture_dims_fingerprint(info: CheckpointInfo,
+                                    detection: DetectionResult) -> Dict[str, Any]:
+    """Compact, bug-report-friendly fingerprint: the K values (column counts)
+    of all 2D float weights under the detected prefix, capped histogram. Lets a
+    user report reproduce the conversion without sharing a multi-GB model."""
+    prefix = detection.unet_prefix
+    if not any(k.startswith(prefix) for k in info.key_set()):
+        prefix = ""
+    counter: Dict[str, int] = {}
+    for meta in info.tensors:
+        if len(meta.shape) != 2 or meta.dtype not in FLOAT_DTYPES:
+            continue
+        if prefix and not meta.name.startswith(prefix):
+            continue
+        key = str(int(meta.shape[1]))
+        counter[key] = counter.get(key, 0) + 1
+    ordered = dict(sorted(counter.items(), key=lambda kv: -kv[1]))
+    return {"dims_2d_k": ordered, "n_2d_float": sum(counter.values())}
+
+
 def build_extension_metadata(info: CheckpointInfo, plan: ConversionPlan,
                              env: EnvironmentInfo, args: Any,
                              calibration: Optional[CalibrationStats],
@@ -4225,6 +4256,7 @@ def build_extension_metadata(info: CheckpointInfo, plan: ConversionPlan,
         "architecture": d.architecture,
         "detection_confidence": d.confidence,
         "unet_prefix": d.unet_prefix,
+        "architecture_dims": _architecture_dims_fingerprint(info, d),
         "source": {
             "kind": info.kind,
             "files": _portable_file_labels(info.files),
@@ -4533,8 +4565,102 @@ class Validator:
                 self.check("metadata-layer-conf", conf_ok,
                            "format/group/ConvRot fields valid" if conf_ok else
                            "invalid format/group/ConvRot field")
+
+                # ---- independent runtime-contract invariants (P0/P1) ----
+                # Re-derived from the file itself, not from the plan: every
+                # quantized layer must carry convrot=true, convrot_groupsize=256,
+                # group_size=16, and exact tensor shapes, and (when the original
+                # checkpoint is known) K % 256 == 0.
+                inv_ok = True
+                inv_bad: List[str] = []
+                try:
+                    with safe_open(out_path, framework="pt") as inv_st:
+                        for layer, conf in layers.items():
+                            try:
+                                gs = int(conf.get("group_size", 0))
+                                cgs = int(conf.get("convrot_groupsize", 0))
+                            except (TypeError, ValueError):
+                                gs = cgs = 0
+                            if (conf.get("format") != FORMAT_W4A8
+                                    or conf.get("convrot") is not True
+                                    or cgs != W4A8_CONVROT_GROUPSIZE
+                                    or gs != 16):
+                                inv_ok = False
+                                inv_bad.append(f"{layer}: conf {conf}")
+                                continue
+                            w = inv_st.get_slice(layer + ".weight")
+                            srel = inv_st.get_slice(layer + ".weight_s_rel")
+                            sch = inv_st.get_slice(layer + ".weight_s_channel")
+                            cb = inv_st.get_slice(layer + ".weight_codebook")
+                            n, k2 = w.get_shape()
+                            k = k2 * 2
+                            if (tuple(w.get_shape()) != (n, k // 2)
+                                    or tuple(srel.get_shape()) != (n, k // gs)
+                                    or tuple(sch.get_shape()) != (n,)
+                                    or tuple(cb.get_shape()) != (16,)
+                                    or k % gs != 0 or k % cgs != 0):
+                                inv_ok = False
+                                inv_bad.append(f"{layer}: shapes w={w.get_shape()} "
+                                               f"s_rel={srel.get_shape()} "
+                                               f"s_ch={sch.get_shape()} cb={cb.get_shape()}")
+                                continue
+                            if self.info is not None:
+                                src_meta = self.info.by_name(layer + ".weight")
+                                if src_meta is None or int(src_meta.shape[1]) % 256 != 0:
+                                    inv_ok = False
+                                    inv_bad.append(f"{layer}: source K not divisible by 256")
+                except Exception as e:
+                    inv_ok = False
+                    inv_bad.append(str(e))
+                self.check(
+                    "metadata-runtime-contract", inv_ok,
+                    "convrot=256, group_size=16, exact shapes, K%256==0" if inv_ok
+                    else "; ".join(inv_bad[:4]) or "invalid")
+
             except Exception as e:
                 self.check("metadata-json", False, f"unparseable: {e}")
+
+        # ---- passthrough byte integrity (P0, full validation only) ----
+        # With --output-dtype auto every non-quantized tensor must be preserved
+        # byte-for-byte (dtype, shape, payload). A requested fp16/bf16 cast is
+        # checked separately by dtype-check.
+        if full_validation and reader is not None \
+                and getattr(args, "output_dtype", "auto") in (None, "auto"):
+            try:
+                q_names = {f"{d.layer}.weight" for d in self.plan.quantized_layers()}
+                payload_mismatch: List[str] = []
+                payload_checked = 0
+                with open(out_path, "rb") as f:
+                    hlen = struct.unpack("<Q", f.read(8))[0]
+                    header = json.loads(f.read(hlen).decode("utf-8"))
+                    for name, e in expected.items():
+                        if name in q_names:
+                            continue
+                        tinfo = header.get(name)
+                        if not isinstance(tinfo, dict):
+                            payload_mismatch.append(f"{name}: missing in header")
+                            continue
+                        src_meta = self.info.by_name(name) if self.info is not None else None
+                        if src_meta is None:
+                            continue
+                        # Only tensors whose dtype was preserved can be byte-compared;
+                        # explicit output-dtype casts are covered by dtype-check.
+                        if e["dtype"] != src_meta.dtype:
+                            continue
+                        d0, d1 = tinfo["data_offsets"]
+                        f.seek(8 + hlen + d0)
+                        out_bytes = f.read(d1 - d0)
+                        src_bytes = reader.read_bytes(name)
+                        payload_checked += 1
+                        if len(out_bytes) != len(src_bytes)                                 or hashlib.sha256(out_bytes).digest() !=                                    hashlib.sha256(src_bytes).digest():
+                            payload_mismatch.append(name)
+                self.check(
+                    "passthrough-integrity", not payload_mismatch,
+                    (f"{payload_checked} passthrough tensors byte-identical"
+                     if not payload_mismatch else
+                     f"payload differs for: {payload_mismatch[:5]}"))
+            except Exception as e:
+                self.check("passthrough-integrity", False, f"check failed: {e}")
 
         # ---- tensor round trips (all with --validate, representative otherwise) ----
         q_layers = self.plan.quantized_layers()
@@ -4846,66 +4972,178 @@ def republish_with_metadata(src_path: str, final_path: str, metadata: Dict[str, 
 # ---------------------------------------------------------------------------
 # Reports
 # ---------------------------------------------------------------------------
+# Known real-model hidden dims that fail the ConvRot-256 gate (audit 2026-08-08,
+# verified against HF configs and state-dict headers). Used to phrase the
+# low-compression warning as an expected architectural limitation instead of a
+# generic "low compression" alarm.
+KNOWN_GATE_DIMS: Dict[str, Tuple[int, ...]] = {
+    "boogu": (3360,),
+    "omnigen2": (2520,),        # fails K % 16 too
+    "pixart": (1152,),
+    "hydit": (1408,),
+    "cogvideox": (1920,),       # only the 2b variant; 5b (3072) is clean
+    "minimax_h3": (1152,),      # mlp.fc2 only
+    "sdxl": (320, 640),
+    "sd15": (320,),
+    "svd": (320, 640),
+    "stable_cascade": (320, 640),
+    "ace_step": (1152,),
+}
+
+# Bucket names tracked by compression_stats, in display order.
+_COMPRESSION_BUCKETS = (
+    "quantized", "convrot_rejected", "shape_rejected", "small_tensor",
+    "keep_precision", "sensitivity_kept", "policy_kept", "user_forced",
+    "user_excluded", "not_in_quantize_set", "unrecognized", "outside_prefix",
+)
+
+
 def compression_stats(info: CheckpointInfo, plan: ConversionPlan,
                      detection: DetectionResult) -> Dict[str, Any]:
     """How much of the family's policy-targeted 2D linear weights actually got
-    quantized, and which K values the ConvRot-256 gate rejected.
+    quantized, bucketed by the reason each layer stayed unquantized.
 
-    Targeted = 2D float weights matched by the family quantize patterns. The
-    fraction is bytes, not layer count, so big FFN layers dominate. A low
-    fraction means the checkpoint stays mostly at original precision (hidden
-    dims like 1152/1408/1920/2520/3360 are not divisible by 256).
+    policy-targeted = 2D float weights under the unet prefix matched by the
+    family quantize patterns, minus user overrides (--include / --exclude /
+    --keep-precision) and minus intentional policy keeps outside the quantize
+    set (policy_kept bucket). The fraction is bytes, so big FFN layers
+    dominate. A low fraction means the checkpoint stays mostly at original
+    precision; the bucket counts show whether ConvRot-256, K%16 shape rules,
+    small tensors, sensitivity analysis, or user filters caused it.
     """
     prefix = detection.unet_prefix
     if not any(k.startswith(prefix) for k in info.key_set()):
         prefix = ""
-    q_re = detection.policy.quantize_re()
+    policy = detection.policy
+    q_re = policy.quantize_re()
+    k_re = policy.keep_re()
+    x_re = policy.exclude_re()
     by_name = {d.name: d for d in plan.decisions}
-    quantized_layers = quantized_bytes = targeted_layers = targeted_bytes = 0
-    gate_k = set()
+
+    buckets: Dict[str, Dict[str, Any]] = {
+        name: {"layers": 0, "bytes": 0, "k_values": set()}
+        for name in _COMPRESSION_BUCKETS
+    }
+
+    def add(bucket: str, meta: TensorMeta, decision: Optional[TensorDecision]) -> None:
+        buckets[bucket]["layers"] += 1
+        buckets[bucket]["bytes"] += meta.nbytes
+        if len(meta.shape) == 2:
+            buckets[bucket]["k_values"].add(int(meta.shape[1]))
+
     for meta in info.tensors:
         if len(meta.shape) != 2 or meta.dtype not in FLOAT_DTYPES:
             continue
         rel = meta.name[len(prefix):] if prefix and meta.name.startswith(prefix) else meta.name
         decision = by_name.get(meta.name)
-        in_qset = bool(q_re.search(rel))
+        reason = decision.reason or "" if decision is not None else ""
         if decision is not None and decision.kind == DecisionKind.QUANTIZE:
-            quantized_layers += 1
-            quantized_bytes += meta.nbytes
-            targeted_layers += 1
-            targeted_bytes += meta.nbytes
+            add("user_forced" if "user-forced" in reason else "quantized", meta, decision)
+            continue
+        if not meta.name.startswith(prefix):
+            add("outside_prefix", meta, decision)
+            continue
+        in_qset = bool(q_re.search(rel)) if policy.quantize else True
+        if "matched --exclude" in reason or "matched --keep-precision" in reason:
+            add("user_excluded", meta, decision)
+        elif "convrot_groupsize" in reason:
+            add("convrot_rejected", meta, decision)
+        elif "not quantizable" in reason:
+            add("shape_rejected", meta, decision)
+        elif "small tensor" in reason:
+            add("small_tensor", meta, decision)
+        elif "sensitivity" in reason or "retained at" in reason:
+            add("sensitivity_kept", meta, decision)
         elif in_qset:
-            targeted_layers += 1
-            targeted_bytes += meta.nbytes
-            if decision is not None and "convrot_groupsize" in (decision.reason or ""):
-                gate_k.add(int(meta.shape[1]))
+            add("keep_precision", meta, decision)
+        elif "policy keep" in reason or "policy exclude" in reason                 or k_re.search(rel) or x_re.search(rel):
+            add("policy_kept", meta, decision)
+        elif "not in" in reason and "quantize set" in reason:
+            add("not_in_quantize_set", meta, decision)
+        else:
+            add("unrecognized", meta, decision)
+
+    policy_targeted = {n: buckets[n] for n in
+                       ("quantized", "convrot_rejected", "shape_rejected",
+                        "small_tensor", "keep_precision", "sensitivity_kept")}
+    targeted_bytes = sum(b["bytes"] for b in policy_targeted.values())
+    targeted_layers = sum(b["layers"] for b in policy_targeted.values())
+    quantized_bytes = buckets["quantized"]["bytes"]
     fraction = (min(1.0, quantized_bytes / targeted_bytes)
                 if targeted_bytes else None)
     return {
-        "quantized_2d_layers": quantized_layers,
+        "quantized_2d_layers": buckets["quantized"]["layers"],
         "targeted_2d_layers": targeted_layers,
         "quantized_2d_bytes": quantized_bytes,
         "targeted_2d_bytes": targeted_bytes,
         "quantized_fraction": fraction,
-        "failing_k_values": sorted(gate_k),
+        "failing_k_values": sorted(buckets["convrot_rejected"]["k_values"]),
+        "buckets": {
+            name: {"layers": b["layers"], "bytes": b["bytes"],
+                   "k_values": sorted(b["k_values"])}
+            for name, b in buckets.items()
+        },
     }
 
 
-def low_compression_warning(stats: Dict[str, Any]) -> Optional[str]:
-    """Warning text when most policy-targeted linear bytes stay unquantized."""
+def policy_miss_warning(stats: Dict[str, Any],
+                         architecture: str) -> Optional[str]:
+    """Warn when large 2D float weights under the detected prefix match neither
+    quantize nor keep/exclude patterns: the architecture policy may be stale."""
+    buckets = stats.get("buckets", {})
+    unrec = buckets.get("unrecognized", {})
+    not_in_set = buckets.get("not_in_quantize_set", {})
+    layers = unrec.get("layers", 0) + not_in_set.get("layers", 0)
+    if not layers:
+        return None
+    bytes_ = unrec.get("bytes", 0) + not_in_set.get("bytes", 0)
+    in_prefix_2d = (stats.get("targeted_2d_bytes", 0) + bytes_
+                    + buckets.get("outside_prefix", {}).get("bytes", 0))
+    if bytes_ <= 0.05 * max(1, in_prefix_2d) or bytes_ < 16 * 1024 * 1024:
+        return None
+    return (
+        "policy may be stale: {} unrecognized 2D linear weights ({} bytes) "
+        "under the {} prefix match neither quantize nor keep/exclude patterns; "
+        "review the architecture policy"
+    ).format(layers, bytes_, architecture)
+
+
+def low_compression_warning(stats: Dict[str, Any],
+                            family: Optional[str] = None) -> Optional[str]:
+    """Warning text when most policy-targeted linear bytes stay unquantized.
+
+    The message names the real cause: ConvRot-256 gate victims (with an
+    "expected for <family>" phrasing when the failing K values are documented
+    for that architecture), K%16 shape failures, or sensitivity/user filters.
+    """
     frac = stats.get("quantized_fraction")
     targeted = stats.get("targeted_2d_bytes") or 0
     if frac is None or targeted == 0 or frac >= 0.5:
         return None
-    ks = ", ".join(str(k) for k in stats.get("failing_k_values", []))
-    gate = " (failing K values: {})".format(ks) if ks else ""
-    return (
-        "low compression: only {:.0f}% of policy-targeted 2D linear bytes were "
-        "quantized ({} of {} layers). The CUDA ConvRot-256 gate keeps layers "
-        "with K % 256 != 0 at original precision{}, so the output stays mostly "
-        "at original precision."
-    ).format(100 * frac, stats["quantized_2d_layers"],
-             stats["targeted_2d_layers"], gate)
+    buckets = stats.get("buckets", {})
+    conv = buckets.get("convrot_rejected", {})
+    shape = buckets.get("shape_rejected", {})
+    q = stats["quantized_2d_layers"]
+    t = stats["targeted_2d_layers"]
+    head = ("low compression: only {:.0f}% of policy-targeted 2D linear bytes "
+            "were quantized ({} of {} layers)".format(100 * frac, q, t))
+    if conv.get("layers") and conv.get("bytes", 0) >= (shape.get("bytes") or 0):
+        ks = ", ".join(str(k) for k in conv.get("k_values", []))
+        known = KNOWN_GATE_DIMS.get(family or "", ())
+        if known and ks and set(conv.get("k_values", [])) <= set(known):
+            return (head + ". Expected for {}: K in {} is incompatible with "
+                    "ConvRot-256, so those layers stay at original precision. "
+                    "The output remains CUDA-runnable, just larger."
+                    .format(family, ks))
+        return (head + ". The CUDA ConvRot-256 gate keeps layers with "
+                "K % 256 != 0 at original precision (failing K values: {})".format(ks))
+    if shape.get("layers"):
+        ks = ", ".join(str(k) for k in shape.get("k_values", []))
+        return (head + ". Layers with K in {} fail the W4A8 K % 16 / group "
+                "divisibility rules and stay at original precision.".format(ks))
+    return (head + ". Most of the loss comes from sensitivity analysis or user "
+            "filters, not the ConvRot gate; review --sensitivity-threshold and "
+            "--keep-precision/--exclude.")
 
 
 def render_text_report(report: Dict[str, Any]) -> str:
@@ -4950,6 +5188,16 @@ def render_text_report(report: Dict[str, Any]) -> str:
         if comp.get("failing_k_values"):
             a("  gate victims   : K in %s not divisible by 256 (ConvRot-256); "
               "kept at original precision" % comp["failing_k_values"])
+        gh = report.get("group_histogram") or {}
+        a("  convrot groups : " + str(gh.get("convrot_groupsize", {})))
+        a("  group sizes    : " + str(gh.get("group_size", {})))
+        b = comp.get("buckets", {})
+        for name in _COMPRESSION_BUCKETS:
+            bl = b.get(name)
+            if bl and bl.get("layers"):
+                ktxt = ("; K in %s" % bl["k_values"]) if bl.get("k_values") else ""
+                a("  %-16s: %d layers, %s%s" % (
+                    name, bl["layers"], human_bytes(bl["bytes"]), ktxt))
     else:
         a("  no policy-targeted 2D linear layers")
     a("")
@@ -4973,6 +5221,17 @@ def render_text_report(report: Dict[str, Any]) -> str:
         a(f"  input {os.path.basename(f)} : {h}")
     a("=" * 78)
     return "\n".join(L)
+
+
+def _group_histogram(plan: ConversionPlan) -> Dict[str, Dict[int, int]]:
+    """convrot_groupsize / group_size counts over the quantized layers. One-line
+    proof in the report that every emitted layer uses the production config."""
+    convrot: Dict[int, int] = {}
+    group: Dict[int, int] = {}
+    for d in plan.quantized_layers():
+        convrot[d.convrot_groupsize] = convrot.get(d.convrot_groupsize, 0) + 1
+        group[d.group_size] = group.get(d.group_size, 0) + 1
+    return {"convrot_groupsize": convrot, "group_size": group}
 
 
 def build_report(info: CheckpointInfo, plan: ConversionPlan, env: EnvironmentInfo,
@@ -4999,6 +5258,7 @@ def build_report(info: CheckpointInfo, plan: ConversionPlan, env: EnvironmentInf
         "n_input_tensors": len(info.tensors), "n_quantized": plan.n_quantized,
         "n_kept": plan.n_kept,
         "compression": compression_stats(info, plan, result),
+        "group_histogram": _group_histogram(plan),
         "quantization_rows": quant_rows,
         "tensor_decisions": [
             {"name": item.name, "decision": item.kind.value,
@@ -5036,7 +5296,7 @@ def _console_color(code: str, text: str) -> str:
 
 def print_console_summary(*, out_path: str, input_bytes: int, output_bytes: int,
                           architecture: str, confidence: str, n_quantized: int,
-                          n_kept: int, comp: Dict[str, Any],
+                          n_kept: int, comp: Dict[str, Any], group_size: int,
                           validation: Optional[Dict[str, Any]],
                           elapsed: float, warnings: List[str],
                           report_path: Optional[str] = None,
@@ -5073,7 +5333,7 @@ def print_console_summary(*, out_path: str, input_bytes: int, output_bytes: int,
           "2D linear bytes); " + f"{n_kept} kept")
     else:
         a(f"  quantized   : {n_quantized} layers; {n_kept} kept")
-    a(f"  format      : {FORMAT_W4A8}  group_size=16  convrot_groupsize=256")
+    a(f"  format      : {FORMAT_W4A8}  group_size={group_size}  convrot_groupsize=256")
     a(f"  validation  : {v_txt}")
     if report_path:
         a(f"  report      : {report_path}")
@@ -5116,7 +5376,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="cast passthrough (non-quantized) float tensors to this "
                         "dtype; auto keeps the original dtype")
     p.add_argument("--group-size", type=int, default=None,
-                   help="quantization group size (default: architecture policy, 16)")
+                   help="quantization group size; only 16 is supported (the "
+                        "validated W4A8 configuration with convrot 256)")
+    p.add_argument("--min-quantized-byte-fraction", type=float, default=None,
+                   metavar="F",
+                   help="abort when the quantized share of policy-targeted 2D "
+                        "linear bytes is below F (0..1); used with "
+                        "--fail-on-low-compression or alone as the threshold")
+    p.add_argument("--fail-on-low-compression", action="store_true",
+                   help="refuse to convert when the quantized byte fraction is "
+                        "below 0.10 (or --min-quantized-byte-fraction)")
     p.add_argument("--calibration-source", metavar="PATH", default=None,
                    help="local calibration data (.npz/.pt/.npy files or a directory; "
                         "arrays named exactly like the layer keys, shape [S, K])")
@@ -5331,6 +5600,11 @@ def run_self_tests() -> int:
         ("metadata-generation", _test_metadata),
         ("registry-behavior", _test_registry),
         ("compression-stats", _test_compression_stats),
+        ("boogu-real-dims", _test_boogu_real_dims),
+        ("real-dim-gate", _test_real_dim_gate),
+        ("policy-miss", _test_policy_miss),
+        ("metadata-fuzz", _test_metadata_fuzz),
+        ("fail-on-low-compression", _test_fail_on_low_compression),
         ("architecture-detection-safety", _test_detection_safety),
         ("golden-vectors-vs-reference", _test_golden_vectors),
         ("malformed-checkpoints", _test_malformed),
@@ -5685,6 +5959,244 @@ def _test_compression_stats() -> str:
     return ("K%256 gate victims detected (3360, frac<0.5); clean dims pass silently")
 
 
+def _make_boogu_real_dims_checkpoint(path: str, n: int = 64,
+                                     n_fail: int = 5,
+                                     n_ok: int = 2) -> Dict[str, Tuple[int, int]]:
+    """Small checkpoint with the REAL Boogu-Image-0.1-Turbo widths: hidden 3360
+    (fails the ConvRot-256 gate) and FFN expansion 13568 (compatible). Returns
+    the shape map for the quantize-set keys."""
+    torch.manual_seed(11)
+    sd = {}
+    def L(n_, k_, s=0.02): return torch.randn(n_, k_) * s
+    for i in range(n_fail):
+        pre = f"double_stream_layers.{i}."
+        sd[pre + "img_self_attn.to_q.weight"] = L(n, 3360)
+        sd[pre + "img_instruct_attn.processor.img_to_q.weight"] = L(n, 3360)
+    for i in range(n_ok):
+        pre = f"single_stream_layers.{i}."
+        sd[pre + "feed_forward.linear_2.weight"] = L(n, 13568)
+    safetensors.torch.save_file(sd, path)
+    return {k: tuple(v.shape) for k, v in sd.items()}
+
+
+def _test_boogu_real_dims() -> str:
+    """Real Boogu widths: K=3360 layers must stay BF16/FP32, K=13568 layers
+    must become W4A8, metadata may only list the compatible layers, and the
+    mixed output must reload as QuantizedTensors."""
+    d = _tmpdir()
+    src_path = os.path.join(d, "boogu_real.safetensors")
+    out = os.path.join(d, "boogu_real_w4a8.safetensors")
+    shapes = _make_boogu_real_dims_checkpoint(src_path)
+    args = _selftest_args(out, FORMAT_W4A8)
+    info = discover_checkpoint(src_path)
+    det = detect_architecture(
+        info, shape_lookup=lambda n: (info.by_name(n).shape if info.by_name(n) else None))
+    assert det.architecture == "boogu", det.architecture
+    dec = classify_tensors(info, det, FORMAT_W4A8, None, [], [], [], None, None)
+    plan = ConversionPlan(fmt=FORMAT_W4A8, detection=det, decisions=dec,
+                          metadata_quant={}, metadata_ext={}, output_entries=[])
+    entries, total = build_output_entries(info, dec, FORMAT_W4A8, None)
+    plan.output_entries = entries
+    plan.total_out_bytes = total
+    plan.n_quantized = len(plan.quantized_layers())
+    plan.n_kept = len(dec) - plan.n_quantized
+    plan.metadata_quant = build_quant_metadata(info, plan)
+    stats = compression_stats(info, plan, det)
+    assert stats["quantized_2d_layers"] == 2, stats
+    assert stats["buckets"]["convrot_rejected"]["layers"] == 10, stats
+    assert stats["failing_k_values"] == [3360], stats
+    assert stats["quantized_fraction"] < 0.5, stats
+    engine = ConversionEngine(info, plan, args, out + ".state.json", out + ".tmp", out)
+    try:
+        engine.run()
+    finally:
+        engine.close()
+    meta = dict(info.metadata)
+    meta[METADATA_KEY_QUANT] = json_dumps(plan.metadata_quant)
+    meta[METADATA_KEY_EXT] = json_dumps(build_extension_metadata(
+        info, plan, inspect_environment(), args, None, None,
+        hash_checkpoint_files(info), sha256_safetensors_payload(out),
+        {"status": "selftest"}, []))
+    republish_with_metadata(out, out, meta, entries)
+    with safe_open(out, framework="pt") as st:
+        meta = st.metadata()
+        qm = json.loads(meta["_quantization_metadata"])
+        q_layers = set(qm["layers"].keys())
+        # only the K=13568 layers may be quantized
+        assert q_layers == {
+            "single_stream_layers.0.feed_forward.linear_2",
+            "single_stream_layers.1.feed_forward.linear_2"}, q_layers
+        for _, conf in qm["layers"].items():
+            assert conf["convrot_groupsize"] == 256 and conf["group_size"] == 16
+        # K=3360 layers stay as the original float dtype with the original shape
+        for key in shapes:
+            layer = key[:-len(".weight")]
+            if layer in q_layers:
+                continue
+            t = st.get_tensor(key)
+            assert t.dtype == torch.float32 and tuple(t.shape) == shapes[key], key
+            # byte-identical payload vs source
+            src_t = safetensors.torch.load_file(src_path)[key]
+            assert torch.equal(t, src_t), key
+    # reload through the ComfyUI conversion path
+    try:
+        import comfy_kitchen  # noqa: F401
+        from comfy_kitchen.tensor.base import QuantizedTensor, get_layout_class  # noqa: F401
+    except Exception:
+        return ("real-dims fixture converts mixed (2 quantized, 5 passthrough, "
+                "metadata restricted to K=13568); comfy-kitchen not installed for "
+                "the QuantizedTensor reload step")
+    with safe_open(out, framework="pt") as st:
+        qm = json.loads(st.metadata()["_quantization_metadata"])
+        layer = "single_stream_layers.0.feed_forward.linear_2"
+        conf = qm["layers"][layer]
+        layout = get_layout_class("AsymW4A8Int8Layout")
+        params = layout.Params(
+            scale=st.get_tensor(layer + ".weight_s_rel").view(torch.float8_e4m3fn),
+            s_channel=st.get_tensor(layer + ".weight_s_channel"),
+            codebook=st.get_tensor(layer + ".weight_codebook"),
+            group_size=conf["group_size"],
+            convrot_groupsize=conf["convrot_groupsize"],
+            orig_dtype=torch.bfloat16, orig_shape=shapes[layer + ".weight"])
+        qt = QuantizedTensor(st.get_tensor(layer + ".weight"),
+                             "AsymW4A8Int8Layout", params)
+        assert qt._params.convrot_groupsize == 256
+        assert qt.dequantize().shape == shapes[layer + ".weight"]
+    return ("real-dims fixture: K=3360 passthrough byte-identical, K=13568 W4A8 "
+            "only, metadata restricted, QuantizedTensor reloads")
+
+
+def _real_dim_case(family: str, keys: Sequence[Tuple[str, Tuple[int, ...]]]):
+    """Classify a real-dims key set and return (stats, warning)."""
+    info = _ckpt(keys)
+    det, decisions = _classify_real(keys)
+    plan = ConversionPlan(fmt=FORMAT_W4A8, detection=det, decisions=decisions,
+                          metadata_quant={}, metadata_ext={}, output_entries=[])
+    return (det, compression_stats(info, plan, det),
+            low_compression_warning(compression_stats(info, plan, det),
+                                    det.architecture))
+
+
+def _test_policy_miss() -> str:
+    """Unknown large 2D linears under a known prefix must raise the stale-policy
+    warning; a clean Boogu set must not."""
+    clean_keys: Sequence[Tuple[str, Tuple[int, ...]]] = [
+        ("double_stream_layers.0.img_instruct_attn.processor.img_to_q.weight", (768, 3360)),
+        ("double_stream_layers.0.img_self_attn.to_q.weight", (768, 3360)),
+        ("double_stream_layers.0.img_feed_forward.linear_2.weight", (768, 13568)),
+    ]
+    info = _ckpt(clean_keys)
+    det, decisions = _classify_real(clean_keys)
+    plan = ConversionPlan(fmt=FORMAT_W4A8, detection=det, decisions=decisions,
+                          metadata_quant={}, metadata_ext={}, output_entries=[])
+    stats = compression_stats(info, plan, det)
+    assert policy_miss_warning(stats, det.architecture) is None
+
+    stale_keys = clean_keys + [
+        ("single_stream_layers.0.mystery_proj.weight", (768, 3360)),
+        ("single_stream_layers.0.other_mystery.weight", (768, 3360)),
+    ]
+    info = _ckpt(stale_keys)
+    det, decisions = _classify_real(stale_keys)
+    plan = ConversionPlan(fmt=FORMAT_W4A8, detection=det, decisions=decisions,
+                          metadata_quant={}, metadata_ext={}, output_entries=[])
+    stats = compression_stats(info, plan, det)
+    warn = policy_miss_warning(stats, det.architecture)
+    assert warn is not None and "policy may be stale" in warn, warn
+    assert stats["buckets"]["not_in_quantize_set"]["layers"] == 2, stats
+    return "unknown linears trigger stale-policy warning; clean sets stay silent"
+
+
+def _test_real_dim_gate() -> str:
+    """The documented problematic real dims must produce convrot/shape gate
+    rejections and low-compression warnings; clean controls must not."""
+    cases = {
+        # (detect_primary key + quantize-set keys with the real widths)
+        "pixart": [
+            ("t_block.1.weight", (1152, 1152)),
+            ("blocks.0.attn1.qkv.weight", (3456, 1152)),
+            ("blocks.0.attn1.proj.weight", (1152, 1152)),
+            ("blocks.0.attn2.to_q.weight", (1152, 768)),
+            ("blocks.0.mlp.fc1.weight", (4608, 1152)),
+            ("blocks.0.mlp.fc2.weight", (1152, 4608)),
+        ],
+        "hydit": [
+            ("mlp_t5.0.weight", (384, 1024)),
+            ("blocks.0.attn.qkv.weight", (4224, 1408)),
+            ("blocks.0.attn.proj.weight", (1408, 1408)),
+            ("blocks.0.mlp.fc1.weight", (5632, 1408)),
+            ("blocks.0.mlp.fc2.weight", (1408, 5632)),
+        ],
+        "cogvideox": [
+            ("blocks.0.norm1.linear.weight", (1920, 1920)),
+            ("transformer_blocks.0.attn1.to_q.weight", (1920, 1920)),
+            ("transformer_blocks.0.attn1.to_out.0.weight", (1920, 1920)),
+            ("transformer_blocks.0.ff.net.0.proj.weight", (7680, 1920)),
+            ("transformer_blocks.0.ff.net.2.weight", (1920, 7680)),
+        ],
+        "minimax_h3": [
+            ("video_patch_proj.weight", (768, 256)),
+            ("audio_patch_proj.weight", (768, 256)),
+            ("blocks.0.attn.qkv_proj.weight", (2304, 768)),
+            ("blocks.0.attn.out_proj.weight", (768, 768)),
+            ("blocks.0.mlp.fc1.weight", (2304, 768)),
+            ("blocks.0.mlp.fc2.weight", (768, 1152)),
+        ],
+        "omnigen2": [
+            ("time_caption_embed.timestep_embedder.linear_1.bias", (256,)),
+            ("layers.0.attn.to_q.weight", (2520, 2520)),
+            ("layers.0.attn.to_k.weight", (2520, 2520)),
+            ("layers.0.attn.to_v.weight", (2520, 2520)),
+            ("layers.0.attn.to_out.0.weight", (2520, 2520)),
+            ("layers.0.feed_forward.linear_1.weight", (2520, 2520)),
+            ("layers.0.feed_forward.linear_2.weight", (2520, 10240)),
+            ("layers.0.feed_forward.linear_3.weight", (2520, 2520)),
+        ],
+    }
+    clean_cases = {
+        "flux": [
+            ("double_blocks.0.img_attn.norm.key_norm.weight", (768,)),
+            ("double_blocks.0.img_attn.qkv.weight", (768, 768)),
+            ("double_blocks.0.img_mlp.w1.weight", (3072, 768)),
+        ],
+        "lumina2": [
+            ("cap_embedder.1.weight", (384, 256)),
+            ("layers.0.attention.qkv.weight", (11520, 3840)),
+            ("layers.0.feed_forward.w1.weight", (10240, 3840)),
+            ("layers.0.feed_forward.w2.weight", (3840, 10240)),
+        ],
+    }
+    # minimax_h3: only mlp.fc2 (K=1152) is rejected, ~18% of block bytes, so
+    # the model still quantizes ~82% and must NOT raise the low-compression
+    # warning; it is a documented gate victim but not a low-compression case.
+    det, stats, warn = _real_dim_case("minimax_h3", cases.pop("minimax_h3"))
+    assert det.architecture == "minimax_h3"
+    assert 0.5 <= stats["quantized_fraction"] < 1.0, stats
+    assert stats["buckets"]["convrot_rejected"]["layers"] == 1
+    assert stats["failing_k_values"] == [1152]
+    assert warn is None, warn
+    for family, keys in cases.items():
+        det, stats, warn = _real_dim_case(family, keys)
+        assert det.architecture == family, (family, det.architecture)
+        assert stats["quantized_fraction"] is not None
+        assert stats["quantized_fraction"] < 0.5, (family, stats)
+        assert warn is not None and "low compression" in warn, (family, warn)
+        if family == "omnigen2":
+            # 2520 fails K%16: shape_rejected, not convrot_rejected
+            assert stats["buckets"]["shape_rejected"]["layers"] > 0
+            assert stats["buckets"]["convrot_rejected"]["layers"] == 0
+        else:
+            assert stats["buckets"]["convrot_rejected"]["layers"] > 0, family
+            assert warn and str(stats["failing_k_values"][0]) in warn, family
+    for family, keys in clean_cases.items():
+        det, stats, warn = _real_dim_case(family, keys)
+        assert det.architecture == family, (family, det.architecture)
+        assert stats["quantized_fraction"] == 1.0, (family, stats)
+        assert warn is None, (family, warn)
+    return ("pixart/hydit/cogvideox/minimax/omnigen2 gate warnings verified; "
+            "flux/lumina2 clean controls silent")
+
+
 def _test_detection_safety() -> str:
     # Real Boogu-Image-0.1 key naming (Comfy-Org repack, verified against the
     # published checkpoint): double/single stream layers plus OmniGen2-style
@@ -5793,6 +6305,119 @@ def _test_detection_safety() -> str:
         assert "ambiguous" in str(exc)
     return ("real Boogu/OmniGen2 naming quantizes; Boogu is its own family; "
         "equal-score architectures fail closed")
+
+
+def _test_fail_on_low_compression() -> str:
+    """--fail-on-low-compression / --min-quantized-byte-fraction must abort a
+    dry-run whose quantized byte fraction is below the threshold."""
+    import subprocess as _sp
+    d = _tmpdir()
+    src_path = os.path.join(d, "boogu_real.safetensors")
+    _make_boogu_real_dims_checkpoint(src_path, n=32, n_fail=80, n_ok=2)
+    out = os.path.join(d, "out.safetensors")
+    script = os.path.abspath(__file__)
+    for argv, expect_err in (
+        (["--dry-run", "--fail-on-low-compression"], "below the required 10%"),
+        (["--dry-run", "--min-quantized-byte-fraction", "0.5"], "below the required 50%"),
+    ):
+        cmd = [sys.executable, script, src_path, "--output", out,
+               "--format", "w4a8"] + argv
+        r = _sp.run(cmd, capture_output=True, text=True, timeout=600)  # noqa: S603 (self-test fixture path)
+        assert r.returncode == 1, (argv, r.returncode, r.stdout[-500:], r.stderr[-500:])
+        assert expect_err in r.stderr or expect_err in r.stdout, (argv, r.stdout[-800:])
+        assert not os.path.exists(out)
+    # without the flag the same dry-run succeeds
+    r = _sp.run([sys.executable, script, src_path, "--output", out,  # noqa: S603 (self-test)
+                 "--format", "w4a8", "--dry-run"], capture_output=True, text=True,
+                timeout=600)
+    assert r.returncode == 0, (r.returncode, r.stdout[-500:])
+    assert not os.path.exists(out)  # dry run writes nothing
+    return ("low-compression thresholds abort dry-run with clear errors; "
+            "default conversion unaffected")
+
+
+def _test_metadata_fuzz() -> str:
+    """Corrupted quantization metadata must be rejected: wrong convrot size,
+    swapped group fields, missing codebook, wrong scale shapes, missing layer
+    metadata, stale old-format entries."""
+    def craft(fname: str, layers_conf, tensors: Dict[str, torch.Tensor]) -> str:
+        meta = {"_quantization_metadata": json_dumps({"layers": layers_conf})}
+        p = os.path.join(_tmpdir(), fname)
+        safetensors.torch.save_file(tensors, p, metadata=meta)
+        return p
+
+    d = _tmpdir()
+    src_path = os.path.join(d, "mini.safetensors")
+    _make_mini_checkpoint(src_path)
+    info = discover_checkpoint(src_path)
+    det = detect_architecture(
+        info, shape_lookup=lambda n: (info.by_name(n).shape if info.by_name(n) else None))
+    layer = "model.diffusion_model.input_blocks.1.0.transformer_blocks.0.attn1.to_q"
+    good = {
+        "format": FORMAT_W4A8, "group_size": 16, "convrot": True,
+        "convrot_groupsize": 256,
+    }
+    base_tensors = {
+        layer + ".weight": torch.zeros(1280, 640, dtype=torch.int8),
+        layer + ".weight_s_rel": torch.zeros(1280, 80, dtype=torch.uint8),
+        layer + ".weight_s_channel": torch.ones(1280, dtype=torch.float32),
+        layer + ".weight_codebook": torch.zeros(16, dtype=torch.float32),
+    }
+
+    # (1) convrot_groupsize 64: the historical v1.2.1 failure -> hard reject
+    p64 = craft("cgs64.safetensors", {layer: dict(good, convrot_groupsize=64)}, base_tensors)
+    try:
+        plan_from_output(p64, det, FORMAT_W4A8, info)
+        raise AssertionError("cgs=64 accepted")
+    except ValidationError as exc:
+        assert "convrot_groupsize" in str(exc)
+
+    # (2) swapped group fields (group_size=256, convrot=16): must be rejected
+    pswap = craft("swapped.safetensors",
+                  {layer: {"format": FORMAT_W4A8, "group_size": 256,
+                           "convrot": True, "convrot_groupsize": 16}}, base_tensors)
+    try:
+        plan_from_output(pswap, det, FORMAT_W4A8, info)
+        raise AssertionError("swapped groups accepted")
+    except ValidationError as exc:
+        assert "convrot_groupsize" in str(exc)
+
+    # (3) missing layer metadata (empty layers): rejected
+    pnone = craft("empty.safetensors", {}, base_tensors)
+    try:
+        plan_from_output(pnone, det, FORMAT_W4A8, info)
+        raise AssertionError("empty layer metadata accepted")
+    except ValidationError as exc:
+        assert "layers" in str(exc)
+
+    # (4) stale old-format entry: rejected
+    pstale = craft("stale.safetensors",
+                   {layer: {"format": "int4_old", "group_size": 16,
+                            "convrot": True, "convrot_groupsize": 256}}, base_tensors)
+    try:
+        plan_from_output(pstale, det, FORMAT_W4A8, info)
+        raise AssertionError("stale format accepted")
+    except ValidationError as exc:
+        assert "incompatible format" in str(exc)
+
+    # (5) wrong s_rel dimensions + missing codebook: plan builds, Validator fails
+    pshape = craft("badshape.safetensors", {layer: good}, {
+        layer + ".weight": torch.zeros(1280, 640, dtype=torch.int8),
+        layer + ".weight_s_rel": torch.zeros(1280, 7, dtype=torch.uint8),  # wrong
+        layer + ".weight_s_channel": torch.ones(1280, dtype=torch.float32),
+        # codebook missing entirely
+    })
+    plan = plan_from_output(pshape, det, FORMAT_W4A8, info)
+    validator = Validator(info, plan, pshape, _selftest_args(pshape, FORMAT_W4A8,
+                                                             extra={"validate": True}),
+                          inspect_environment())
+    summary = validator.run()
+    assert summary["n_failed"] >= 1, summary
+    failed_names = {c["name"] for c in summary["checks"] if c["status"] == "failed"}
+    assert "metadata-runtime-contract" in failed_names, failed_names
+    assert "shape-preservation" in failed_names, failed_names
+    return ("cgs64/swapped/empty/stale metadata rejected; wrong s_rel and missing "
+            "codebook fail runtime-contract validation")
 
 
 def _test_malformed() -> str:
@@ -6027,6 +6652,25 @@ def _test_resume() -> str:
         f.seek(byte_pos)
         f.write(original_byte)
 
+    # A different converter/algorithm revision must invalidate the resume plan,
+    # even when the inventory looks identical.
+    global CONVERTER_VERSION  # noqa: PLW0603
+    saved_version = CONVERTER_VERSION
+    try:
+        CONVERTER_VERSION = saved_version + "-test"
+        drift_ver = ConversionEngine(
+            info, plan, _selftest_args(out, FORMAT_W4A8, resume=True),
+            state_path, tmp_path, out)
+        try:
+            drift_ver.run()
+            raise AssertionError("resume accepted different converter version")
+        except OutputError as exc:
+            assert "parameters" in str(exc)
+        finally:
+            drift_ver.close()
+    finally:
+        CONVERTER_VERSION = saved_version
+
     # second run: resume and finish
     args2 = _selftest_args(out, FORMAT_W4A8, resume=True)
     eng2 = ConversionEngine(info, plan, args2, state_path, tmp_path, out)
@@ -6147,6 +6791,7 @@ def _selftest_args(out: str, fmt: str, resume: bool = False, overwrite: bool = F
         group_size=None, calibration_source=None, calibration_samples=None,
         calibration_cache=None, seed=0, include=[], exclude=[], keep_precision=[], min_numel_override=None,
         sensitivity_threshold=None, error_threshold=0.35, max_memory=2 * 1024**3,
+        min_quantized_byte_fraction=None, fail_on_low_compression=False,
         streaming=True, resume=resume, overwrite=overwrite, dry_run=False,
         inspect=False, validate=False, validation_only=False, metadata_only=False,
         report=None, log_level="warning", json_log=None, trust_pickle=False,
@@ -6181,6 +6826,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"{special} cannot be combined with " + ", ".join(selected_modes))
     if args.resume and args.overwrite:
         raise UsageError("--resume and --overwrite are mutually exclusive")
+    if args.group_size is not None and args.group_size != 16:
+        raise UsageError(
+            "--group-size must be 16: only the validated W4A8 configuration "
+            "(group_size=16, convrot_groupsize=256) is supported by the "
+            "production runtime")
     setup_logging(args.log_level,
                   args.json_log if (args.list_architectures or args.self_test) else None)
     env = inspect_environment()
@@ -6434,9 +7084,26 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"{d.layer}: {tuple(m.shape)} gs={d.group_size} cgs={d.convrot_groupsize}")
 
     comp_stats = compression_stats(info, plan, detection)
-    low_comp = low_compression_warning(comp_stats)
+    effective_group_size = (plan.quantized_layers()[0].group_size
+                            if plan.quantized_layers() else
+                            (args.group_size or 16))
+    low_comp = low_compression_warning(comp_stats, detection.architecture)
     if low_comp:
         warnings.append(low_comp)
+    miss = policy_miss_warning(comp_stats, detection.architecture)
+    if miss:
+        warnings.append(miss)
+    fail_threshold = args.min_quantized_byte_fraction
+    if fail_threshold is None and args.fail_on_low_compression:
+        fail_threshold = 0.10
+    frac = comp_stats.get("quantized_fraction")
+    if fail_threshold is not None and frac is not None and frac < fail_threshold:
+        flag = ("--min-quantized-byte-fraction" if args.min_quantized_byte_fraction
+                else "--fail-on-low-compression")
+        raise UsageError(
+            f"quantized byte fraction {100*frac:.1f}% is below the required "
+            f"{100*fail_threshold:.0f}% ({flag}); nothing was written. Lower "
+            "the threshold or drop the flag to allow the conversion.")
 
     if args.metadata_only:
         metadata_input_hashes = hash_checkpoint_files(info)
@@ -6464,8 +7131,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             out_path=out_path, input_bytes=info.total_bytes,
             output_bytes=total_out, architecture=detection.architecture,
             confidence=detection.confidence, n_quantized=plan.n_quantized,
-            n_kept=plan.n_kept, comp=comp_stats, validation=None,
-            elapsed=time.time() - t_start, warnings=warnings,
+            n_kept=plan.n_kept, comp=comp_stats, group_size=effective_group_size,
+            validation=None, elapsed=time.time() - t_start, warnings=warnings,
             report_path=os.path.abspath(args.report) if args.report else None,
             dry_run=True)
         return 0
@@ -6599,7 +7266,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         output_bytes=os.path.getsize(out_path),
         architecture=detection.architecture, confidence=detection.confidence,
         n_quantized=plan.n_quantized, n_kept=plan.n_kept, comp=comp_stats,
-        validation=summary, elapsed=time.time() - t_start, warnings=warnings,
+        group_size=effective_group_size, validation=summary,
+        elapsed=time.time() - t_start, warnings=warnings,
         report_path=os.path.abspath(args.report) if args.report else None,
         dry_run=False)
 

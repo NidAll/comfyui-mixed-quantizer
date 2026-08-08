@@ -13,7 +13,7 @@ accepts only `w4a8` and defaults to it.
 - Repo (public): `https://github.com/NidAll/comfyui-w4a8-quantizer`
   (renamed from `comfyui-wxa8-quantizer`; old URL redirects)
 - Branch: `main`, SSH remote `git@github.com:NidAll/comfyui-w4a8-quantizer.git`
-- Script version: `1.2.3` (`CONVERTER_VERSION` in the script)
+- Script version: `1.3.0` (`CONVERTER_VERSION` in the script)
 
 ## Format facts (verified, do not guess)
 
@@ -123,7 +123,7 @@ pip install --python .venv/bin/python PKG`.
 ## Common commands
 
 ```bash
-.venv/bin/python comfyui_wxa8_quantizer.py --self-test          # 20/20 required
+.venv/bin/python comfyui_wxa8_quantizer.py --self-test          # 25/25 required
 .venv/bin/python comfyui_wxa8_quantizer.py --list-architectures
 .venv/bin/python comfyui_wxa8_quantizer.py MODEL.safetensors --inspect
 .venv/bin/python comfyui_wxa8_quantizer.py MODEL.safetensors \
@@ -141,7 +141,7 @@ Fixture generation and conversion (small, fast, no real models):
     --output testdata/wan_fixture_w4a8.safetensors --format w4a8 --validate
 ```
 
-Families: `sdxl, sd15, flux, wan, minimax_h3, hydit, mmdit_sd3, zimage, boogu, omnigen2` (boogu and omnigen2 use the real state-dict naming).
+Families: `sdxl, sd15, flux, wan, minimax_h3, hydit, mmdit_sd3, zimage, boogu, boogu_real, omnigen2` (boogu/omnigen2 use the real state-dict naming; boogu_real uses the real Boogu-Image-0.1-Turbo widths: K=3360 passthrough + K=13568 W4A8).
 `zimage` uses the real Lumina2/Z-Image naming. Reports live in
 `testdata/reports/` (path-sanitized).
 
@@ -154,21 +154,32 @@ small regeneration tests instead of real models.
 
 ## Verification before claiming success
 
-1. `--self-test` must pass 20/20.
+1. `--self-test` must pass 25/25.
 2. Convert affected families from `testdata/make_fixtures.py` with `--validate`;
    max relL2 should be about 0.073 (chunked path about 0.085). Every quantized
    layer in the report must show `cgs=256`; layers with K%256 != 0 must appear as
    passthrough with "divisible by convrot_groupsize=256" in the reason. The
    report's `-- compression --` section shows the quantized share of
-   policy-targeted 2D bytes; a share below 50% also raises the low-compression
-   warning with the failing K values.
-3. For converter changes, the CI matrix runs self-tests and a fixture
-   conversion on ubuntu / windows / macos on every push.
-4. For loader questions, reproduce with the real ComfyUI path:
+   policy-targeted 2D bytes plus per-reason buckets; a share below 50% raises
+   the low-compression warning with the failing K values. `--validate` also
+   verifies passthrough tensors byte-identically (auto output dtype) and runs
+   the independent metadata runtime-contract checks.
+3. On a GPU machine run `testdata/cuda_smoke.py` (fused CUDA W4A8 linear at
+   K=256/768/13568, invalid-convrot rejection, mixed boogu_real fixture through
+   the fused kernels). The real-dims fixture is `boogu_real_fixture` (K=3360
+   passthrough + K=13568 W4A8, full ComfyUI inventory); `testdata/comfyui_smoke.py`
+   performs the full ComfyUI one-step forward on the real checkpoint.
+4. `--fail-on-low-compression` / `--min-quantized-byte-fraction` abort low-value
+   conversions; `--group-size` is restricted to 16 (the only validated config).
+5. For converter changes, the CI matrix runs self-tests and fixture
+   conversions (wan, boogu, boogu_real) on ubuntu / windows / macos on every
+   push; the optional cuda-smoke workflow targets a self-hosted GPU runner.
+6. For loader questions, reproduce with the real ComfyUI path:
    `PYTHONPATH=research/ComfyUI .venv/bin/python` and the flow
    `load_torch_file -> convert_old_quants -> model_config_from_unet ->
    get_model -> load_model_weights`, then check that weights are
-   `QuantizedTensor` with `layout=AsymW4A8Int8Layout`.
+   `QuantizedTensor` with `layout=AsymW4A8Int8Layout` and
+   `convrot_groupsize=256`.
 
 ## Known behavior, do not "fix" it
 

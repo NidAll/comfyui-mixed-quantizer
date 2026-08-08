@@ -242,6 +242,91 @@ def make_boogu():
     return sd
 
 
+def make_boogu_real():
+    """Boogu-Image-0.1-Turbo shaped fixture with the REAL structural widths
+    (hidden 3360, FFN expansion 13568) and the full state-dict inventory the
+    ComfyUI Boogu loader needs (embedders, norms, modulations). Synthetic data,
+    real dimensions (verified against Boogu/Boogu-Image-0.1-Turbo). The
+    conversion proves mixed passthrough + W4A8 behavior and the file loads in
+    real ComfyUI for the one-step smoke test."""
+    sd = {}
+    def L(n, k, scale=0.02): return torch.randn(n, k) * scale
+    # embedders (real naming, prefix-less)
+    sd["x_embedder.weight"] = L(3360, 64)
+    sd["x_embedder.bias"] = torch.randn(3360) * 0.01
+    sd["ref_image_patch_embedder.weight"] = L(3360, 64)
+    sd["ref_image_patch_embedder.bias"] = torch.randn(3360) * 0.01
+    sd["image_index_embedding"] = torch.randn(5, 3360) * 0.1
+    sd["time_caption_embed.timestep_embedder.linear_1.weight"] = L(256, 64)
+    sd["time_caption_embed.timestep_embedder.linear_1.bias"] = torch.randn(256) * 0.01
+    sd["time_caption_embed.timestep_embedder.linear_2.weight"] = L(3360, 256)
+    sd["time_caption_embed.timestep_embedder.linear_2.bias"] = torch.randn(3360) * 0.01
+    sd["time_caption_embed.caption_embedder.0.weight"] = L(4096, 1024)
+    sd["time_caption_embed.caption_embedder.1.weight"] = L(3360, 4096)
+    sd["time_caption_embed.caption_embedder.1.bias"] = torch.randn(3360) * 0.01
+    sd["norm_out.linear_1.weight"] = L(3360, 3360)
+    sd["norm_out.linear_1.bias"] = torch.randn(3360) * 0.01
+    sd["norm_out.linear_2.weight"] = L(64, 3360)
+    sd["norm_out.linear_2.bias"] = torch.randn(64) * 0.01
+    for b in range(4):
+        pre = f"double_stream_layers.{b}."
+        for proj in ("to_q", "to_k", "to_v"):
+            sd[pre + "img_self_attn." + proj + ".weight"] = L(384, 3360)
+            sd[pre + "img_instruct_attn.processor.img_" + proj + ".weight"] = L(384, 3360)
+            sd[pre + "img_instruct_attn.processor.instruct_" + proj + ".weight"] = L(384, 3360)
+        sd[pre + "img_self_attn.to_out.0.weight"] = L(384, 3360)
+        sd[pre + "img_instruct_attn.to_out.0.weight"] = L(384, 3360)
+        sd[pre + "img_instruct_attn.processor.img_out.weight"] = L(384, 3360)
+        sd[pre + "img_instruct_attn.processor.instruct_out.weight"] = L(384, 3360)
+        for ffn in ("img_feed_forward", "instruct_feed_forward"):
+            for i in (1, 2, 3):
+                sd[pre + f"{ffn}.linear_{i}.weight"] = L(384, 3360 if i != 2 else 13568)
+        for mod in ("img_norm1", "img_norm2", "img_norm3", "instruct_norm1", "instruct_norm2"):
+            sd[pre + f"{mod}.linear.weight"] = L(1536, 64)
+            sd[pre + f"{mod}.linear.bias"] = torch.randn(1536) * 0.01
+            sd[pre + f"{mod}.norm.weight"] = torch.randn(384) * 0.1
+        sd[pre + "img_self_attn.norm_k.weight"] = torch.randn(384) * 0.1
+        sd[pre + "img_self_attn.norm_q.weight"] = torch.randn(384) * 0.1
+        sd[pre + "img_instruct_attn.norm_k.weight"] = torch.randn(384) * 0.1
+        sd[pre + "img_instruct_attn.norm_q.weight"] = torch.randn(384) * 0.1
+        sd[pre + "img_self_attn_norm.weight"] = torch.randn(384) * 0.1
+        sd[pre + "instruct_attn_norm.weight"] = torch.randn(384) * 0.1
+        sd[pre + "img_attn_norm.weight"] = torch.randn(384) * 0.1
+        sd[pre + "img_ffn_norm1.weight"] = torch.randn(384) * 0.1
+        sd[pre + "img_ffn_norm2.weight"] = torch.randn(384) * 0.1
+        sd[pre + "instruct_ffn_norm1.weight"] = torch.randn(384) * 0.1
+        sd[pre + "instruct_ffn_norm2.weight"] = torch.randn(384) * 0.1
+    for b in range(8):
+        pre = f"single_stream_layers.{b}."
+        for proj in ("to_q", "to_k", "to_v"):
+            sd[pre + "attn." + proj + ".weight"] = L(384, 3360)
+        sd[pre + "attn.to_out.0.weight"] = L(384, 3360)
+        for i in (1, 2, 3):
+            sd[pre + f"feed_forward.linear_{i}.weight"] = L(384, 3360 if i != 2 else 13568)
+        sd[pre + "norm1.linear.weight"] = L(1536, 64)
+        sd[pre + "norm1.linear.bias"] = torch.randn(1536) * 0.01
+        sd[pre + "norm1.norm.weight"] = torch.randn(384) * 0.1
+        sd[pre + "norm2.weight"] = torch.randn(384) * 0.1
+        sd[pre + "attn.norm_k.weight"] = torch.randn(384) * 0.1
+        sd[pre + "attn.norm_q.weight"] = torch.randn(384) * 0.1
+        sd[pre + "ffn_norm1.weight"] = torch.randn(384) * 0.1
+        sd[pre + "ffn_norm2.weight"] = torch.randn(384) * 0.1
+    for name in ("context_refiner", "noise_refiner", "ref_image_refiner"):
+        pre = f"{name}.0."
+        for proj in ("to_q", "to_k", "to_v"):
+            sd[pre + "attn." + proj + ".weight"] = L(384, 3360)
+        sd[pre + "attn.to_out.0.weight"] = L(384, 3360)
+        for i in (1, 2, 3):
+            sd[pre + f"feed_forward.linear_{i}.weight"] = L(384, 3360 if i != 2 else 13568)
+        sd[pre + "attn.norm_k.weight"] = torch.randn(384) * 0.1
+        sd[pre + "attn.norm_q.weight"] = torch.randn(384) * 0.1
+        sd[pre + "ffn_norm1.weight"] = torch.randn(384) * 0.1
+        sd[pre + "ffn_norm2.weight"] = torch.randn(384) * 0.1
+        sd[pre + "norm1.weight"] = torch.randn(384) * 0.1
+        sd[pre + "norm2.weight"] = torch.randn(384) * 0.1
+    return sd
+
+
 def make_omnigen2():
     """OmniGen2 shaped fixture using the real state-dict naming (BAAI/OmniGen2,
     prefix-less): layers.N.attn / feed_forward plus the refiners."""
@@ -283,7 +368,8 @@ def make_mmdit_sd3():
 makers = {
     "sdxl": make_sdxl, "sd15": make_sd15, "flux": make_flux, "wan": make_wan,
     "minimax_h3": make_minimax_h3, "hydit": make_hydit, "mmdit_sd3": make_mmdit_sd3,
-    "zimage": make_zimage, "boogu": make_boogu, "omnigen2": make_omnigen2,
+    "zimage": make_zimage, "boogu": make_boogu, "boogu_real": make_boogu_real,
+    "omnigen2": make_omnigen2,
 }
 key = os.path.basename(OUT).split("_fixture")[0]
 sd = makers[key]()

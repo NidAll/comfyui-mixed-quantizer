@@ -1,13 +1,13 @@
 ==============================================================================
-comfyui_wxa8_quantizer 1.2.3 -- conversion report
+comfyui_wxa8_quantizer 1.3.0 -- conversion report
 ==============================================================================
 format            : asym_w4a8_int8 (asym-w4a8-int8-r1)
 architecture      : minimax_h3 (confidence high)
 unet prefix       : model.
 input             : safetensors (testdata/minimax_h3_fixture.safetensors)
 output            : testdata/minimax_h3_fixture_w4a8.safetensors (36.77 MiB)
-elapsed           : 5.119 s
-peak RSS          : 688.29 MiB
+elapsed           : 5.559 s
+peak RSS          : 701.82 MiB
 
 -- detection evidence --
   + video_patch_proj.weight
@@ -25,6 +25,12 @@ peak RSS          : 688.29 MiB
   quantized      : 6 / 12 policy-targeted 2D layers
   byte share     : 54.9% of targeted 2D bytes
   gate victims   : K in [1152] not divisible by 256 (ConvRot-256); kept at original precision
+  convrot groups : {256: 6}
+  group sizes    : {16: 6}
+  quantized       : 6 layers, 31.50 MiB; K in [768]
+  convrot_rejected: 2 layers, 6.75 MiB; K in [1152]
+  keep_precision  : 4 layers, 19.12 MiB; K in [768, 1152]
+  policy_kept     : 8 layers, 6.31 MiB; K in [8, 256, 768, 1024]
 
 -- quantization --
   blocks.0.attn.out_proj: (768, 768) gs=16 cgs=256
@@ -50,6 +56,8 @@ peak RSS          : 688.29 MiB
   [passed                ] tensor-payload-hash -- sha256=ee342fc96d2cde56332971a3c295931a59568a9e34bbbfe7e34d2d41d689da9a
   [passed                ] metadata-layer-inventory -- 6 layers match
   [passed                ] metadata-layer-conf -- format/group/ConvRot fields valid
+  [passed                ] metadata-runtime-contract -- convrot=256, group_size=16, exact shapes, K%256==0
+  [passed                ] passthrough-integrity -- 24 passthrough tensors byte-identical
   [passed                ] recon-blocks.0.attn.out_proj -- relL2=0.0726 snr=22.8dB cos=0.9974
   [passed                ] pack-rt-blocks.0.attn.out_proj -- pack/unpack round trip
   [passed                ] recon-blocks.0.attn.qkv_proj -- relL2=0.0726 snr=22.8dB cos=0.9974
@@ -66,7 +74,7 @@ peak RSS          : 688.29 MiB
   [passed                ] scale-validation -- 6 layers OK (fp8 s_rel finite/nonnegative, fp32 s_channel finite/positive)
   [passed                ] deterministic-conversion -- two runs byte-identical
   [passed                ] deterministic-vs-disk -- recomputed packed weight matches the file
-  [passed                ] output-hash -- sha256=92fdf4bd26a5ba55e285beec56877c1034930ce480035d3e24c5676136e640d3
+  [passed                ] output-hash -- sha256=201dabf13304d18b961af31c7ff3c484e5b4e980398065fb3d07e753179f3455
   [passed                ] compat-comfy-kitchen -- installed comfy-kitchen: 0.2.28, static package source contains AsymW4A8Int8Layout: True
   [skipped               ] compat-comfyui -- ComfyUI not installed (skipped)
   [passed                ] input-hash -- {"minimax_h3_fixture.safetensors":"7fa2d5cde079d2dad981b3f2be2856d5fd4f61ebe2eb89df1d3aabd88972f8ec"}
@@ -76,6 +84,6 @@ peak RSS          : 688.29 MiB
   comfy-kitchen >= aa1ab2263dc06225d9de6702dfc087313d4bc971 (PR #90, merged) with AsymW4A8Int8Layout; ComfyUI >= v0.31.0 (PR #15308 merged as 344b43989e; older builds need patches/comfyui_w4a8_loader.patch); CUDA: PyTorch cu130+, SM >= 8.0; ROCm: triton >= 3.7; eager works anywhere
 
 -- output integrity --
-  sha256          : 92fdf4bd26a5ba55e285beec56877c1034930ce480035d3e24c5676136e640d3
+  sha256          : 201dabf13304d18b961af31c7ff3c484e5b4e980398065fb3d07e753179f3455
   input minimax_h3_fixture.safetensors : 7fa2d5cde079d2dad981b3f2be2856d5fd4f61ebe2eb89df1d3aabd88972f8ec
 ==============================================================================

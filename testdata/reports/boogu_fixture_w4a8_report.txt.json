@@ -1,6 +1,6 @@
 {
  "converter": "comfyui_wxa8_quantizer",
- "converter_version": "1.2.3",
+ "converter_version": "1.3.0",
  "format": "asym_w4a8_int8",
  "format_revision": "asym-w4a8-int8-r1",
  "architecture": "boogu",
@@ -34,7 +34,86 @@
   "quantized_2d_bytes": 161611776,
   "targeted_2d_bytes": 161611776,
   "quantized_fraction": 1.0,
-  "failing_k_values": []
+  "failing_k_values": [],
+  "buckets": {
+   "quantized": {
+    "layers": 73,
+    "bytes": 161611776,
+    "k_values": [
+     768
+    ]
+   },
+   "convrot_rejected": {
+    "layers": 0,
+    "bytes": 0,
+    "k_values": []
+   },
+   "shape_rejected": {
+    "layers": 0,
+    "bytes": 0,
+    "k_values": []
+   },
+   "small_tensor": {
+    "layers": 0,
+    "bytes": 0,
+    "k_values": []
+   },
+   "keep_precision": {
+    "layers": 0,
+    "bytes": 0,
+    "k_values": []
+   },
+   "sensitivity_kept": {
+    "layers": 0,
+    "bytes": 0,
+    "k_values": []
+   },
+   "policy_kept": {
+    "layers": 20,
+    "bytes": 7733248,
+    "k_values": [
+     64,
+     256,
+     384,
+     1024
+    ]
+   },
+   "user_forced": {
+    "layers": 0,
+    "bytes": 0,
+    "k_values": []
+   },
+   "user_excluded": {
+    "layers": 0,
+    "bytes": 0,
+    "k_values": []
+   },
+   "not_in_quantize_set": {
+    "layers": 0,
+    "bytes": 0,
+    "k_values": []
+   },
+   "unrecognized": {
+    "layers": 1,
+    "bytes": 7680,
+    "k_values": [
+     384
+    ]
+   },
+   "outside_prefix": {
+    "layers": 0,
+    "bytes": 0,
+    "k_values": []
+   }
+  }
+ },
+ "group_histogram": {
+  "convrot_groupsize": {
+   "256": 73
+  },
+  "group_size": {
+   "16": 73
+  }
  },
  "quantization_rows": [
   "context_refiner.0.attn.to_k: (768, 768) gs=16 cgs=256",
@@ -1589,6 +1668,18 @@
    "reason": ""
   },
   {
+   "name": "metadata-runtime-contract",
+   "status": "passed",
+   "detail": "convrot=256, group_size=16, exact shapes, K%256==0",
+   "reason": ""
+  },
+  {
+   "name": "passthrough-integrity",
+   "status": "passed",
+   "detail": "102 passthrough tensors byte-identical",
+   "reason": ""
+  },
+  {
    "name": "recon-context_refiner.0.attn.to_k",
    "status": "passed",
    "detail": "relL2=0.0726 snr=22.8dB cos=0.9974",
@@ -2491,7 +2582,7 @@
   {
    "name": "output-hash",
    "status": "passed",
-   "detail": "sha256=b83c3748f6f7185026d1e06c8f5181f96f84614db8e3152956cdefdd6e2b3621",
+   "detail": "sha256=c82242070b7119a4b5d4f6c46eb85eb4e4720d90f246afe973b327288fab8b38",
    "reason": ""
   },
   {
@@ -2523,9 +2614,9 @@
  "input_hashes": {
   "testdata/boogu_fixture.safetensors": "67ac4691950492f7d04baf2a00d7c82315bee1bdd505589d25e2c184aeceff66"
  },
- "output_sha256": "b83c3748f6f7185026d1e06c8f5181f96f84614db8e3152956cdefdd6e2b3621",
- "elapsed_seconds": 31.786,
- "peak_rss_bytes": 819630080,
+ "output_sha256": "c82242070b7119a4b5d4f6c46eb85eb4e4720d90f246afe973b327288fab8b38",
+ "elapsed_seconds": 32.166,
+ "peak_rss_bytes": 831324160,
  "environment": {
   "python": "3.11.15",
   "torch_version": "2.13.0+cu130",

@@ -1,6 +1,6 @@
 {
  "converter": "comfyui_wxa8_quantizer",
- "converter_version": "1.2.3",
+ "converter_version": "1.3.0",
  "format": "asym_w4a8_int8",
  "format_revision": "asym-w4a8-int8-r1",
  "architecture": "sdxl",
@@ -29,7 +29,86 @@
   "quantized_fraction": 0.7204968944099379,
   "failing_k_values": [
    320
-  ]
+  ],
+  "buckets": {
+   "quantized": {
+    "layers": 8,
+    "bytes": 19005440,
+    "k_values": [
+     1280,
+     2048
+    ]
+   },
+   "convrot_rejected": {
+    "layers": 12,
+    "bytes": 7372800,
+    "k_values": [
+     320
+    ]
+   },
+   "shape_rejected": {
+    "layers": 0,
+    "bytes": 0,
+    "k_values": []
+   },
+   "small_tensor": {
+    "layers": 0,
+    "bytes": 0,
+    "k_values": []
+   },
+   "keep_precision": {
+    "layers": 0,
+    "bytes": 0,
+    "k_values": []
+   },
+   "sensitivity_kept": {
+    "layers": 0,
+    "bytes": 0,
+    "k_values": []
+   },
+   "policy_kept": {
+    "layers": 2,
+    "bytes": 414720,
+    "k_values": [
+     320
+    ]
+   },
+   "user_forced": {
+    "layers": 0,
+    "bytes": 0,
+    "k_values": []
+   },
+   "user_excluded": {
+    "layers": 0,
+    "bytes": 0,
+    "k_values": []
+   },
+   "not_in_quantize_set": {
+    "layers": 0,
+    "bytes": 0,
+    "k_values": []
+   },
+   "unrecognized": {
+    "layers": 0,
+    "bytes": 0,
+    "k_values": []
+   },
+   "outside_prefix": {
+    "layers": 1,
+    "bytes": 151781376,
+    "k_values": [
+     768
+    ]
+   }
+  }
+ },
+ "group_histogram": {
+  "convrot_groupsize": {
+   "256": 8
+  },
+  "group_size": {
+   "16": 8
+  }
  },
  "quantization_rows": [
   "model.diffusion_model.input_blocks.1.0.transformer_blocks.0.attn2.to_k: (320, 2048) gs=16 cgs=256",
@@ -343,6 +422,18 @@
    "reason": ""
   },
   {
+   "name": "metadata-runtime-contract",
+   "status": "passed",
+   "detail": "convrot=256, group_size=16, exact shapes, K%256==0",
+   "reason": ""
+  },
+  {
+   "name": "passthrough-integrity",
+   "status": "passed",
+   "detail": "20 passthrough tensors byte-identical",
+   "reason": ""
+  },
+  {
    "name": "recon-model.diffusion_model.input_blocks.1.0.transformer_blocks.0.attn2.to_k",
    "status": "passed",
    "detail": "relL2=0.0729 snr=22.7dB cos=0.9973",
@@ -465,7 +556,7 @@
   {
    "name": "output-hash",
    "status": "passed",
-   "detail": "sha256=cc74c68ef4b36588b8caa5faaf2e8197e0cb574b9eb603f92df7aad4623c09e2",
+   "detail": "sha256=10e7654af95c8caf51683f3e03a2e3a0050cd5dce6eecf015392a1b315dd1aa0",
    "reason": ""
   },
   {
@@ -497,9 +588,9 @@
  "input_hashes": {
   "testdata/sdxl_fixture.safetensors": "d283dbbc60dfb24e4c4b0b2c7361ca64f6f34dc67282551680ed05fba0099ad5"
  },
- "output_sha256": "cc74c68ef4b36588b8caa5faaf2e8197e0cb574b9eb603f92df7aad4623c09e2",
- "elapsed_seconds": 6.632,
- "peak_rss_bytes": 800129024,
+ "output_sha256": "10e7654af95c8caf51683f3e03a2e3a0050cd5dce6eecf015392a1b315dd1aa0",
+ "elapsed_seconds": 7.807,
+ "peak_rss_bytes": 902238208,
  "environment": {
   "python": "3.11.15",
   "torch_version": "2.13.0+cu130",

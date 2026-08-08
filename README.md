@@ -91,6 +91,26 @@ python comfyui_wxa8_quantizer.py ORIGINAL_MODEL \
 Only the original model path and the output path are required. `--format` defaults
 to `w4a8`. All other parameters have architecture-specific defaults.
 
+Safety flags worth knowing:
+
+* `--dry-run` prints the estimated output size, the quantized byte fraction and
+  any low-compression warning before anything is written.
+* `--fail-on-low-compression` aborts a conversion whose quantized share of
+  policy-targeted 2D linear bytes is below 10% (adjust with
+  `--min-quantized-byte-fraction F`).
+* `--validate` runs the full suite, including byte-identical passthrough
+  verification and the independent runtime-contract checks
+  (convrot_groupsize=256, group_size=16, exact tensor shapes, K%256==0).
+* `--validation-only` rejects corrupted or incompatible outputs, including the
+  historical `convrot_groupsize=64` bug.
+
+GPU regression and ComfyUI smoke tests live in `testdata/`:
+
+```bash
+python testdata/cuda_smoke.py          # fused CUDA W4A8 kernels + rejection checks
+PYTHONPATH=<comfyui-src> python testdata/comfyui_smoke.py --model OUT.safetensors
+```
+
 ## Supported inputs
 
 * a single `.safetensors` checkpoint (ComfyUI-style single files, e.g. SD1.5 / SDXL
@@ -325,12 +345,25 @@ values and records the breakdown in the report (see `compression`).
 | odd-byte bool/u8 passthrough tensors | pass |
 | nested BF16 pickle state dict and unindexed shard tensor | pass |
 | ComfyUI loader contract (names/dtypes/shapes/metadata) on output | pass |
+| Boogu real-width fixture (K=3360 passthrough + K=13568 W4A8, full inventory) | pass; mixed output reloads as QuantizedTensors, metadata lists only compatible layers |
+| real-dims gate regression (pixart 1152, hydit 1408, cogvideox 1920, minimax fc2 1152, omnigen2 2520) | pass; low-compression warnings fire with the expected K values |
+| policy-miss warning (unrecognized 2D linears) | pass |
+| metadata fuzz (cgs 64, swapped groups, empty layers, stale format, bad s_rel, missing codebook) | pass (rejected) |
+| `--fail-on-low-compression` / `--min-quantized-byte-fraction` | pass (dry-run aborts below threshold) |
+| resume plan hash includes converter version + format/algorithm revision | pass (version drift refused) |
+| CUDA fused W4A8 linear regression (`testdata/cuda_smoke.py`) | pass on RTX 3050: K=256/768/13568, invalid convrot rejected, mixed Boogu fixture through the fused kernels |
+| passthrough byte-integrity (`--validate`) | pass: non-quantized tensors byte-identical under `--output-dtype auto` |
 
 ### Not executed or unsupported
 
-* No end-to-end inference was run inside ComfyUI. Standalone validation does not
-  claim runtime compatibility; ComfyUI >= v0.31.0 loads W4A8 natively (PR #15308
-  merged 2026-08-07).
+* Full end-to-end ComfyUI image inference is not run in this repository's CI.
+  `testdata/comfyui_smoke.py` loads a converted checkpoint through real ComfyUI
+  (load_torch_file -> convert_old_quants -> model_config_from_unet -> get_model
+  -> load_model_weights), asserts AsymW4A8Int8Layout layers with
+  convrot_groupsize=256, and performs one diffusion-model forward. Run it on a
+  CUDA machine with ComfyUI >= v0.31.0 and the real checkpoint:
+  `PYTHONPATH=<comfyui> python testdata/comfyui_smoke.py --model out.safetensors`.
+  ComfyUI >= v0.31.0 loads W4A8 natively (PR #15308 merged 2026-08-07).
 * Perception models (RT-DETR_v4, DepthAnything3, SAM3/SAM31) refuse conversion
   unless `--architecture` forces them.
 * Diffusers-format subfolders (`unet/diffusion_pytorch_model.safetensors`) are
