@@ -9,8 +9,8 @@ the bound exists for fp32 accumulation noise only).
 
 Formats and dimensions exercised (the awkward real-model K values):
 
-    W4A4 (A4 mode):  K 320, 640, 1152, 1408, 1920
-    W4A8:            K 768, 1024, 3072, 4096
+    W4A4 (A4 mode):  K 320, 640, 1152, 1408, 1920, 3072, 4096
+    W4A8:            K 256, 768, 1024, 3072, 4096
     INT8:            K 2520, 3360, 4096
 
 The W4A4 A8 (linear_dtype=int8) execution mode is CUDA-only in comfy-kitchen
@@ -65,8 +65,9 @@ def main() -> int:
     def disagreement(y1: torch.Tensor, y2: torch.Tensor) -> float:
         return float((y1 - y2).norm() / y2.norm().clamp(min=1e-8))
 
-    w4a4_cases = [(320, 64), (640, 64), (1152, 16), (1408, 64), (1920, 64)]
-    w4a8_cases = [768, 1024, 3072, 4096]
+    w4a4_cases = [(320, 64), (640, 64), (1152, 16), (1408, 64), (1920, 64),
+                  (3072, 256), (4096, 256)]
+    w4a8_cases = [256, 768, 1024, 3072, 4096]
     int8_cases = [2520, 3360, 4096]
     worst = {"w4a4": 0.0, "w4a8": 0.0, "int8": 0.0}
 

@@ -151,25 +151,63 @@ def main() -> int:
     # mixed checkpoints this converter emits would silently lose their
     # loading path upstream.
     REQUIRED_ALGOS = ("convrot_w4a4", "asym_w4a8_int8", "int8_tensorwise")
+    REQUIRED_SCALE_NAMES = ("weight_scale", "weight_s_rel", "weight_s_channel",
+                            "weight_codebook")
     REQUIRED_LAYOUTS = ("AsymW4A8Int8Layout", "TensorCoreConvRotW4A4Layout",
                         "TensorWiseINT8Layout")
-    if args.check_runtime_contract and args.tarball:
-        import io as _io
-        import tarfile as _tf
-        with _tf.open(fileobj=_io.BytesIO(requests_get(args.tarball)),
-                      mode="r:gz") as tf:
-            qo = next((memb for memb in tf.getmembers()
-                       if memb.name.endswith("/comfy/quant_ops.py")), None)
-            if qo is not None:
-                source = tf.extractfile(qo).read().decode("utf-8")
-                missing_algos = [a for a in REQUIRED_ALGOS if a not in source]
-                result["comfyui_quant_algos"] = {
-                    a: a in source for a in REQUIRED_ALGOS}
-                if missing_algos:
-                    ok = False
-                    result["missing_quant_algos"] = missing_algos
-                    print(f"UPSTREAM RUNTIME REGRESSION: ComfyUI quant_ops.py "
-                          f"no longer registers: {missing_algos}")
+    if args.check_runtime_contract and (args.tarball or args.comfy_src):
+        quant_ops_source = None
+        if args.comfy_src:
+            qo_path = os.path.join(args.comfy_src, "comfy", "quant_ops.py")
+            if os.path.isfile(qo_path):
+                with open(qo_path, encoding="utf-8") as f:
+                    quant_ops_source = f.read()
+        elif args.tarball:
+            import io as _io
+            import tarfile as _tf
+            with _tf.open(fileobj=_io.BytesIO(requests_get(args.tarball)),
+                          mode="r:gz") as tf:
+                qo = next((memb for memb in tf.getmembers()
+                           if memb.name.endswith("/comfy/quant_ops.py")), None)
+                if qo is not None:
+                    quant_ops_source = tf.extractfile(qo).read().decode("utf-8")
+        if quant_ops_source is not None:
+            source = quant_ops_source
+            missing_algos = [a for a in REQUIRED_ALGOS if a not in source]
+            result["comfyui_quant_algos"] = {
+                a: a in source for a in REQUIRED_ALGOS}
+            if missing_algos:
+                ok = False
+                result["missing_quant_algos"] = missing_algos
+                print(f"UPSTREAM RUNTIME REGRESSION: ComfyUI quant_ops.py "
+                      f"no longer registers: {missing_algos}")
+        # scale/parameter names live in comfy/ops.py (the loader), so scan
+        # both files
+        loader_source = None
+        if args.comfy_src:
+            ops_path = os.path.join(args.comfy_src, "comfy", "ops.py")
+            if os.path.isfile(ops_path):
+                with open(ops_path, encoding="utf-8") as f:
+                    loader_source = f.read()
+        elif args.tarball:
+            import io as _io
+            import tarfile as _tf
+            with _tf.open(fileobj=_io.BytesIO(requests_get(args.tarball)),
+                          mode="r:gz") as tf:
+                ops = next((memb for memb in tf.getmembers()
+                            if memb.name.endswith("/comfy/ops.py")), None)
+                if ops is not None:
+                    loader_source = tf.extractfile(ops).read().decode("utf-8")
+        if args.check_runtime_contract and loader_source is not None:
+            missing_scales = [s for s in REQUIRED_SCALE_NAMES
+                              if s not in loader_source]
+            result["comfyui_scale_names"] = {
+                s: s in loader_source for s in REQUIRED_SCALE_NAMES}
+            if missing_scales:
+                ok = False
+                result["missing_scale_names"] = missing_scales
+                print("UPSTREAM RUNTIME REGRESSION: ComfyUI ops.py no longer "
+                      f"references scale names: {missing_scales}")
     if args.check_runtime_contract and args.tarball_kitchen:
         import io as _io
         import tarfile as _tf

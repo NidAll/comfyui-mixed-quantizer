@@ -33,3 +33,8 @@ jobs:
             --check-runtime-contract \
             --pinned latest-main \
             --json testdata/architecture_sync_latest.json
+
+      - name: Install latest comfy-kitchen and run CPU runtime equivalence
+        run: |
+          pip install --upgrade comfy-kitchen
+          python testdata/runtime_equivalence.py --seeds 3
