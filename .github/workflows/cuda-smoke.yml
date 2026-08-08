@@ -4,11 +4,22 @@ name: cuda-smoke
 # with an NVIDIA GPU. GitHub-hosted runners have no GPUs, so this job targets
 # a self-hosted runner labeled `gpu` (see the repo README for setup).
 #
-# Trigger: manual (workflow_dispatch). Add `push: branches: [main]` if a GPU
-# runner is permanently available.
+# Triggers: manual (workflow_dispatch), release tags, and every push to the
+# default branch. A self-hosted GPU runner must be permanently available for
+# the release and push triggers to be meaningful.
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "comfyui_wxa8_quantizer.py"
+      - "testdata/cuda_smoke.py"
+      - "testdata/comfyui_smoke.py"
+      - "testdata/make_fixtures.py"
+  release:
+    types: [published]
 
 jobs:
   cuda:
@@ -27,5 +38,9 @@ jobs:
           pip install torch --index-url https://download.pytorch.org/whl/cu130
           pip install safetensors numpy comfy-kitchen
 
-      - name: CUDA W4A8 regression (fused linear + invalid-convrot rejection)
+      - name: Generate fixtures
+        run: |
+          python testdata/make_fixtures.py testdata/boogu_real_fixture.safetensors
+
+      - name: CUDA regression (W4A8 fused, INT8 K=3360, W4A4 K=1152, mixed checkpoint)
         run: python testdata/cuda_smoke.py

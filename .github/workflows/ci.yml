@@ -39,6 +39,14 @@ jobs:
       - name: "Smoke test: architecture registry"
         run: python comfyui_wxa8_quantizer.py --list-architectures
 
+      - name: Architecture coverage sync (pinned ComfyUI revision)
+        shell: bash
+        run: |
+          python testdata/comfyui_architecture_sync.py \
+            --tarball https://codeload.github.com/Comfy-Org/ComfyUI/tar.gz/bdcb886a4705a03cf40f4a7226de9fc7c059fc90 \
+            --pinned bdcb886a4705a03cf40f4a7226de9fc7c059fc90 \
+            --json testdata/architecture_sync.json
+
       - name: Fixture conversion with full validation
         shell: bash
         run: |

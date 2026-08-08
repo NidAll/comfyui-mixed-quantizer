@@ -1,0 +1,33 @@
+name: nightly-upstream-sync
+
+# Nightly: check the embedded architecture registry against the CURRENT
+# ComfyUI main. When ComfyUI adds a model class the registry does not cover,
+# this job fails and the failure names the unaccounted classes, so coverage
+# drift is caught within a day instead of through a user issue report.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  sync:
+    name: architecture-sync (latest ComfyUI main)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install CPU torch (registry import needs torch)
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Compare registry against ComfyUI main
+        run: |
+          python testdata/comfyui_architecture_sync.py \
+            --tarball https://codeload.github.com/Comfy-Org/ComfyUI/tar.gz/refs/heads/master \
+            --pinned latest-main \
+            --json testdata/architecture_sync_latest.json
