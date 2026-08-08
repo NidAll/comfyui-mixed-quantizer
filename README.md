@@ -128,11 +128,16 @@ in the report and in the console warnings.
 
 The gates are hard. A plan that cannot meet its gates is not published:
 QualityGateError and CompressionGateError abort the conversion with the
-measured numbers and the override that would let it through. A plan that
-quantizes nothing is rejected as a passthrough-only checkpoint. The
-compression gates enforce the profile's effective bytes/parameter target and
-its original-precision share of the targeted linear payload, both reported in
-the console summary and the report.
+measured numbers, the largest contributors, and the override that would let
+it through (for example a quality failure reports the remaining quantized
+formats and the top error layers; a compression failure reports the kept
+share and the largest kept layers). A plan that quantizes nothing is rejected
+as a passthrough-only checkpoint.
+
+The global quality metric covers the ENTIRE targeted set: layers kept at
+original precision contribute error 0 while their parameters stay in the
+denominator. The report shows both the targeted weighted error (the optimizer
+metric) and the quantized-subset weighted error (diagnostic).
 
 Eligibility rules per format:
 
@@ -177,11 +182,25 @@ weight-only reconstruction error and the planner prints a warning;
 The calibration metric is the real quantized operation, not a
 reconstructed-weight approximation. For every candidate the planner emulates
 the eager runtime path exactly: activation rotation (ConvRot formats),
-dynamic rowwise activation quantization (int8, or int4 for the W4A4 int4
-variant), and the scaled quantized GEMM. The error is the mean over samples
-of ||Y_quant - Y_bf16|| / ||Y_bf16||. The emulation is cross-checked against
-comfy-kitchen's eager kernels in the self-tests (int8 error 0.011, W4A4-int4
-0.204, W4A4-int8 0.143 on the golden activation set).
+dynamic rowwise activation quantization, and the scaled quantized GEMM,
+always in the ConvRot basis (the W4A8 simulation decodes the rotated int8
+runtime weight; it never multiplies rotated activations by the
+inverse-rotated physical weight). The error is the mean over samples of
+||Y_quant - Y_bf16|| / ||Y_bf16||.
+
+The W4A4 simulation is target-runtime accurate. The eager backend always
+executes the int4 activation path regardless of `linear_dtype`, so a CPU
+target is evaluated with A4; CUDA/HIP targets honor the requested variant.
+The candidate record stores the requested `linear_dtype`, the effective
+activation bits, and the backend, so the same checkpoint can legitimately
+receive different plans per target runtime.
+
+Every simulator is permanently cross-checked against the real comfy-kitchen
+implementation in `testdata/runtime_equivalence.py` (exact output agreement
+0 to 5e-8 for W4A4-A4, W4A8, and INT8 across the awkward K matrix; the W4A4
+A8 mode is CUDA-only and its quality-vs-BF16 agreement with the CUDA kernels
+is checked in `testdata/cuda_smoke.py`). CI runs the equivalence suite on
+every push.
 
 Compression is enforced, not advisory. `--max-linear-bytes-per-param F`
 replaces the profile's effective bytes/parameter target and
@@ -257,12 +276,28 @@ name is introduced.
 The `comfy_wxa8` extension block is schema-versioned. Single-format W4A8
 outputs use `comfy_wxa8/v1` with the W4A8-global fields (fp8 scales, codebook
 packing, format revision). Mixed outputs use `comfy_wxa8/v2`: a `mode:
-"mixed"` marker, per-format contract details (weight bits, scale dtype,
-packing, ConvRot), the distribution (layer counts, params, bytes per format,
-kept payload, effective bytes/parameter, original-precision share, weighted
-global error, promotions), the profile and gates, and the runtime target with
-per-format support status. The v2 revision is `mixed-r1`, never the W4A8
+"mixed"` marker with `activation_precision: "per-format"` (each format
+describes its own activation bits; W4A4 declares
+`runtime_activation_bits: "backend-dependent"` plus its requested
+`linear_dtype`), per-format contract details, the distribution (layer counts,
+params, bytes per format, kept payload, effective bytes/parameter,
+original-precision share, both weighted error metrics, promotions), the
+profile and gates, the runtime target with per-format
+loadable/executable/accelerated status, and a `quality_validation` block
+with a certification level. The v2 revision is `mixed-r1`, never the W4A8
 revision.
+
+Certification levels are explicit and never overstated:
+
+| Level | Meaning |
+| ----- | ------- |
+| unverified | weight-only layer gates (no calibration) |
+| calibrated | runtime-output layer calibration from activation data |
+| model-verified | testdata/model_quality.py passed on the target machine |
+| e2e-verified | full generation comparison passed (future workflow) |
+
+The converter stamps `unverified` or `calibrated`; the model-level harness
+stamps `model-verified` after a passing run.
 
 ## Runtime compatibility
 
@@ -288,13 +323,18 @@ closed unless `--architecture` is given.
 
 ## Validation
 
-* `--self-test`: 35 embedded checks, including golden vectors for W4A4 and
-  INT8 (byte-identical to comfy-kitchen's eager implementations), the
-  eligibility matrix, mixed planning on real Boogu dims, hard-failure tests
-  for every gate, BF16 promotion, the runtime capability matrix, the
-  runtime-output metric cross-checked against comfy-kitchen's eager kernels,
-  an end-to-end mixed conversion with layout reload, and an architecture
-  coverage sync against the pinned ComfyUI revision.
+* `--self-test`: 37 embedded checks, including golden vectors for W4A4 and
+  INT8 (embedded reference weight so every platform quantizes the same
+  input; packed nibbles compared with a 99.5% agreement bound for the
+  BLAS-dependent Hadamard rotation, fp32 scales with rtol 1e-4, matching the
+  project's cross-platform convention), the eligibility matrix, mixed
+  planning on real Boogu dims, hard-failure tests for every gate, BF16
+  promotion, the runtime capability matrix (including the eager-A4 vs
+  CUDA-A8 W4A4 modes), the runtime-output metric cross-checked against
+  comfy-kitchen's eager kernels, planner determinism, corrupted heterogeneous
+  metadata rejection for all three formats, an end-to-end mixed conversion
+  with layout reload, and an architecture coverage sync against the pinned
+  ComfyUI revision.
 * `--validate`: reopens the output, checks the inventory, shapes, dtypes,
   per-format metadata and runtime contract (each format has its own shape and
   K rules), scales, packing round trips, reconstruction error against the
@@ -310,12 +350,23 @@ closed unless `--architecture` is given.
   checkpoints. It reads the per-layer metadata and asserts each quantized
   module's layout matches its format (TensorCoreConvRotW4A4Layout /
   AsymW4A8Int8Layout / TensorWiseINT8Layout), then runs one diffusion-model
-  forward. A full three-layout forward still needs the real checkpoint on a
-  ComfyUI >= v0.31.0 machine.
+  forward. `--require-format` forces a checkpoint to actually contain
+  specific formats before the forward runs, so a "mixed" test cannot pass on
+  a W4A8+INT8-only file. A full three-layout forward still needs the real
+  checkpoint on a ComfyUI >= v0.31.0 machine.
+* `testdata/model_quality.py`: the model-level BF16-relative gate. Loads the
+  original and the quantized checkpoint through real ComfyUI, runs the
+  denoiser on identical synthetic inputs at several timesteps, and reports
+  relative L2, cosine, SNR, and max error per timestep against a threshold.
+  This is what earns the "model-verified" label; run it on the target
+  machine with real checkpoints.
 * `testdata/comfyui_architecture_sync.py`: compares the embedded registry
   (43 families) with ComfyUI's `supported_models.py` class set. CI runs it
-  against the pinned research revision; a nightly workflow runs it against
-  ComfyUI main and fails naming any newly added, unaccounted class.
+  against the pinned research revision; the nightly workflow runs it against
+  ComfyUI main AND comfy-kitchen main with `--check-runtime-contract`,
+  failing when a new class is unaccounted for or when an upstream change
+  removes one of the three QUANT_ALGOS formats or one of the three layout
+  classes the converter emits.
 
 ## Known limitations
 

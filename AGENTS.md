@@ -77,11 +77,41 @@ formats).
 `--target-runtime` feeds `RuntimeCapabilities` (`runtime_capabilities_for`)
 into eligibility: nvidia = all three formats accelerated (verified on the RTX
 3050), amd = HIP/triton paths (not certified here), cpu = eager fallback for
-all three. Unsupported formats get `eligible=False` with the reason recorded.
-Before conversion `_check_runtime_compatibility` fails closed: every selected
-format must exist in the installed ComfyUI quant_ops registry (when comfy is
-installed) and every required layout must exist in comfy-kitchen (when
-installed); neither installed -> warning only.
+all three. Capabilities are per-format `FormatRuntimeCapability`
+(loadable/executable/accelerated/backend/reason), never a single boolean.
+The W4A4 simulation is target-accurate via
+`resolve_w4a4_activation_bits`: eager always executes A4 regardless of
+`linear_dtype`, CUDA/HIP honor the request; CandidateResult records
+requested_linear_dtype + effective_activation_bits + backend. Unsupported
+formats get `eligible=False` with the reason recorded. Before conversion
+`_check_runtime_compatibility` fails closed: every selected format must exist
+in the installed ComfyUI quant_ops registry (when comfy is installed) and
+every required layout must exist in comfy-kitchen (when installed); neither
+installed -> warning only.
+
+Simulators are validated against the real runtime, not by hand:
+`testdata/runtime_equivalence.py` requires exact output agreement (bound
+1e-4; measured 0 to 5e-8) between our W4A4-A4 / W4A8 / INT8 simulations and
+comfy-kitchen's eager kernels across the awkward K matrix, on every CI push.
+The W4A8 simulation operates in the ConvRot basis
+(`decode_w4a8_runtime_weight` -> rotated int8 runtime weight); NEVER multiply
+rotated activations by the inverse-rotated physical weight. The W4A4 A8 mode
+is CUDA-only; cuda_smoke compares its error-vs-BF16 with the CUDA kernel
+(measured gap 0.7%, bound 10%). CUDA kernels are numerically different
+implementations of the same quantization (fused int4 packing differs from
+eager in the last digits); exact equivalence is defined against eager.
+
+Global metric semantics: `targeted_weighted_error` covers the ENTIRE targeted
+set (original-precision layers contribute error 0 but keep their parameters
+in the denominator); `quantized_weighted_error` is the diagnostic subset
+metric. The gate uses the targeted metric. ORIGINAL precision is a unified
+candidate (`CandidateResult` with zero error and source bytes), so select and
+promote need no special case beyond kind switching.
+
+Certification levels: converter stamps `quality_validation.level` =
+"unverified" (no calibration) or "calibrated" (runtime-output calibration) in
+the v2 metadata; `testdata/model_quality.py` stamps "model-verified" on the
+target machine. Never claim model-verified without running it.
 
 Profiles (`MIXED_PROFILE_DEFAULTS`):
 
@@ -142,11 +172,15 @@ mixed balanced = 16 W4A8 + 4 INT8; wan mixed size-first = 10 W4A8 + 9 W4A4 +
 
 ## Verification before claiming success
 
-1. `--self-test` must pass 35/35 (includes W4A4/INT8 golden byte digests,
-   eligibility matrix, mixed planning on real Boogu dims, mixed e2e with
-   comfy-kitchen layout reload, hard gate failures, BF16 promotion, runtime
-   capability matrix, runtime-output metric vs eager kernels, architecture
-   sync).
+1. `--self-test` must pass 37/37 (includes W4A4/INT8 golden vectors with an
+   EMBEDDED reference weight: packed nibble agreement >= 0.995 + fp32 scales
+   rtol 1e-4, because the Hadamard-rotation matmul and torch.randn differ in
+   the last ULPs across platforms; never use byte-exact sha assertions on
+   randn-generated inputs in new tests), eligibility matrix, mixed planning
+   on real Boogu dims, mixed e2e with comfy-kitchen layout reload, hard gate
+   failures, BF16 promotion, runtime capability matrix incl. eager-A4 vs
+   CUDA-A8, runtime-output metric vs eager kernels, planner determinism,
+   corrupted heterogeneous metadata rejection, architecture sync.
 2. All fixture families must pass `--validate` in BOTH `--format w4a8`
    (regression; max relL2 about 0.073) and `--format mixed --profile balanced`
    (0 failed).
@@ -164,7 +198,11 @@ mixed balanced = 16 W4A8 + 4 INT8; wan mixed size-first = 10 W4A8 + 9 W4A4 +
 6. `testdata/comfyui_architecture_sync.py` must pass against the pinned
    ComfyUI revision (CI tarball mode) and against the local
    `research/ComfyUI` checkout when present. The nightly workflow checks
-   ComfyUI main and fails naming any new unaccounted class.
+   ComfyUI main + comfy-kitchen main with --check-runtime-contract (three
+   QUANT_ALGOS names + three layout classes) and fails naming any regression.
+7. `testdata/runtime_equivalence.py` must pass (CI runs it with comfy-kitchen
+   installed): our W4A4-A4 / W4A8 / INT8 simulators must agree with the real
+   eager kernels to 1e-4 relative on the awkward K matrix.
 
 ## Known behavior, do not "fix" it
 
