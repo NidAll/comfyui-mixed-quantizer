@@ -39,6 +39,12 @@ jobs:
       - name: "Smoke test: architecture registry"
         run: python comfyui_wxa8_quantizer.py --list-architectures
 
+      - name: Install comfy-kitchen (simulator equivalence needs it)
+        run: pip install comfy-kitchen
+
+      - name: Runtime equivalence (our simulators vs comfy-kitchen eager)
+        run: python testdata/runtime_equivalence.py --seeds 2
+
       - name: Architecture coverage sync (pinned ComfyUI revision)
         shell: bash
         run: |

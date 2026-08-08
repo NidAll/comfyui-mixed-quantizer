@@ -235,8 +235,8 @@ def main() -> int:
                         orig_shape=(packed.shape[0], packed.shape[1] * 2))
                     qt = QuantizedTensor(packed, "AsymW4A8Int8Layout", params)
                     x = torch.randn(4, packed.shape[1] * 2, dtype=torch.bfloat16, device=dev)
-                    y = F.linear(x, qt)
-                    y_ref = F.linear(x, qt.dequantize())
+                    y = torch.nn.functional.linear(x, qt)
+                    y_ref = torch.nn.functional.linear(x, qt.dequantize())
                     n_w4a8 += 1
                 denom = max(float(y.abs().max()), 1e-6)
                 errs.append((y - y_ref).abs().max().item() / denom)
@@ -249,6 +249,45 @@ def main() -> int:
             check("mixed-checkpoint-cuda-forward", False, f"{type(e).__name__}: {e}")
     else:
         print("SKIP mixed-checkpoint-cuda-forward (mixed fixture not generated)")
+
+    # ---- check 2.9: W4A4 A8-mode simulator quality vs the CUDA kernels ----
+    # linear_dtype=int8 is CUDA-only (eager always runs A4). The CUDA kernels
+    # are numerically different implementations of the same quantization
+    # (their packed codes and scales differ from eager in the last digits),
+    # so the exact-output equivalence is checked against eager in
+    # testdata/runtime_equivalence.py. Here the quality-relevant quantity is
+    # compared: the error-vs-BF16 of our A8 simulation must track the CUDA
+    # A8 kernel's error-vs-BF16 within 10% (measured 2.8%).
+    try:
+        torch.manual_seed(77)
+        w = torch.randn(64, 1152, dtype=torch.bfloat16, device=dev) * 0.02
+        x = torch.randn(8, 1152, dtype=torch.bfloat16, device=dev) * 0.1
+        q, s = __import__("comfyui_wxa8_quantizer",
+                          fromlist=["quantize_w4a4_weight"]).quantize_w4a4_weight(
+            w.cpu().float(), 16)
+        mod = __import__("comfyui_wxa8_quantizer",
+                         fromlist=["build_hadamard", "rotate_activation"])
+        h = mod.build_hadamard(16, device="cpu", dtype=torch.float32)
+        xr = mod.rotate_activation(x.cpu().float(), h, 16)
+        aq, asc = mod._act_quant_int8(xr)
+        y_sim = mod._simulate_quantized_chunk(
+            w.cpu().float(), {"": q, "_scale": s}, "convrot_w4a4", 16, 16,
+            aq, asc, "int8")
+        y_ck = comfy_kitchen.convrot_w4a4_linear(
+            x, q.cuda(), s.cuda(), None, convrot_groupsize=16,
+            quant_group_size=64, linear_dtype="int8")
+        y_ref = torch.nn.functional.linear(x, w)
+        err_sim = float((y_sim - y_ref.cpu().float()).norm()
+                        / y_ref.cpu().float().norm())
+        err_ck = float((y_ck - y_ref).norm() / y_ref.norm())
+        rel_gap = abs(err_sim - err_ck) / max(err_ck, 1e-9)
+        ok = rel_gap < 0.10 and tuple(y_sim.shape) == tuple(y_ck.shape)
+        check("cuda-w4a4-A8-simulator-quality", ok,
+              f"sim err {err_sim:.4f} vs CUDA A8 err {err_ck:.4f} "
+              f"(gap {100*rel_gap:.1f}%)"
+              if ok else f"gap {100*rel_gap:.1f}%")
+    except Exception as e:  # pragma: no cover
+        check("cuda-w4a4-A8-simulator-quality", False, f"{type(e).__name__}: {e}")
 
     # ---- check 3 (optional): ComfyUI one-step forward ----
     if args.model:
