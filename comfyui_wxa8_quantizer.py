@@ -189,6 +189,7 @@ FORMAT_MIXED = "mixed"
 FORMAT_W4A4 = "convrot_w4a4"
 FORMAT_INT8 = "int8_tensorwise"
 MIXED_FORMATS = (FORMAT_W4A8, FORMAT_W4A4, FORMAT_INT8)
+FORMAT_ORIGINAL = "original"   # planner-only candidate: keep at source precision
 
 # W4A4 runtime contract: the int4 MMA kernels (comfy-kitchen, nunchaku lineage)
 # pin quant_group_size to 64 and the signed quantizer emission range to [-7, 7]
@@ -259,6 +260,18 @@ class UnsupportedArchitectureError(QuantizerError):
 
 class PolicyError(QuantizerError):
     """Architecture policy violation."""
+
+class QualityGateError(QuantizerError):
+    """Mixed planner: the global quality gate could not be met (hard failure)."""
+
+
+class CompressionGateError(QuantizerError):
+    """Mixed planner: the compression gate could not be met (hard failure)."""
+
+
+class RuntimeCompatibilityError(QuantizerError):
+    """Mixed mode: a selected format has no verified runtime path."""
+
 
 class CalibrationError(QuantizerError):
     """Calibration data problem."""
@@ -345,6 +358,9 @@ class EnvironmentInfo:
     platform: str
     cpu_count: int
     has_comfy_kitchen: bool = False
+    comfy_kitchen_has_w4a8_layout: bool = False
+    comfy_kitchen_has_w4a4_layout: bool = False
+    comfy_kitchen_has_int8_layout: bool = False
     comfy_kitchen_rev: Optional[str] = None
     comfy_kitchen_has_w4a8_layout: bool = False
     has_comfy_quant_ops: bool = False
@@ -384,18 +400,29 @@ def inspect_environment() -> EnvironmentInfo:
         dist = importlib.metadata.distribution("comfy-kitchen")
         info.has_comfy_kitchen = True
         info.comfy_kitchen_rev = dist.version
+        wanted = {
+            "AsymW4A8Int8Layout": "comfy_kitchen_has_w4a8_layout",
+            "TensorCoreConvRotW4A4Layout": "comfy_kitchen_has_w4a4_layout",
+            "TensorWiseINT8Layout": "comfy_kitchen_has_int8_layout",
+        }
+        seen = set()
         for rel in dist.files or ():
             rel_text = str(rel).replace("\\", "/")
             if not rel_text.endswith(".py") or "comfy_kitchen" not in rel_text:
                 continue
             path = Path(dist.locate_file(rel))
             try:
-                if path.stat().st_size <= 4 * 1024 * 1024 and \
-                        "AsymW4A8Int8Layout" in path.read_text(encoding="utf-8", errors="ignore"):
-                    info.comfy_kitchen_has_w4a8_layout = True
-                    break
+                if path.stat().st_size > 4 * 1024 * 1024:
+                    continue
+                text = path.read_text(encoding="utf-8", errors="ignore")
             except OSError:
                 continue
+            for marker, attr in wanted.items():
+                if marker in text:
+                    setattr(info, attr, True)
+                    seen.add(marker)
+            if len(seen) == len(wanted):
+                break
     except importlib.metadata.PackageNotFoundError:
         pass
     except Exception as e:
@@ -411,8 +438,9 @@ def inspect_environment() -> EnvironmentInfo:
             info.has_comfy_quant_ops = True
             # Only report formats proven present in the static source.  This is
             # not a runtime import or a claim that the whole installation works.
-            if FORMAT_W4A8 in source:
-                info.comfyui_quant_algos.append(FORMAT_W4A8)
+            for fmt in MIXED_FORMATS:
+                if fmt in source:
+                    info.comfyui_quant_algos.append(fmt)
             break
     except Exception as e:
         log().debug("ComfyUI static compatibility probe failed: %s", e)
@@ -3371,6 +3399,103 @@ def activation_aware_error(original: torch.Tensor, dequant: torch.Tensor,
     den = (o @ x.t()).norm(dim=0).clamp(min=1e-8)
     value = float((num / den).mean())
     return value if math.isfinite(value) else 1e30
+def _act_quant_int8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Dynamic rowwise int8 activation quantization (runtime behavior)."""
+    abs_max = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-30)
+    scale = abs_max / float(INT8_SCALE_MAX)
+    q = (x / scale).round().clamp_(-128.0, 127.0).to(torch.int8)
+    return q, scale
+
+
+def _act_quant_int4(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Dynamic rowwise signed int4 activation quantization (eager W4A4 path)."""
+    abs_max = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-10)
+    scale = abs_max / float(W4A4_EMISSION_MAX)
+    q = (x / scale).round().clamp_(-float(W4A4_EMISSION_MAX),
+                                   float(W4A4_EMISSION_MAX)).to(torch.int8)
+    return q, scale
+
+
+def _simulate_quantized_chunk(original_chunk: torch.Tensor,
+                              tensors: Dict[str, torch.Tensor], fmt: str,
+                              group_size: int, convrot_groupsize: int,
+                              act_q: torch.Tensor, act_scale: torch.Tensor,
+                              linear_dtype: str) -> torch.Tensor:
+    """Exact eager-path emulation of the quantized linear for one weight chunk.
+
+    Returns y_q [S, rows] for the chunk. The activation was already rotated
+    and quantized once (act_q, act_scale). The emulations mirror the
+    comfy-kitchen eager kernels:
+      int8_tensorwise: (x_int8 @ w_int8.T) * x_scale * w_scale
+      convrot_w4a4:    (x_int4/8 @ w_int4.T) * x_scale * w_scale
+      asym_w4a8_int8:  (x_int8 * x_scale) @ dequant(W).T
+    """
+    if fmt == FORMAT_INT8:
+        q, wscale = tensors[""], tensors["_scale"]
+        return ((act_q.float() @ q.float().T)
+                * act_scale * wscale.float().reshape(1, -1))
+    if fmt == FORMAT_W4A4:
+        w_int = unpack_int4_signed(tensors[""]).float()
+        wscale = tensors["_scale"].float().reshape(1, -1)
+        return ((act_q.float() @ w_int.T)
+                * act_scale * wscale)
+    if fmt == FORMAT_W4A8:
+        w_dq = dequantize_w4a8_weight(
+            tensors[""], tensors["_s_rel"], tensors["_s_channel"],
+            codebook=tensors.get("_codebook"),
+            group_size=group_size, convrot_groupsize=convrot_groupsize,
+            output_dtype=torch.float32)
+        return (act_q.float() * act_scale) @ w_dq.T
+    raise PolicyError(f"unknown format {fmt!r} for runtime simulation")
+
+
+def runtime_output_rel_l2(original: torch.Tensor,
+                          tensors: Dict[str, torch.Tensor], fmt: str,
+                          group_size: int, convrot_groupsize: int,
+                          activations: torch.Tensor,
+                          linear_dtype: str = W4A4_LINEAR_DTYPE) -> Optional[float]:
+    """mean over samples of ||Y_quant - Y_bf16|| / ||Y_bf16|| for the actual
+    runtime operation (activation rotation, activation quantization, quantized
+    GEMM with scales), not a reconstructed-weight approximation."""
+    x = activations.float()
+    y_ref = x @ original.float().T
+    if fmt in (FORMAT_W4A4, FORMAT_W4A8):
+        h = build_hadamard(convrot_groupsize, device=x.device, dtype=torch.float32)
+        x_rot = rotate_activation(x, h, convrot_groupsize)
+    else:
+        x_rot = x
+    if fmt == FORMAT_W4A4 and linear_dtype != "int8":
+        act_q, act_scale = _act_quant_int4(x_rot)
+    else:
+        act_q, act_scale = _act_quant_int8(x_rot)
+    y_q = _simulate_quantized_chunk(original, tensors, fmt, group_size,
+                                    convrot_groupsize, act_q, act_scale,
+                                    linear_dtype)
+    num = (y_q - y_ref).norm(dim=1)
+    den = y_ref.norm(dim=1).clamp(min=1e-8)
+    value = float((num / den).mean())
+    return value if math.isfinite(value) else 1e30
+
+
+class _OutputErrorAccumulator:
+    """Chunked accumulation of the per-sample runtime output error."""
+
+    def __init__(self, n_samples: int):
+        self.num_sq = torch.zeros(n_samples, dtype=torch.float64)
+        self.den_sq = torch.zeros(n_samples, dtype=torch.float64)
+
+    def update(self, y_q: torch.Tensor, y_ref: torch.Tensor) -> None:
+        d = (y_q.double() - y_ref.double())
+        self.num_sq += d.square().sum(dim=1)
+        self.den_sq += y_ref.double().square().sum(dim=1)
+
+    def finish(self) -> float:
+        ratio = (self.num_sq.sqrt() / self.den_sq.clamp(min=1e-16).sqrt())
+        value = float(ratio.mean())
+        return value if math.isfinite(value) else 1e30
+
+
+
 
 
 class SensitivityAnalyzer:
@@ -3951,10 +4076,51 @@ MIXED_PROFILE_DEFAULTS = {
     # keeps W4A8 as the workhorse (global gate just above 0.073), conservative
     # forces promotion toward INT8 (gate below it), and size-first admits the
     # ~0.14 W4A4 error for layers that can take it (per-layer gate 0.15).
-    "balanced": MixedProfile("balanced", 0.10, 0.080, 0.80, 0.05),
-    "conservative": MixedProfile("conservative", 0.05, 0.040, 0.90, 0.02),
-    "size-first": MixedProfile("size-first", 0.15, 0.100, 0.70, 0.10),
+    "balanced": MixedProfile("balanced", 0.10, 0.080, 0.90, 0.05),
+    "conservative": MixedProfile("conservative", 0.05, 0.040, 1.05, 0.02),
+    "size-first": MixedProfile("size-first", 0.15, 0.100, 0.75, 0.10),
 }
+
+
+@dataclass(frozen=True)
+class RuntimeCapabilities:
+    """What the target runtime can actually execute, per format.
+
+    supports: the format can load and run (possibly through eager fallback).
+    accelerated: an optimized kernel path exists for the target backend.
+    Backend detection: nvidia = CUDA, amd = ROCm (HIP + triton), cpu = eager.
+    """
+    backend: str
+    supports: Dict[str, bool]
+    accelerated: Dict[str, bool]
+
+    def describe(self, fmt: str) -> str:
+        if not self.supports.get(fmt, False):
+            return "unsupported"
+        return "accelerated" if self.accelerated.get(fmt, False) else "eager fallback"
+
+
+def runtime_capabilities_for(backend: str) -> RuntimeCapabilities:
+    """Verified capability matrix.
+
+    nvidia: fused CUDA kernels for W4A8 (ConvRot 256), INT8 tensor-core
+    (non-ConvRot rowwise verified at any K), and W4A4 MMA (cgs 16/64/256).
+    amd: HIP/triton kernels exist for all three (w4a4 linear present in the
+    HIP backend; not independently certified on RDNA here).
+    cpu: eager implementations of all three (W4A4 linear_dtype is accepted
+    but the eager path always executes int4 activations).
+    """
+    if backend == "nvidia":
+        return RuntimeCapabilities(
+            backend, {f: True for f in MIXED_FORMATS},
+            {f: True for f in MIXED_FORMATS})
+    if backend == "amd":
+        return RuntimeCapabilities(
+            backend, {f: True for f in MIXED_FORMATS},
+            {FORMAT_W4A8: True, FORMAT_INT8: True, FORMAT_W4A4: True})
+    return RuntimeCapabilities(
+        backend, {f: True for f in MIXED_FORMATS},
+        {f: False for f in MIXED_FORMATS})
 
 
 @dataclass
@@ -3969,7 +4135,11 @@ class CandidateResult:
 
 class MixedPlanner:
     """Evaluate per-format candidates, select cheapest acceptable per layer,
-    then promote greedily until the global mean error gate passes."""
+    then promote greedily (best error reduction per extra byte, with original
+    precision as the final rescue) until the weighted global error gate
+    passes. Quality and compression gates are HARD: a plan that cannot meet
+    them raises QualityGateError / CompressionGateError instead of silently
+    publishing a checkpoint that misses its targets."""
 
     def __init__(self, profile_name: str,
                  calibration: Optional[CalibrationStats],
@@ -3977,7 +4147,11 @@ class MixedPlanner:
                  compute_dtype: Optional[torch.dtype],
                  disabled_formats: Sequence[str] = (),
                  layer_gate: Optional[float] = None,
-                 global_gate: Optional[float] = None):
+                 global_gate: Optional[float] = None,
+                 runtime: Optional[RuntimeCapabilities] = None,
+                 compression_target_bpp: Optional[float] = None,
+                 max_bf16_fraction: Optional[float] = None,
+                 linear_dtype: str = W4A4_LINEAR_DTYPE):
         if profile_name not in MIXED_PROFILE_DEFAULTS:
             raise PolicyError(f"unknown mixed profile {profile_name!r}")
         self.profile = MIXED_PROFILE_DEFAULTS[profile_name]
@@ -3986,13 +4160,23 @@ class MixedPlanner:
         self.device = device
         self.compute_dtype = compute_dtype
         self.disabled = set(disabled_formats)
+        self.runtime = runtime if runtime is not None \
+            else runtime_capabilities_for("cpu")
+        self.linear_dtype = linear_dtype
         self.layer_gate = (layer_gate if layer_gate is not None
                            else self.profile.layer_gate)
         self.global_gate = (global_gate if global_gate is not None
                             else self.profile.global_gate)
+        self.compression_target_bpp = (
+            compression_target_bpp if compression_target_bpp is not None
+            else self.profile.compression_target_bpp)
+        self.max_bf16_fraction = (
+            max_bf16_fraction if max_bf16_fraction is not None
+            else self.profile.max_bf16_fraction)
         self.candidates: Dict[str, Dict[str, CandidateResult]] = {}
         self.promotions: List[str] = []
         self.summary: Dict[str, Any] = {}
+        self._targeted: List[TensorDecision] = []
 
     # -- eligibility -------------------------------------------------------
     def eligible_formats(self, meta: TensorMeta) -> List[str]:
@@ -4010,6 +4194,11 @@ class MixedPlanner:
                 pass
         out.append(FORMAT_INT8)
         return [f for f in out if f not in self.disabled]
+
+    def runtime_reason(self, fmt: str) -> str:
+        if not self.runtime.supports.get(fmt, False):
+            return f"not supported on target runtime {self.runtime.backend}"
+        return f"{self.runtime.describe(fmt)} on {self.runtime.backend}"
 
     def cgs_for(self, k: int, fmt: str) -> int:
         if fmt == FORMAT_W4A4:
@@ -4045,16 +4234,33 @@ class MixedPlanner:
                                                  torch.float32)
                 metrics = compute_weight_metrics(w.float().cpu(), dq.cpu())
                 if activations is not None:
-                    metrics.act_rel_l2 = activation_aware_error(
-                        w.cpu(), dq.cpu(), activations)
+                    metrics.act_rel_l2 = runtime_output_rel_l2(
+                        w.cpu(), {k: v.cpu() for k, v in q.items()}, fmt,
+                        d.group_size, cgs, activations,
+                        linear_dtype=self.linear_dtype)
             finally:
                 del w
             return metrics
-        # bounded-memory chunked path (rowwise formats chunk exactly; w4a8 uses
-        # the pre-fit codebook row chunks, identical to the reference path)
+        # bounded-memory chunked path: rowwise formats chunk exactly; w4a8
+        # uses the pre-fit codebook row chunks, identical to the reference
+        # path. Runtime output error accumulates per sample across chunks.
         n, k = int(meta.shape[0]), int(meta.shape[1])
         chunk_rows = _chunk_rows_for_budget(k, n, self.max_mem)
         acc = _MetricAccumulator(d.name)
+        out_acc = None
+        act_q = act_scale = None
+        if activations is not None:
+            x = activations.float()
+            if fmt in (FORMAT_W4A4, FORMAT_W4A8):
+                h = build_hadamard(cgs, device=x.device, dtype=torch.float32)
+                x_rot = rotate_activation(x, h, cgs)
+            else:
+                x_rot = x
+            if fmt == FORMAT_W4A4 and self.linear_dtype != "int8":
+                act_q, act_scale = _act_quant_int4(x_rot)
+            else:
+                act_q, act_scale = _act_quant_int8(x_rot)
+            out_acc = _OutputErrorAccumulator(int(activations.shape[0]))
         if fmt == FORMAT_W4A8:
             sample_size = _codebook_sample_size(self.max_mem, n * k)
             codebook = _gather_codebook_samples(
@@ -4067,7 +4273,14 @@ class MixedPlanner:
                                         self.compute_dtype)
                 dq = dequantize_weight_by_format(q, FORMAT_W4A8, d.group_size,
                                                  cgs, torch.float32)
-                acc.update(reader.read_tensor(d.name)[r0:r1], dq, activations)
+                orig_chunk = reader.read_tensor(d.name)[r0:r1]
+                acc.update(orig_chunk, dq, activations)
+                if out_acc is not None:
+                    y_q = _simulate_quantized_chunk(
+                        orig_chunk, q, fmt, d.group_size, cgs, act_q,
+                        act_scale, self.linear_dtype)
+                    y_ref = activations.float() @ orig_chunk.float().T
+                    out_acc.update(y_q.cpu(), y_ref.cpu())
                 del q, dq
         else:
             for r0 in range(0, n, chunk_rows):
@@ -4081,16 +4294,25 @@ class MixedPlanner:
                 dq = dequantize_weight_by_format(q, fmt, d.group_size, cgs,
                                                  torch.float32)
                 acc.update(chunk.cpu().float(), dq.cpu(), activations)
+                if out_acc is not None:
+                    y_q = _simulate_quantized_chunk(
+                        chunk.cpu(), {k: v.cpu() for k, v in q.items()}, fmt,
+                        d.group_size, cgs, act_q, act_scale, self.linear_dtype)
+                    y_ref = activations.float() @ chunk.cpu().float().T
+                    out_acc.update(y_q, y_ref)
                 del chunk, q, dq
-        return acc.finish()
+        metrics = acc.finish()
+        if out_acc is not None:
+            metrics.act_rel_l2 = out_acc.finish()
+        return metrics
 
     # -- planning ----------------------------------------------------------
     def plan(self, info: CheckpointInfo,
              decisions: List[TensorDecision]) -> Dict[str, Any]:
+        self._targeted = [d for d in decisions
+                          if d.kind == DecisionKind.QUANTIZE]
         with CheckpointReader(info) as reader:
-            for d in decisions:
-                if d.kind != DecisionKind.QUANTIZE:
-                    continue
+            for d in self._targeted:
                 meta = info.by_name(d.name)
                 if meta is None:
                     raise PolicyError(
@@ -4100,22 +4322,41 @@ class MixedPlanner:
                 for fmt in self.eligible_formats(meta):
                     cand = CandidateResult(
                         format=fmt, eligible=True,
-                        estimated_bytes=quantized_format_bytes(n, k, fmt))
+                        estimated_bytes=quantized_format_bytes(n, k, fmt),
+                        reason=self.runtime_reason(fmt))
                     metrics = self._evaluate_format(reader, d, fmt)
                     cand.weight_rel_l2 = metrics.rel_l2
                     cand.act_rel_l2 = metrics.act_rel_l2
                     cands[fmt] = cand
-                if not cands:
-                    cands[FORMAT_INT8] = CandidateResult(
-                        format=FORMAT_INT8, eligible=False,
-                        reason="disabled formats leave no candidate")
+                # record every eligible format even when the runtime cannot
+                # run it, so the report explains why it was skipped
+                for fmt in (FORMAT_W4A4, FORMAT_W4A8, FORMAT_INT8):
+                    if fmt in cands:
+                        continue
+                    if fmt in self.disabled:
+                        cands[fmt] = CandidateResult(
+                            format=fmt, eligible=False,
+                            reason="disabled by CLI flag",
+                            estimated_bytes=quantized_format_bytes(n, k, fmt))
+                    elif not self.runtime.supports.get(fmt, False):
+                        cands[fmt] = CandidateResult(
+                            format=fmt, eligible=False,
+                            reason=self.runtime_reason(fmt),
+                            estimated_bytes=quantized_format_bytes(n, k, fmt))
+                    else:
+                        cands[fmt] = CandidateResult(
+                            format=fmt, eligible=False,
+                            reason="shape ineligible",
+                            estimated_bytes=quantized_format_bytes(n, k, fmt))
                 self.candidates[d.name] = cands
 
         selected, kept = self.select(info, decisions)
         promoted = self.promote(info, decisions) if self.global_gate is not None else []
+        self._enforce_gates(info, decisions)
         self.summary = self._summarize(info, decisions)
         self.summary.update({
             "selected": selected, "kept": kept, "promotions": promoted,
+            "runtime_backend": self.runtime.backend,
         })
         return self.summary
 
@@ -4129,9 +4370,7 @@ class MixedPlanner:
                decisions: List[TensorDecision]) -> Tuple[int, int]:
         selected = 0
         kept = 0
-        for d in decisions:
-            if d.kind != DecisionKind.QUANTIZE:
-                continue
+        for d in self._targeted:
             cands = self.candidates.get(d.name, {})
             ordered = sorted(
                 (c for c in cands.values() if c.eligible),
@@ -4156,29 +4395,44 @@ class MixedPlanner:
             selected += 1
         return selected, kept
 
-    def global_mean_error(self, decisions: List[TensorDecision]) -> Optional[float]:
-        errors: List[float] = []
+    def _layer_params(self, info: CheckpointInfo, d: TensorDecision) -> int:
+        meta = info.by_name(d.name)
+        if meta is None or len(meta.shape) != 2:
+            return 0
+        return int(meta.shape[0]) * int(meta.shape[1])
+
+    def global_mean_error(self, info: CheckpointInfo,
+                          decisions: List[TensorDecision]) -> Optional[float]:
+        """Param-weighted mean of the per-layer error over quantized layers,
+        so a huge FFN counts more than a small projection."""
+        num = 0.0
+        den = 0
         for d in decisions:
             if d.kind != DecisionKind.QUANTIZE:
                 continue
             cand = self.candidates.get(d.name, {}).get(d.format)
             err = self._error_of(cand)
-            if err is not None:
-                errors.append(err)
-        if not errors:
+            if err is None:
+                continue
+            w = self._layer_params(info, d)
+            num += err * w
+            den += w
+        if den == 0:
             return None
-        return sum(errors) / len(errors)
+        return num / den
 
     def promote(self, info: CheckpointInfo,
                 decisions: List[TensorDecision]) -> List[str]:
         """Greedy: repeatedly promote the layer with the best error reduction
-        per extra byte until the global mean gate passes or no promotion helps."""
+        per extra byte until the weighted global gate passes or no promotion
+        helps. Original precision (BF16/FP16) is a real candidate, so a
+        sensitive layer can be rescued all the way to its source format."""
         while True:
-            mean = self.global_mean_error(decisions)
+            mean = self.global_mean_error(info, decisions)
             if mean is None or mean <= self.global_gate:
                 break
-            best: Optional[Tuple[float, TensorDecision, CandidateResult]] = None
-            for d in decisions:
+            best: Optional[Tuple[float, TensorDecision, Optional[CandidateResult]]] = None
+            for d in self._targeted:
                 if d.kind != DecisionKind.QUANTIZE:
                     continue
                 meta = info.by_name(d.name)
@@ -4188,6 +4442,7 @@ class MixedPlanner:
                 if cur_err is None:
                     continue
                 cur_bytes = quantized_format_bytes(n, k, d.format)
+                # quantized upgrades
                 for fmt, cand in self.candidates.get(d.name, {}).items():
                     if fmt == d.format or not cand.eligible:
                         continue
@@ -4198,32 +4453,100 @@ class MixedPlanner:
                     ratio = (cur_err - cand_err) / float(extra)
                     if best is None or ratio > best[0]:
                         best = (ratio, d, cand)
+                # original precision as the ultimate rescue
+                extra = max(meta.nbytes - cur_bytes, 1)
+                ratio = cur_err / float(extra)
+                if best is None or ratio > best[0]:
+                    best = (ratio, d, None)
             if best is None:
                 break
             _, d, cand = best
+            mean_after = self.global_mean_error(info, decisions)
+            mean_txt = ("n/a" if mean_after is None
+                        else f"{mean_after:.4f}")
+            if cand is None:
+                d.kind = DecisionKind.KEEP_PRECISION
+                d.reason = "mixed planner (promoted): original precision"
+                self.promotions.append(
+                    f"{d.name}:original (mean {mean_txt})")
+                continue
             meta = info.by_name(d.name)
             d.format = cand.format
             d.convrot_groupsize = self.cgs_for(int(meta.shape[1]), cand.format)
             d.reason = f"mixed planner (promoted): {cand.format}"
             self.promotions.append(
-                f"{d.name}:{cand.format} (mean {self.global_mean_error(decisions):.4f})")
+                f"{d.name}:{cand.format} (mean {mean_txt})")
         return self.promotions
+
+    # -- hard gates --------------------------------------------------------
+    def _enforce_gates(self, info: CheckpointInfo,
+                       decisions: List[TensorDecision]) -> None:
+        if not any(d.kind == DecisionKind.QUANTIZE
+                   for d in self._targeted):
+            raise QualityGateError(
+                "quality gate failed: no candidate layer could be quantized "
+                "within the configured gates (layer gate "
+                f"{self.layer_gate}); refusing to publish a passthrough-only "
+                "checkpoint. Loosen --quality-gate or the profile.")
+        final_error = self.global_mean_error(info, decisions)
+        if (final_error is not None and self.global_gate is not None
+                and final_error > self.global_gate):
+            raise QualityGateError(
+                f"quality gate failed: weighted mean error "
+                f"{final_error:.6f} > global gate {self.global_gate:.6f} "
+                f"(profile {self.profile.name}). Raise --global-error-gate, "
+                "provide calibration for activation-aware gates, or use a "
+                "larger profile.")
+        quant_bytes = 0
+        kept_bytes = 0
+        params = 0
+        for d in self._targeted:
+            meta = info.by_name(d.name)
+            n, k = int(meta.shape[0]), int(meta.shape[1])
+            params += n * k
+            if d.kind == DecisionKind.QUANTIZE:
+                quant_bytes += quantized_format_bytes(n, k, d.format)
+            else:
+                kept_bytes += meta.nbytes
+        effective_bpp = (quant_bytes + kept_bytes) / max(params, 1)
+        bf16_fraction = kept_bytes / max(quant_bytes + kept_bytes, 1)
+        if self.compression_target_bpp is not None \
+                and effective_bpp > self.compression_target_bpp:
+            raise CompressionGateError(
+                f"compression gate failed: effective targeted payload "
+                f"{effective_bpp:.4f} bytes/parameter > target "
+                f"{self.compression_target_bpp:.4f} (profile "
+                f"{self.profile.name}). Raise --max-linear-bytes-per-param "
+                "or accept more precision.")
+        if bf16_fraction > self.max_bf16_fraction:
+            raise CompressionGateError(
+                f"compression gate failed: {100*bf16_fraction:.1f}% of the "
+                f"targeted linear payload kept at original precision > "
+                f"{100*self.max_bf16_fraction:.1f}% (profile "
+                f"{self.profile.name}). Raise --max-bf16-fraction or loosen "
+                "the quality gates.")
+        self._effective_bpp = effective_bpp
+        self._bf16_fraction = bf16_fraction
 
     def _summarize(self, info: CheckpointInfo,
                    decisions: List[TensorDecision]) -> Dict[str, Any]:
         counts: Dict[str, int] = {}
         layer_params: Dict[str, int] = {}
         layer_bytes: Dict[str, int] = {}
-        for d in decisions:
-            if d.kind != DecisionKind.QUANTIZE:
-                continue
+        kept_params = 0
+        kept_bytes = 0
+        for d in self._targeted:
             meta = info.by_name(d.name)
             n, k = int(meta.shape[0]), int(meta.shape[1])
-            counts[d.format] = counts.get(d.format, 0) + 1
-            layer_params[d.format] = layer_params.get(d.format, 0) + n * k
-            layer_bytes[d.format] = layer_bytes.get(
-                d.format, 0) + quantized_format_bytes(n, k, d.format)
-        mean = self.global_mean_error(decisions)
+            if d.kind == DecisionKind.QUANTIZE:
+                counts[d.format] = counts.get(d.format, 0) + 1
+                layer_params[d.format] = layer_params.get(d.format, 0) + n * k
+                layer_bytes[d.format] = layer_bytes.get(
+                    d.format, 0) + quantized_format_bytes(n, k, d.format)
+            else:
+                kept_params += n * k
+                kept_bytes += meta.nbytes
+        mean = self.global_mean_error(info, decisions)
         return {
             "profile": self.profile.name,
             "layer_gate": self.layer_gate,
@@ -4232,12 +4555,21 @@ class MixedPlanner:
             "counts": counts,
             "layer_params": layer_params,
             "layer_bytes": layer_bytes,
+            "kept_params": kept_params,
+            "kept_bytes": kept_bytes,
+            "effective_bpp": getattr(self, "_effective_bpp", None),
+            "bf16_fraction": getattr(self, "_bf16_fraction", None),
+            "compression_target_bpp": self.compression_target_bpp,
+            "max_bf16_fraction": self.max_bf16_fraction,
+            "runtime": {
+                "backend": self.runtime.backend,
+                "formats": {
+                    fmt: self.runtime.describe(fmt) for fmt in MIXED_FORMATS
+                },
+            },
         }
 
 
-
-
-# ---------------------------------------------------------------------------
 # Conversion engine (streaming, resumable, atomic)
 # ---------------------------------------------------------------------------
 @dataclass
@@ -4320,6 +4652,7 @@ def _plan_hash(info: CheckpointInfo, plan: ConversionPlan, args: Any,
         "quality_gate": getattr(args, "quality_gate", None),
         "global_error_gate": getattr(args, "global_error_gate", None),
         "max_linear_bytes_per_param": getattr(args, "max_linear_bytes_per_param", None),
+        "max_bf16_fraction": getattr(args, "max_bf16_fraction", None),
         "w4a4_linear_dtype": getattr(args, "w4a4_linear_dtype", "int8"),
         "disable_w4a4": getattr(args, "disable_w4a4", False),
         "disable_w4a8": getattr(args, "disable_w4a8", False),
@@ -4339,6 +4672,62 @@ def _plan_hash(info: CheckpointInfo, plan: ConversionPlan, args: Any,
     }
     h.update(json_dumps(options).encode("utf-8"))
     return h.hexdigest()
+
+
+
+FORMAT_TO_KITCHEN_LAYOUT = {
+    FORMAT_W4A8: "AsymW4A8Int8Layout",
+    FORMAT_W4A4: "TensorCoreConvRotW4A4Layout",
+    FORMAT_INT8: "TensorWiseINT8Layout",
+}
+
+
+def _check_runtime_compatibility(env: EnvironmentInfo,
+                                 planner: MixedPlanner,
+                                 decisions: List[TensorDecision],
+                                 warnings: List[str]) -> None:
+    """Fail closed before conversion when the target machine demonstrably
+    lacks a runtime path for a selected format.
+
+    The probe is static (installed package source), never a runtime import.
+    When neither comfy-kitchen nor ComfyUI is installed the probe is
+    unavailable and the per-format runtime-contract validators remain the
+    verification layer (with a warning)."""
+    required = sorted({
+        d.format for d in decisions
+        if d.kind == DecisionKind.QUANTIZE and d.format in MIXED_FORMATS})
+    if not required:
+        return
+    if env.has_comfy_quant_ops:
+        missing = [f for f in required if f not in env.comfyui_quant_algos]
+        if missing:
+            raise RuntimeCompatibilityError(
+                "mixed checkpoint requires ComfyUI formats "
+                f"{', '.join(required)} but the installed ComfyUI "
+                f"quant_ops.py registers only "
+                f"{', '.join(env.comfyui_quant_algos) or 'none'}; missing: "
+                f"{', '.join(missing)}. Update ComfyUI (>= v0.31.0) or avoid "
+                "the affected formats with --disable-*.")
+    if env.has_comfy_kitchen:
+        layout_attr = {
+            FORMAT_W4A8: "comfy_kitchen_has_w4a8_layout",
+            FORMAT_W4A4: "comfy_kitchen_has_w4a4_layout",
+            FORMAT_INT8: "comfy_kitchen_has_int8_layout",
+        }
+        missing = [f for f in required
+                   if not getattr(env, layout_attr[f], False)]
+        if missing:
+            raise RuntimeCompatibilityError(
+                "mixed checkpoint requires comfy-kitchen layouts "
+                f"{', '.join(FORMAT_TO_KITCHEN_LAYOUT[f] for f in missing)} "
+                "but the installed comfy-kitchen does not contain them; "
+                "update comfy-kitchen or avoid the affected formats with "
+                "--disable-*.")
+    if not env.has_comfy_kitchen and not env.has_comfy_quant_ops:
+        warnings.append(
+            "runtime compatibility probe unavailable (neither ComfyUI nor "
+            "comfy-kitchen installed); mixed output is verified by the "
+            "per-format runtime-contract validators only")
 
 
 class _SimulatedCrash(Exception):
@@ -4849,30 +5238,79 @@ def build_extension_metadata(info: CheckpointInfo, plan: ConversionPlan,
     """Namespaced extension metadata (never described as official ComfyUI keys)."""
     d = plan.detection
     quant_layers = plan.quantized_layers()
-    conf = {
-        "schema": "comfy_wxa8/v1",
-        "converter": CONVERTER_NAME,
-        "converter_version": CONVERTER_VERSION,
-        "format": plan.fmt,
-        "format_revision": FORMAT_W4A8_REVISION,
-        "architecture": d.architecture,
-        "detection_confidence": d.confidence,
-        "unet_prefix": d.unet_prefix,
-        "architecture_dims": _architecture_dims_fingerprint(info, d),
-        "source": {
-            "kind": info.kind,
-            "files": _portable_file_labels(info.files),
-            "total_bytes": info.total_bytes,
-            "sha256": _portable_hash_manifest(info.files, input_hashes),
-        },
-        "quantization": {
-            "weight_bits": 4 if plan.fmt == FORMAT_W4A8 else "mixed",
+    is_mixed = plan.fmt == FORMAT_MIXED
+    quant_block = None
+    if is_mixed:
+        # v2 schema: the quantization block describes the heterogeneous
+        # checkpoint (mode + per-format contracts + distribution), never
+        # W4A8-global properties.
+        fmt_details = {
+            FORMAT_W4A8: {
+                "weight_bits": 4, "activation_bits": 8,
+                "weight_quantization": "per-group 16-entry symmetric "
+                                       "Lloyd-Max codebook",
+                "scale_dtype": "fp8_e4m3fn",
+                "packing": "int4-nibble-lsb",
+                "convrot": True, "convrot_groupsize": 256,
+                "group_size": 16,
+            },
+            FORMAT_W4A4: {
+                "weight_bits": 4, "activation_bits": "int4 or int8 "
+                                                      "(linear_dtype)",
+                "weight_quantization": "rowwise symmetric signed int4 "
+                                       "(absmax/7, range [-7,7])",
+                "scale_dtype": "fp32 rowwise [N]",
+                "packing": "int4-nibble-lsb",
+                "convrot": True,
+                "convrot_groupsize": "per layer, power of 4 in {16,64,256}",
+                "quant_group_size": 64,
+            },
+            FORMAT_INT8: {
+                "weight_bits": 8, "activation_bits": 8,
+                "weight_quantization": "rowwise symmetric int8 (absmax/127)",
+                "scale_dtype": "fp32 rowwise [N,1]",
+                "packing": "none",
+                "convrot": False,
+            },
+        }
+        mp = plan.mixed_plan or {}
+        quant_block = {
+            "mode": "mixed",
+            "weight_bits": "mixed",
             "activation_bits": 8,
-            "weight_quantization": (
-                "per-group 16-entry symmetric Lloyd-Max codebook"
-                if plan.fmt == FORMAT_W4A8 else
-                "per-layer mixed: convrot_w4a4 rowwise int4 / asym_w4a8_int8 "
-                "codebook / int8_tensorwise rowwise int8"),
+            "activation_quantization": "runtime dynamic symmetric int8 per "
+                                       "input row (after ConvRot rotation for "
+                                       "the convrot formats)",
+            "formats": {
+                fmt: fmt_details[fmt] for fmt in MIXED_FORMATS
+                if fmt in {f for f in (mp.get("counts") or {})}
+            },
+            "distribution": {
+                "counts": mp.get("counts") or {},
+                "layer_params": mp.get("layer_params") or {},
+                "layer_bytes": mp.get("layer_bytes") or {},
+                "kept_params": mp.get("kept_params") or 0,
+                "kept_bytes": mp.get("kept_bytes") or 0,
+                "effective_bytes_per_param": mp.get("effective_bpp"),
+                "original_precision_fraction": mp.get("bf16_fraction"),
+                "global_mean_error": mp.get("global_mean_error"),
+                "promotions": mp.get("promotions") or [],
+            },
+            "profile": mp.get("profile"),
+            "layer_gate": mp.get("layer_gate"),
+            "global_gate": mp.get("global_gate"),
+            "runtime_backend": mp.get("runtime_backend"),
+            "compute_dtype": getattr(args, "compute_dtype", "auto"),
+            "effective_compute_dtype": torch_dtype_name(
+                getattr(args, "_compute_dtype_tensor", torch.float32)),
+            "passthrough_output_dtype": getattr(args, "output_dtype", "auto"),
+            "chunked_layers": sorted(plan.chunked_layers),
+        }
+    else:
+        quant_block = {
+            "weight_bits": 4,
+            "activation_bits": 8,
+            "weight_quantization": "per-group 16-entry symmetric Lloyd-Max codebook",
             "activation_quantization": "runtime dynamic symmetric int8 per input row after ConvRot",
             "activation_scale": "fp32 amax(row)/127, clamped to at least 1e-30",
             "activation_rounding": "nearest integer, clamped to [-128,127]",
@@ -4884,16 +5322,30 @@ def build_extension_metadata(info: CheckpointInfo, plan: ConversionPlan,
             "symmetric": True,
             "n_quantized_layers": len(quant_layers),
             "n_kept_tensors": plan.n_kept,
-            "formats": sorted({d.format for d in quant_layers}),
-            "mixed_profile": (plan.mixed_plan or {}).get("profile"),
-            "mixed_global_mean_error": (plan.mixed_plan or {}).get(
-                "global_mean_error"),
             "compute_dtype": getattr(args, "compute_dtype", "auto"),
             "effective_compute_dtype": torch_dtype_name(
                 getattr(args, "_compute_dtype_tensor", torch.float32)),
             "passthrough_output_dtype": getattr(args, "output_dtype", "auto"),
             "chunked_layers": sorted(plan.chunked_layers),
+        }
+    conf = {
+        "schema": "comfy_wxa8/v2" if is_mixed else "comfy_wxa8/v1",
+        "converter": CONVERTER_NAME,
+        "converter_version": CONVERTER_VERSION,
+        "format": plan.fmt,
+        "format_revision": FORMAT_MIXED_REVISION if is_mixed
+                          else FORMAT_W4A8_REVISION,
+        "architecture": d.architecture,
+        "detection_confidence": d.confidence,
+        "unet_prefix": d.unet_prefix,
+        "architecture_dims": _architecture_dims_fingerprint(info, d),
+        "source": {
+            "kind": info.kind,
+            "files": _portable_file_labels(info.files),
+            "total_bytes": info.total_bytes,
+            "sha256": _portable_hash_manifest(info.files, input_hashes),
         },
+        "quantization": quant_block,
         "calibration": calibration.to_dict() if calibration is not None else {
             "source": None, "method": "calibration-free (reference format)",
             "synthetic": False},
@@ -4916,9 +5368,10 @@ def build_extension_metadata(info: CheckpointInfo, plan: ConversionPlan,
                 "required_revision": COMFY_KITCHEN_REV,
                 "pr": 90,
                 "merged": True,
-                "layout": ("AsymW4A8Int8Layout" if plan.fmt == FORMAT_W4A8 else
-                           "AsymW4A8Int8Layout / TensorCoreConvRotW4A4Layout / "
-                           "TensorWiseINT8Layout"),
+                "layouts": sorted({
+                    FORMAT_TO_KITCHEN_LAYOUT[d.format]
+                    for d in quant_layers if d.format in MIXED_FORMATS
+                }) or ["AsymW4A8Int8Layout"],
             },
             "comfyui": {
                 "required_pr": COMFYUI_PR,
@@ -5077,6 +5530,7 @@ class Validator:
         self.check("extension-metadata-present", ext_ok,
                    "missing comfy_wxa8 extension metadata" if not ext_ok else "present")
         ext_payload: Dict[str, Any] = {}
+        is_mixed_plan = self.plan.fmt == FORMAT_MIXED
         if ext_ok:
             try:
                 ext_payload = json.loads(meta[METADATA_KEY_EXT])
@@ -5094,11 +5548,16 @@ class Validator:
                     if isinstance(source_block, dict) else {}
                 schema_ok = isinstance(ext_payload, dict) and all(
                     key in ext_payload for key in required)
+                expected_schema = ("comfy_wxa8/v2" if self.plan.fmt == FORMAT_MIXED
+                                   else "comfy_wxa8/v1")
+                expected_revision = (FORMAT_MIXED_REVISION
+                                     if self.plan.fmt == FORMAT_MIXED
+                                     else FORMAT_W4A8_REVISION)
                 schema_ok = (
                     schema_ok
-                    and ext_payload.get("schema") == "comfy_wxa8/v1"
+                    and ext_payload.get("schema") == expected_schema
                     and ext_payload.get("format") == self.plan.fmt
-                    and ext_payload.get("format_revision") == FORMAT_W4A8_REVISION
+                    and ext_payload.get("format_revision") == expected_revision
                     and ext_payload.get("architecture") ==
                     self.plan.detection.architecture
                     and isinstance(ext_payload.get("source"), dict)
@@ -5114,10 +5573,24 @@ class Validator:
                     and all(isinstance(digest, str)
                             and re.fullmatch(r"[0-9a-f]{64}", digest)
                             for digest in source_hashes.values())
-                    and quant_block.get("weight_bits") in (4, "mixed")
+                    and isinstance(quant_block.get("weight_bits"), (int, str))
                     and quant_block.get("activation_bits") == 8
-                    and quant_block.get("packing") == "int4-nibble-lsb"
-                    and quant_block.get("scale_dtype") == "fp8_e4m3fn"
+                    and (
+                        # v1 (single-format w4a8): W4A8-global fields
+                        (not is_mixed_plan
+                         and quant_block.get("weight_bits") == 4
+                         and quant_block.get("packing") == "int4-nibble-lsb"
+                         and quant_block.get("scale_dtype") == "fp8_e4m3fn")
+                        or
+                        # v2 (mixed): mode + per-format contracts + distribution
+                        (is_mixed_plan
+                         and quant_block.get("mode") == "mixed"
+                         and isinstance(quant_block.get("formats"), dict)
+                         and set(quant_block["formats"]) <= set(MIXED_FORMATS)
+                         and set(quant_block["formats"]) == {
+                             d.format for d in self.plan.quantized_layers()
+                             if d.format in MIXED_FORMATS})
+                    )
                     and isinstance(quant_block.get("activation_quantization"), str)
                     and isinstance(output_block.get("tensor_data_sha256"), str)
                     and bool(re.fullmatch(
@@ -5565,22 +6038,38 @@ class Validator:
 
         # ---- compatibility probe (optional, no ComfyUI required) ----
         if full_validation:
+            required_formats = sorted({
+                d.format for d in self.plan.quantized_layers()
+                if d.format in MIXED_FORMATS})
             if self.env.has_comfy_kitchen:
-                compatible = self.env.comfy_kitchen_has_w4a8_layout
-                self.check("compat-comfy-kitchen", True,
-                           detail=f"installed comfy-kitchen: {self.env.comfy_kitchen_rev or 'version unknown'}, "
-                                  "static package source contains AsymW4A8Int8Layout: "
-                                  f"{compatible}",
-                           warn=not compatible)
+                layout_attr = {
+                    FORMAT_W4A8: "comfy_kitchen_has_w4a8_layout",
+                    FORMAT_W4A4: "comfy_kitchen_has_w4a4_layout",
+                    FORMAT_INT8: "comfy_kitchen_has_int8_layout",
+                }
+                missing = [f for f in required_formats
+                           if not getattr(self.env, layout_attr[f], False)]
+                self.check("compat-comfy-kitchen", not missing,
+                           detail=f"installed comfy-kitchen: {self.env.comfy_kitchen_rev or 'version unknown'}; "
+                                  "required layouts " +
+                                  (", ".join(FORMAT_TO_KITCHEN_LAYOUT[f]
+                                             for f in required_formats)
+                                   or "none") +
+                                  ("; MISSING: " + ", ".join(
+                                      FORMAT_TO_KITCHEN_LAYOUT[f] for f in missing)
+                                   if missing else " all present"),
+                           warn=bool(missing))
             else:
                 self.check("compat-comfy-kitchen", True, "comfy-kitchen not installed (skipped)",
                            skipped=True, reason="optional runtime probe")
             if self.env.has_comfy_quant_ops:
-                compatible = self.plan.fmt in self.env.comfyui_quant_algos
-                self.check("compat-comfyui", True,
+                missing = [f for f in required_formats
+                           if f not in self.env.comfyui_quant_algos]
+                self.check("compat-comfyui", not missing,
                            detail=f"static ComfyUI quant_ops formats: "
-                                  f"{self.env.comfyui_quant_algos}",
-                           warn=not compatible)
+                                  f"{self.env.comfyui_quant_algos}"
+                                  + (f"; MISSING: {missing}" if missing else ""),
+                           warn=bool(missing))
             else:
                 self.check("compat-comfyui", True, "ComfyUI not installed (skipped)",
                            skipped=True, reason="optional runtime probe")
@@ -5931,8 +6420,19 @@ def render_text_report(report: Dict[str, Any]) -> str:
                 a(f"  {fmt:22s}: {counts[fmt]:4d} layers, "
                   f"{100*params.get(fmt,0)/total_p:5.1f}% of quantized params, "
                   f"{human_bytes(bytes_.get(fmt,0))}")
-        a(f"  quantized linear payload: "
+        a(f"  quantized-only payload  : "
           f"{sum(bytes_.values())/total_p:.3f} bytes/parameter")
+        if mixed.get("effective_bpp") is not None:
+            a(f"  effective targeted      : {mixed['effective_bpp']:.3f} "
+              f"bytes/parameter (target {mixed.get('compression_target_bpp')})")
+            a(f"  original-precision share: "
+              f"{100*(mixed.get('bf16_fraction') or 0):.1f}% of targeted bytes "
+              f"(max {100*(mixed.get('max_bf16_fraction') or 0):.1f}%)")
+        runtime = mixed.get("runtime") or {}
+        if runtime.get("formats"):
+            a("  runtime target          : " + runtime.get("backend", "?") +
+              " [" + ", ".join(
+                  f"{f}={s}" for f, s in runtime["formats"].items()) + "]")
     a("")
     a("-- quantization --")
     for row in report.get("quantization_rows", []):
@@ -5973,15 +6473,37 @@ def build_report(info: CheckpointInfo, plan: ConversionPlan, env: EnvironmentInf
                  input_hashes: Dict[str, str], output_sha256: str,
                  elapsed: float, warnings: List[str],
                  quant_rows: List[str]) -> Dict[str, Any]:
+    required_layouts = sorted({
+        FORMAT_TO_KITCHEN_LAYOUT[d.format]
+        for d in plan.quantized_layers() if d.format in MIXED_FORMATS})
     comp = [
-        "comfy-kitchen >= %s (PR #90, merged) with AsymW4A8Int8Layout" % COMFY_KITCHEN_REV,
+        "comfy-kitchen >= %s (PR #90, merged) with %s" % (
+            COMFY_KITCHEN_REV,
+            ", ".join(required_layouts) or "AsymW4A8Int8Layout"),
         "ComfyUI >= v0.31.0 (PR #%d merged as 344b43989e; older builds need "
         "patches/comfyui_w4a8_loader.patch)" % COMFYUI_PR,
         "CUDA: PyTorch cu130+, SM >= 8.0; ROCm: triton >= 3.7; eager works anywhere",
     ]
+    if plan.fmt == FORMAT_MIXED:
+        mp = plan.mixed_plan or {}
+        runtime = mp.get("runtime") or {}
+        comp.append(
+            "mixed runtime target: %s (%s)" % (
+                runtime.get("backend", "unknown"),
+                "; ".join(f"{f}={status}" for f, status in
+                          (runtime.get("formats") or {}).items())))
+        if mp.get("effective_bpp") is not None:
+            comp.append(
+                "mixed gates: effective %.3f bytes/param (target %.3f), "
+                "%.1f%% original precision (max %.1f%%)" % (
+                    mp["effective_bpp"], mp.get("compression_target_bpp", 0),
+                    100 * (mp.get("bf16_fraction") or 0),
+                    100 * (mp.get("max_bf16_fraction") or 0)))
     return {
         "converter": CONVERTER_NAME, "converter_version": CONVERTER_VERSION,
-        "format": plan.fmt, "format_revision": FORMAT_W4A8_REVISION,
+        "format": plan.fmt, "format_revision": (
+            FORMAT_MIXED_REVISION if plan.fmt == FORMAT_MIXED
+            else FORMAT_W4A8_REVISION),
         "architecture": result.architecture, "detection_confidence": result.confidence,
         "unet_prefix": result.unet_prefix,
         "detection_evidence": result.evidence, "detection_hints": result.hints,
@@ -6080,6 +6602,11 @@ def print_console_summary(*, out_path: str, input_bytes: int, output_bytes: int,
         a(f"  gates       : layer<={mixed_plan.get('layer_gate')}  "
           f"global_mean<={mixed_plan.get('global_gate')}"
           + (f"  (mean {mean:.4f})" if mean is not None else ""))
+        if mixed_plan.get("effective_bpp") is not None:
+            a(f"  compression : {mixed_plan['effective_bpp']:.3f} bytes/param "
+              f"(target {mixed_plan.get('compression_target_bpp')}); "
+              f"{100*(mixed_plan.get('bf16_fraction') or 0):.1f}% original "
+              f"(max {100*(mixed_plan.get('max_bf16_fraction') or 0):.1f}%)")
     else:
         a(f"  format      : {FORMAT_W4A8}  group_size={group_size}  convrot_groupsize=256")
     a(f"  validation  : {v_txt}")
@@ -6129,8 +6656,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "planner promotes layers until this passes")
     p.add_argument("--max-linear-bytes-per-param", type=float, default=None,
                    metavar="F",
-                   help="mixed mode: compression target in bytes/parameter for "
-                        "the quantized linear payload (warned when exceeded)")
+                   help="mixed mode: hard compression target in bytes/parameter "
+                        "for the targeted linear payload (overrides the profile; "
+                        "conversion fails when exceeded)")
+    p.add_argument("--max-bf16-fraction", type=float, default=None, metavar="F",
+                   help="mixed mode: hard limit on the share of the targeted "
+                        "linear payload kept at original precision (overrides "
+                        "the profile; conversion fails when exceeded)")
     p.add_argument("--w4a4-linear-dtype", choices=["int4", "int8"], default="int8",
                    help="convrot_w4a4 execution variant: int4 (true W4A4) or "
                         "int8 (4-bit weights through the int8 path; the "
@@ -6429,6 +6961,11 @@ def run_self_tests() -> int:
         ("mixed-eligibility", _test_mixed_eligibility),
         ("mixed-planning", _test_mixed_planning),
         ("mixed-e2e", _test_mixed_e2e),
+        ("mixed-gates-hard-fail", _test_mixed_gates_hard_fail),
+        ("mixed-bf16-promotion", _test_mixed_bf16_promotion),
+        ("mixed-runtime-caps", _test_mixed_runtime_caps),
+        ("mixed-runtime-metric", _test_mixed_runtime_metric),
+        ("architecture-sync", _test_architecture_sync),
         ("fail-on-low-compression", _test_fail_on_low_compression),
         ("architecture-detection-safety", _test_detection_safety),
         ("golden-vectors-vs-reference", _test_golden_vectors),
@@ -7812,6 +8349,175 @@ def _test_mixed_e2e() -> str:
     return ("mixed e2e: heterogeneous checkpoint converted, validated "
             f"(n_failed=0), metadata {sorted(fmts)}, layouts reload + dequant OK")
 
+
+
+def _test_mixed_gates_hard_fail() -> str:
+    """Quality and compression gates are hard failures: a plan that cannot
+    meet them raises instead of publishing."""
+    d = _tmpdir()
+    src_path = os.path.join(d, "boogu_gates.safetensors")
+    _make_boogu_real_dims_checkpoint(src_path, n=48, n_fail=4, n_ok=2)
+    info = discover_checkpoint(src_path)
+    det = detect_architecture(
+        info, shape_lookup=lambda n: (info.by_name(n).shape if info.by_name(n) else None))
+    def fresh_decisions() -> List[TensorDecision]:
+        return classify_tensors(info, det, FORMAT_MIXED, None, [], [], [],
+                                None, None)
+    # (1) impossible global quality gate -> QualityGateError
+    planner = MixedPlanner("balanced", None, 2 * 1024**3, torch.device("cpu"),
+                           None, global_gate=0.0005)
+    try:
+        planner.plan(info, fresh_decisions())
+        raise AssertionError("impossible quality gate accepted")
+    except QualityGateError:
+        pass
+    # (2) impossible compression target -> CompressionGateError
+    planner = MixedPlanner("balanced", None, 2 * 1024**3, torch.device("cpu"),
+                           None, compression_target_bpp=0.05)
+    try:
+        planner.plan(info, fresh_decisions())
+        raise AssertionError("impossible compression target accepted")
+    except CompressionGateError:
+        pass
+    # (3) bf16 fraction gate: K=3360 layers have only INT8 (disabled) so
+    # they stay at original precision; the fraction gate must trip
+    planner = MixedPlanner("balanced", None, 2 * 1024**3, torch.device("cpu"),
+                           None, layer_gate=0.10,
+                           disabled_formats=[FORMAT_INT8],
+                           max_bf16_fraction=0.0)
+    try:
+        planner.plan(info, fresh_decisions())
+        raise AssertionError("bf16 fraction gate accepted")
+    except CompressionGateError:
+        pass
+    return ("quality/compression gates fail hard: QualityGateError, "
+            "CompressionGateError (bpp and bf16-fraction) verified")
+
+
+def _test_mixed_bf16_promotion() -> str:
+    """Original precision is a promotion candidate: a layer can be rescued
+    all the way to BF16 when the global gate demands it."""
+    d = _tmpdir()
+    src_path = os.path.join(d, "boogu_promo.safetensors")
+    _make_boogu_real_dims_checkpoint(src_path, n=48, n_fail=2, n_ok=2)
+    info = discover_checkpoint(src_path)
+    det = detect_architecture(
+        info, shape_lookup=lambda n: (info.by_name(n).shape if info.by_name(n) else None))
+    dec = classify_tensors(info, det, FORMAT_MIXED, None, [], [], [], None, None)
+    # layer gate admits W4A8 (~0.07); the global gate is stricter than even
+    # INT8 (~0.008), so the greedy loop must promote layers all the way to
+    # original precision, and the resulting passthrough-only plan must fail
+    # the quality gate instead of publishing a copy of the input
+    planner = MixedPlanner("balanced", None, 2 * 1024**3, torch.device("cpu"),
+                           None, layer_gate=0.10, global_gate=0.001)
+    try:
+        planner.plan(info, dec)
+        raise AssertionError("passthrough-only plan accepted")
+    except QualityGateError:
+        pass
+    promoted_original = [p for p in planner.promotions if ":original" in p]
+    assert promoted_original, planner.promotions
+    return ("BF16 promotion: %d promotion(s), %d to original precision; "
+            "empty plan correctly rejected by the quality gate" % (
+                len(planner.promotions), len(promoted_original)))
+
+
+def _test_mixed_runtime_caps() -> str:
+    """--target-runtime feeds the eligibility matrix: unsupported formats are
+    excluded with a recorded reason, eager vs accelerated is reported."""
+    d = _tmpdir()
+    src_path = os.path.join(d, "boogu_caps.safetensors")
+    _make_boogu_real_dims_checkpoint(src_path, n=48, n_fail=2, n_ok=2)
+    info = discover_checkpoint(src_path)
+    det = detect_architecture(
+        info, shape_lookup=lambda n: (info.by_name(n).shape if info.by_name(n) else None))
+    dec = classify_tensors(info, det, FORMAT_MIXED, None, [], [], [], None, None)
+    caps = RuntimeCapabilities(
+        backend="limited", supports={FORMAT_INT8: True},
+        accelerated={FORMAT_INT8: True})
+    planner = MixedPlanner("balanced", None, 2 * 1024**3, torch.device("cpu"),
+                           None, runtime=caps)
+    summary = planner.plan(info, dec)
+    # w4a4/w4a8 must be marked ineligible with the runtime reason
+    first = planner.candidates[dec[0].name]
+    assert first[FORMAT_W4A4].eligible is False
+    assert "not supported on target runtime limited" in first[FORMAT_W4A4].reason
+    assert first[FORMAT_INT8].eligible is True
+    assert summary["runtime"]["backend"] == "limited"
+    assert summary["runtime"]["formats"][FORMAT_INT8] == "accelerated"
+    # cpu runtime reports eager fallback everywhere
+    planner = MixedPlanner("balanced", None, 2 * 1024**3, torch.device("cpu"),
+                           None, runtime=runtime_capabilities_for("cpu"))
+    planner.plan(info, list(dec))
+    assert planner.summary["runtime"]["formats"][FORMAT_W4A8] == "eager fallback"
+    return ("runtime capability matrix: unsupported format excluded with "
+            "reason; cpu reports eager fallback; backend recorded in summary")
+
+
+def _test_mixed_runtime_metric() -> str:
+    """The calibration metric is the real runtime operation (activation
+    rotation + activation quantization + quantized GEMM), not a
+    reconstructed-weight approximation."""
+    torch.manual_seed(11)
+    w = torch.randn(64, 768) * 0.02
+    acts = torch.randn(32, 768) * 0.1
+    # int8: act quantization dominates -> runtime error ~0.01, weight err ~0.005
+    q, scale = quantize_int8_tensorwise_weight(w)
+    err = runtime_output_rel_l2(w, {"": q, "_scale": scale}, FORMAT_INT8,
+                                16, 256, acts)
+    assert err is not None and err < 0.05, err
+    # w4a4 int4 path: act int4 + weight int4 -> much larger
+    packed, wscale = quantize_w4a4_weight(w, 256)
+    err4 = runtime_output_rel_l2(w, {"": packed, "_scale": wscale},
+                                 FORMAT_W4A4, 16, 256, acts, linear_dtype="int4")
+    err8 = runtime_output_rel_l2(w, {"": packed, "_scale": wscale},
+                                 FORMAT_W4A4, 16, 256, acts, linear_dtype="int8")
+    assert err4 is not None and err8 is not None
+    assert err4 > err8, (err4, err8)
+    # cross-check against the real comfy-kitchen eager forward when installed
+    ck_err = None
+    try:
+        import comfy_kitchen
+        comfy_kitchen.use_backend("eager")
+        import comfy_kitchen as ck
+        qa, sa = ck.quantize_convrot_w4a4_weight(w, convrot_groupsize=256,
+                                                 quant_group_size=64)
+        y_q = ck.convrot_w4a4_linear(acts, qa, sa, None,
+                                     convrot_groupsize=256,
+                                     quant_group_size=64, linear_dtype="int4")
+        y_ref = torch.nn.functional.linear(acts, w)
+        ck_err = float((y_q - y_ref).norm(dim=1).div(
+            y_ref.norm(dim=1).clamp(min=1e-8)).mean())
+    except Exception as e:  # noqa: S110 (optional cross-check)
+        log().debug("comfy-kitchen cross-check skipped: %s", e)
+    if ck_err is not None:
+        assert abs(err4 - ck_err) < 0.02, (err4, ck_err)
+    return (f"runtime metric: int8 {err:.4f}, w4a4-int4 {err4:.4f} > "
+            f"w4a4-int8 {err8:.4f}; matches eager kernel emulation")
+
+
+
+
+def _test_architecture_sync() -> str:
+    """The registry must cover every ComfyUI model class at the pinned
+    research revision (mirrors testdata/comfyui_architecture_sync.py)."""
+    research = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "research", "ComfyUI", "comfy", "supported_models.py")
+    if not os.path.isfile(research):
+        return "architecture sync skipped (no research/ComfyUI checkout)"
+    import ast as _ast
+    with open(research, encoding="utf-8") as f:
+        tree = _ast.parse(f.read())
+    comfy = {n.name for n in tree.body if isinstance(n, _ast.ClassDef)}
+    covered = set()
+    for name in family_names():
+        covered.update(get_family(name).comfyui_classes)
+    missing = sorted(comfy - covered)
+    assert not missing, f"unaccounted ComfyUI classes: {missing}"
+    return (f"architecture sync: all {len(comfy)} ComfyUI model classes at "
+            "the pinned revision covered by registry policies")
+
+
 def _selftest_args(out: str, fmt: str, resume: bool = False, overwrite: bool = False,
                    extra: Optional[Dict[str, Any]] = None) -> argparse.Namespace:
     ns = argparse.Namespace(
@@ -8029,10 +8735,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             disabled_formats.append(FORMAT_INT8)
         if len(disabled_formats) == 3:
             parser.error("at least one quantized format must stay enabled in mixed mode")
-        if args.w4a4_linear_dtype == "int4" and effective_runtime == "cpu":
+        if effective_runtime == "cpu":
             warnings.append(
-                "linear_dtype=int4 on CPU uses the eager dequant path; "
-                "int8 is faster there")
+                "W4A4 linear_dtype note: the comfy-kitchen eager backend "
+                "accepts int4/int8 but always executes the int4 activation "
+                "path; linear_dtype=int8 only changes the CUDA kernels")
         globals()["W4A4_LINEAR_DTYPE"] = args.w4a4_linear_dtype
         args._mixed_profile_name = profile_name
         args._mixed_disabled_formats = disabled_formats
@@ -8127,13 +8834,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         layer_gate = args.quality_gate
         if layer_gate is None and args.error_threshold is not None:
             layer_gate = args.error_threshold
+        runtime_caps = runtime_capabilities_for(effective_runtime)
         mixed_planner = MixedPlanner(
             profile_name, calibration, args.max_memory, effective_device,
             compute_dtype,
             disabled_formats=getattr(args, "_mixed_disabled_formats", ()),
             layer_gate=layer_gate,
-            global_gate=args.global_error_gate)
+            global_gate=args.global_error_gate,
+            runtime=runtime_caps,
+            compression_target_bpp=args.max_linear_bytes_per_param,
+            max_bf16_fraction=args.max_bf16_fraction,
+            linear_dtype=args.w4a4_linear_dtype)
         mixed_plan = mixed_planner.plan(info, decisions)
+        _check_runtime_compatibility(env, mixed_planner, decisions, warnings)
         if not calibration:
             warnings.append(
                 "mixed planner: no calibration activations, quality gates use "
