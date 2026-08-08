@@ -1,221 +1,177 @@
-# AGENTS.md
+# AGENTS.md (experimental/mixed-precision branch)
 
 ## Project
 
 `comfyui_wxa8_quantizer.py` is a standalone, single-file converter that turns
-generative-model checkpoints into the ComfyUI W4A8 format (`asym_w4a8_int8`):
-4-bit weights packed as int8, an fp8 group scale, an fp32 channel scale, and a
-16-entry Lloyd-Max codebook. It does not import ComfyUI or comfy-kitchen at
-runtime. W3A8 was removed in v1.1.0 and must not be reintroduced; `--format`
-accepts only `w4a8` and defaults to it.
+generative-model checkpoints into ComfyUI-native quantized checkpoints. It
+does not import ComfyUI or comfy-kitchen at runtime.
+
+This branch (`experimental/mixed-precision`) adds `--format mixed`: a
+per-layer optimizer over the ComfyUI-native formats `convrot_w4a4`,
+`asym_w4a8_int8`, and `int8_tensorwise`. It is experimental and not merged to
+main. `--format w4a8` remains the default and is byte-identical to main
+v1.3.0 (golden vectors and the 30/30 self-test suite prove it).
 
 - Local path: `/home/nidall/projects/testdeepseek/quantizationscripts_w4a8_w3a8`
 - Repo (public): `https://github.com/NidAll/comfyui-w4a8-quantizer`
-  (renamed from `comfyui-wxa8-quantizer`; old URL redirects)
-- Branch: `main`, SSH remote `git@github.com:NidAll/comfyui-w4a8-quantizer.git`
-- Script version: `1.3.0` (`CONVERTER_VERSION` in the script)
+- Branch: `experimental/mixed-precision` (do not merge to main without review)
+- Script version: `1.4.0-experimental` (`CONVERTER_VERSION`)
 
 ## Format facts (verified, do not guess)
 
-The format spec comes from comfy-kitchen PR #90 (merged,
-`aa1ab2263dc06225d9de6702dfc087313d4bc971`). The ComfyUI loader is PR #15308
-("Support asym w4a8_int", merged 2026-08-07 as commit `344b43989e`, shipped in
-ComfyUI v0.31.0). ComfyUI >= v0.31.0 loads W4A8 natively; older builds need
-`patches/comfyui_w4a8_loader.patch` (verified against ComfyUI v0.30.0). Without
-the patch ComfyUI fails with `KeyError: 'asym_w4a8_int8'`.
+### W4A8 (unchanged from main)
 
-Per quantized layer, the output file has:
+Per quantized layer: `{layer}.weight` int8 [N, K/2] (even column low nibble),
+`{layer}.weight_s_rel` fp8_e4m3fn [N, K/16], `{layer}.weight_s_channel` fp32
+[N], `{layer}.weight_codebook` fp32 [16]. Metadata: `format=asym_w4a8_int8`,
+`group_size=16`, `convrot=true`, `convrot_groupsize=256`. K % 256 == 0 is
+required (CUDA fused kernels are ConvRot-256-only).
 
-- `{layer}.weight` int8 `[N, K/2]`, even column in the low nibble, odd in the high
-- `{layer}.weight_s_rel` fp8_e4m3fn `[N, K/group_size]`
-- `{layer}.weight_s_channel` fp32 `[N]`
-- `{layer}.weight_codebook` fp32 `[16]`
-- `__metadata__["_quantization_metadata"]` = `{"layers": {layer: {"format":
-  "asym_w4a8_int8", "group_size": 16, "convrot": true,
-  "convrot_groupsize": 256}}}` (full state-dict keys, prefix included)
-- `__metadata__["comfy_wxa8"]` extension block (never described as official)
+### W4A4 (new, convrot_w4a4)
 
-Shape rules: 2D only, `K % 16 == 0`, `K % group_size == 0`, group_size >= 4 and
-`(16 % group_size == 0 or group_size % 16 == 0)`, `K % convrot_groupsize == 0`.
-ConvRot is ALWAYS 256-wide (v1.2.2+): the comfy-kitchen CUDA fused kernels
-(activation rotation+quantize, chunked codebook GEMM, weight rotation) implement
-ConvRot 256 only and throw `convrot fused kernel only supports group_size 256` at
-sampling otherwise. Therefore `K % 256 == 0` is required for quantization; any
-2D linear whose K is not divisible by 256 passes through at original precision
-with the reason recorded (e.g. SDXL attn1 K=320, WAN FFN K=384/2240, MiniMaxH3
-fc2 K=1152, Boogu/OmniGen2 layers with K%256 != 0). Do not reintroduce adaptive
-per-layer convrot group sizes (4/16/64): they serialize and validate, but crash
-the CUDA runtime. The CUDA dequant kernel requires weight group sizes in
-{4, 8, 16} or multiples of 16 (this is `group_size`, unrelated to ConvRot).
+- `{layer}.weight` int8 [N, K/2], packed signed int4, low nibble = even column
+  (matches comfy-kitchen `_pack_int4_row_major`)
+- `{layer}.weight_scale` fp32 [N], rowwise absmax / 7, emission range [-7, 7]
+  (matches eager `quantize_convrot_w4a4_weight`; golden-vector byte digests in
+  `_test_w4a4_golden`)
+- Metadata: `format=convrot_w4a4`, `convrot_groupsize` (largest power of 4 in
+  {16, 64, 256} dividing K), `quant_group_size=64` (kernel contract), and
+  `linear_dtype` (execution variant only: int4 or int8, default int8; never a
+  quality fallback)
+- Eligibility: K % 64 == 0 and K % cgs == 0. Boogu 3360 and OmniGen2 2520 are
+  NOT eligible (3360 % 64 = 32, 2520 % 64 = 24). PixArt 1152, HunyuanDiT 1408,
+  CogVideoX-2B 1920, SDXL 320/640, MiniMax fc2 1152 ARE eligible.
+- Measured weight error ~0.142, about 2x the W4A8 codebook path (0.070).
+  Dequant requires the signed nibble interpretation (`unpack_int4_signed`,
+  NOT `unpack_w4` which is unsigned).
 
-Real-model dims audit (2026-08-08, HF configs + state-dict headers): krea2
-(6144/16384), ernie_image (4096/12288), qwen_image (3072/12288), zimage
-(3840/10240), ideogram4 (4608/12288), joyimage, mage_flow, kandinsky5, wan
-(5120/13824, 1536/8960), mmdit_sd3, flux/flux2, mochi, ltxv, cosmos,
-hunyuan_video, cogvideox-5b, hidream, hidream_o1, chroma, seedvr2, pixeldit,
-lens, hunyuan3d, aura_flow, cascade-C are all clean. SDXL/SD15/SVD/cascade-B
-lose only the 320/640 low-res blocks (~3%/13%/15% of bytes). AFFECTED real
-models: pixart (hidden 1152), hydit (1408), cogvideox-2b (1920), minimax_h3
-(fc2 K=1152, ~17%), boogu (3360, ~87% passthrough), omnigen2 (2520 fails even
-K%16). Expect low-compression warnings for these. Full table in README.md
-"Real-model dimension audit". Krea2 and Z-Image have official Comfy-Org
-int8_convrot (int8_tensorwise + convrot 256) checkpoints on HF.
+### INT8 (new, int8_tensorwise)
 
-## Architecture registry
+- `{layer}.weight` int8 [N, K], `{layer}.weight_scale` fp32 [N, 1]
+  (rowwise absmax / 127, clamp min 1e-30; [N, 1] so eager and CUDA backends
+  both broadcast; matches eager `quantize_int8_rowwise`, golden digests in
+  `_test_int8_golden`)
+- Metadata: `{"format": "int8_tensorwise"}` only. No ConvRot, no K constraint.
+  This is the universal fallback tier and the fix for Boogu/OmniGen2.
+- Measured weight error ~0.005. Comfy-Org ships the same rowwise scheme in
+  its `*_int8_convrot` checkpoints (those add convrot=true; we do not).
 
-The script embeds 43 policy families covering all 98 ComfyUI model classes at
-the research revision `bdcb886a4705a03cf40f4a7226de9fc7c059fc90`. Detection
-signatures mirror ComfyUI's `detect_unet_config`. Each family has its own
-quantize / keep / exclude patterns and validation thresholds. Generic fallback
-only after explicit `--architecture`.
+## Mixed mode design
 
-Z-Image / Lumina2 real naming (used by `sickOllie_zTurbo`): `attention.qkv` and
-`attention.out`, `feed_forward.w1/w2/w3`, `context_refiner`, `noise_refiner`,
-`adaLN_modulation` (capitalization matters; universal exclude has both cases).
-Do not rename these patterns back to `attn.qkv` / `mlp.w1`; that broke real
-checkpoints in v1.1.1.
+`MixedPlanner` (in the converter): per-layer candidate evaluation (quantize +
+dequantize each eligible format, error vs source and vs calibration
+activations when present), cheapest-acceptable selection under the profile's
+per-layer gate, then a greedy promotion loop (best error reduction per extra
+byte) until the global mean gate passes. Selection and promotion mutate
+`TensorDecision.format` / `.convrot_groupsize` and must run BEFORE
+`build_output_entries` (output shapes and offsets depend on per-layer
+formats).
 
-Boogu / OmniGen2 real naming (verified against the published checkpoints,
-v1.2.1):
-- Boogu-Image-0.1 (Base/Turbo/Edit, Comfy-Org repack, prefix-less):
-  `double_stream_layers.N.img_self_attn.to_q`, `.img_instruct_attn.processor.img_to_q`,
-  `.img_feed_forward.linear_1/2/3`, `.instruct_feed_forward.linear_1/2/3`,
-  `single_stream_layers.N.attn.to_q`, `single_stream_layers.N.feed_forward.linear_1/2/3`,
-  plus `context_refiner` / `noise_refiner` / `ref_image_refiner` with
-  `attn.to_q` / `feed_forward.linear_1/2/3`. Modulation linears
-  (`img_normN.linear`, `instruct_normN.linear`, `single_stream_layers.N.norm1.linear`,
-  `noise_refiner.N.norm1.linear`, `ref_image_refiner.N.norm1.linear`) and
-  `norm_out.linear_1/2` are kept at original precision.
-- OmniGen2 (BAAI/OmniGen2): `layers.N.attn.to_q/to_k/to_v/to_out.0`,
-  `layers.N.feed_forward.linear_1/2/3`, same refiners. Its hidden dim is 2520,
-  which fails the W4A8 `K % 16 == 0` rule; only `feed_forward.linear_2`
-  (K=10240) layers quantize, the rest pass through with a recorded reason.
-Boogu is its own family (not an omnigen2 alias); detection is disambiguated by
-`img_self_attn` / `img_feed_forward` / `processor` keys before the omnigen2
-`layers.0.attn.to_q` check.
+Profiles (`MIXED_PROFILE_DEFAULTS`):
+
+| Profile | layer gate | global gate | notes |
+| ------- | ---------: | ----------: | ----- |
+| balanced | 0.10 | 0.08 | GPU default via `--profile auto` |
+| conservative | 0.05 | 0.04 | CPU default via `--profile auto` |
+| size-first | 0.15 | 0.10 | admits W4A4 (~0.14 error) |
+
+Gate defaults are anchored to the measured W4A8 weight error (~0.073). Do not
+"improve" them without re-measuring on real dims. `--quality-gate` and
+`--global-error-gate` override; without calibration the gates use weight-only
+error and the planner warns.
 
 ## Environment
 
-The working tree is kept clean of large artifacts. No `.venv` and no model
-checkpoints are stored locally; both are recreated on demand.
-
-```bash
-uv venv .venv
-uv pip install --python .venv/bin/python -r requirements.txt
-# optional, only for ComfyUI loader reproduction (research/ComfyUI):
-uv pip install --python .venv/bin/python comfy-kitchen comfy-aimdo pillow \
-    tqdm torchaudio opencv-python transformers psutil av einops requests
-```
-
-Expected versions: torch 2.13.0+cu130, safetensors 0.8.0, comfy-kitchen 0.2.27,
-comfy-aimdo 0.4.13. There is no pip module inside the venv; install with `uv
-pip install --python .venv/bin/python PKG`.
-
-- GPU: quantization defaults to CPU
-  (`--device auto`), which is deterministic and matches the golden vectors.
-  `--device cuda` is faster; the codebook subsample is device-dependent, so
-  CUDA output differs from CPU output (both valid).
-- `research/comfy-kitchen`: checkout at `aa1ab22` (the PR #90 merge commit).
-- `research/ComfyUI`: checkout at `v0.30.0` with the loader patch applied in the
-  working tree (do not reset unless you re-apply the patch). Used for loader
-  reproduction, not by the converter.
+Same as main: uv venv, no model checkpoints stored locally. GPU is an RTX
+3050; `--device cuda` works for quantization and CUDA smoke tests run for
+real here. `research/ComfyUI` is v0.30.0 + loader patch (gitignored, do not
+reset). `.venv` has torch 2.13.0+cu130 and comfy-kitchen 0.2.28.
 
 ## Common commands
 
 ```bash
-.venv/bin/python comfyui_wxa8_quantizer.py --self-test          # 25/25 required
+.venv/bin/python comfyui_wxa8_quantizer.py --self-test          # 30/30 required
 .venv/bin/python comfyui_wxa8_quantizer.py --list-architectures
 .venv/bin/python comfyui_wxa8_quantizer.py MODEL.safetensors --inspect
-.venv/bin/python comfyui_wxa8_quantizer.py MODEL.safetensors \
-    --output OUT.safetensors --format w4a8 --dry-run
-.venv/bin/python comfyui_wxa8_quantizer.py MODEL.safetensors \
-    --output OUT.safetensors --format w4a8 --device cuda --validate \
-    --report report.txt
-```
 
-Fixture generation and conversion (small, fast, no real models):
+# w4a8 (stable path, unchanged)
+.venv/bin/python comfyui_wxa8_quantizer.py MODEL.safetensors --output OUT.safetensors --format w4a8 --validate
 
-```bash
+# mixed (experimental)
+.venv/bin/python comfyui_wxa8_quantizer.py MODEL.safetensors --output OUT.safetensors --format mixed --profile auto --validate
+.venv/bin/python comfyui_wxa8_quantizer.py MODEL.safetensors --output OUT.safetensors --format mixed --profile size-first --validate
+
+# fixtures
 .venv/bin/python testdata/make_fixtures.py testdata/wan_fixture.safetensors
-.venv/bin/python comfyui_wxa8_quantizer.py testdata/wan_fixture.safetensors \
-    --output testdata/wan_fixture_w4a8.safetensors --format w4a8 --validate
+.venv/bin/python testdata/make_fixtures.py testdata/boogu_real_fixture.safetensors
+.venv/bin/python comfyui_wxa8_quantizer.py testdata/boogu_real_fixture.safetensors     --output testdata/boogu_real_fixture_mixed.safetensors --format mixed --profile balanced --validate
+
+# CUDA regression (real GPU; 9/9 on the RTX 3050)
+.venv/bin/python testdata/cuda_smoke.py
 ```
 
-Families: `sdxl, sd15, flux, wan, minimax_h3, hydit, mmdit_sd3, zimage, boogu, boogu_real, omnigen2` (boogu/omnigen2 use the real state-dict naming; boogu_real uses the real Boogu-Image-0.1-Turbo widths: K=3360 passthrough + K=13568 W4A8).
-`zimage` uses the real Lumina2/Z-Image naming. Reports live in
-`testdata/reports/` (path-sanitized).
-
-Reference results from the real checkpoint (not kept on disk): the user's
-`sickOllie_zTurbo.safetensors` (11.46 GiB bf16) converts to
-`sickOllie_zTurbo_w4a8.safetensors` (3.42 GiB, 170 layers, max relL2 0.0730,
-~4 minutes, relL2 validated). Root-level `*.safetensors` is
-gitignored; do not commit model files. Use `testdata/make_fixtures.py` for
-small regeneration tests instead of real models.
+Expected results on the fixtures: boogu_real mixed = 19 W4A8 + 134 INT8
+layers, 346.69 MiB vs 1.19 GiB input, 328/328 validation checks pass; wan
+mixed balanced = 16 W4A8 + 4 INT8; wan mixed size-first = 10 W4A8 + 9 W4A4 +
+1 INT8 (9.75 MiB).
 
 ## Verification before claiming success
 
-1. `--self-test` must pass 25/25.
-2. Convert affected families from `testdata/make_fixtures.py` with `--validate`;
-   max relL2 should be about 0.073 (chunked path about 0.085). Every quantized
-   layer in the report must show `cgs=256`; layers with K%256 != 0 must appear as
-   passthrough with "divisible by convrot_groupsize=256" in the reason. The
-   report's `-- compression --` section shows the quantized share of
-   policy-targeted 2D bytes plus per-reason buckets; a share below 50% raises
-   the low-compression warning with the failing K values. `--validate` also
-   verifies passthrough tensors byte-identically (auto output dtype) and runs
-   the independent metadata runtime-contract checks.
-3. On a GPU machine run `testdata/cuda_smoke.py` (fused CUDA W4A8 linear at
-   K=256/768/13568, invalid-convrot rejection, mixed boogu_real fixture through
-   the fused kernels). The real-dims fixture is `boogu_real_fixture` (K=3360
-   passthrough + K=13568 W4A8, full ComfyUI inventory); `testdata/comfyui_smoke.py`
-   performs the full ComfyUI one-step forward on the real checkpoint.
-4. `--fail-on-low-compression` / `--min-quantized-byte-fraction` abort low-value
-   conversions; `--group-size` is restricted to 16 (the only validated config).
-5. For converter changes, the CI matrix runs self-tests and fixture
-   conversions (wan, boogu, boogu_real) on ubuntu / windows / macos on every
-   push; the optional cuda-smoke workflow targets a self-hosted GPU runner.
-6. For loader questions, reproduce with the real ComfyUI path:
-   `PYTHONPATH=research/ComfyUI .venv/bin/python` and the flow
-   `load_torch_file -> convert_old_quants -> model_config_from_unet ->
-   get_model -> load_model_weights`, then check that weights are
-   `QuantizedTensor` with `layout=AsymW4A8Int8Layout` and
-   `convrot_groupsize=256`.
+1. `--self-test` must pass 30/30 (includes W4A4/INT8 golden byte digests,
+   eligibility matrix, mixed planning on real Boogu dims, mixed e2e with
+   comfy-kitchen layout reload).
+2. All fixture families must pass `--validate` in BOTH `--format w4a8`
+   (regression; max relL2 about 0.073) and `--format mixed --profile balanced`
+   (0 failed).
+3. `testdata/cuda_smoke.py` must pass 9/9 on a CUDA machine.
+4. CI matrix (ubuntu/windows/macos) runs self-tests, w4a8 fixture conversions,
+   and mixed fixture conversions including a `--validation-only` re-check of a
+   mixed output.
+5. For loader questions, reproduce with the real ComfyUI path:
+   `PYTHONPATH=research/ComfyUI .venv/bin/python`, flow
+   `load_torch_file -> convert_old_quants -> load_diffusion_model_state_dict`,
+   then check weights are `QuantizedTensor` with the expected layout classes
+   (`TensorCoreConvRotW4A4Layout`, `AsymW4A8Int8Layout`, `TensorWiseINT8Layout`).
 
 ## Known behavior, do not "fix" it
 
-- The golden-vector test compares packed int8 and fp8 scales byte-exactly but
-  fp32 `s_channel` / `codebook` with `rtol=1e-4`: torch reductions differ in the
-  last ULPs across platforms (x86 vs ARM, Windows vs Linux). Byte-exact fp32
-  comparison fails CI on macOS/Windows.
-- `--device cuda` and the chunked path (`--max-memory`) produce different but
-  valid codebooks; `deterministic-vs-disk` is skipped for those with a reason.
-- ComfyUI may log `unet unexpected: [...comfy_quant...]` on builds with dynamic
-  VRAM loading. The markers are consumed during detection; the warning is
-  benign and documented in the README. It is a ComfyUI-side artifact, not a
-  checkpoint problem.
-- Only 2D linear weights are quantized. Convolutions, embeddings, norms, heads,
-  and modulations pass through at original precision with the reason recorded.
+- `unpack_w4` is the unsigned W4A8 codec; W4A4 dequant uses
+  `unpack_int4_signed` (signed nibbles [-8, 7]). They are different on purpose.
+- INT8 `weight_scale` is [N, 1], not [N]. [N] breaks the eager backend
+  (`q.float() * scale` fails to broadcast) and the [N, 1] form works on eager
+  and CUDA. The runtime-contract validator accepts both shapes for
+  backwards-compatible reading.
+- The w4a8-only mode must stay byte-identical to main. Any refactor of shared
+  code (quantize dispatch, output entries, engine writers, metadata builders,
+  plan_from_output, Validator) must keep `--format w4a8` outputs unchanged;
+  the golden-vector and deterministic-conversion self-tests guard this.
+- ConvRot for W4A8 is 256-only. W4A4 may use cgs 16/64/256 per layer.
+- Only 2D linear weights are quantized. Convolutions, embeddings, norms,
+  heads, and modulations pass through with the reason recorded.
+- Fixtures are gitignored (`testdata/*.safetensors`); reports and the
+  `boogu_real_fixture_mixed` golden output artifacts follow the repo rules:
+  keep the tree clean of large artifacts, commit reports under
+  `testdata/reports/`.
 - Pickle inputs require `--trust-pickle`. Outputs never overwrite inputs.
 
 ## Editing and docs conventions
 
-- The converter is one file. There is no `build/` part structure anymore; edit
-  `comfyui_wxa8_quantizer.py` directly with exact-string edits and recompile.
-- Docs: README.md is the only markdown file (research notes, metadata spec,
-  compatibility matrix, limitations, troubleshooting are folded into it).
-  Keep it humanizer-clean: no em dashes, no AI vocabulary, no rule-of-three
-  padding, plain technical prose. Other markdown files were deleted on purpose.
-- Commit messages summarize behavior and evidence. Push with
-  `git push origin main`; CI runs automatically.
-- The loader patch is generated from ComfyUI PR #15308 head `8c3a2b27`; when the
-  PR merges upstream, the README prerequisites and the patch file need updating.
+- One converter file. Edit with exact-string edits and recompile.
+- README.md is the only markdown file. Humanizer-clean: no em dashes, no AI
+  vocabulary, no rule-of-three padding, plain technical prose.
+- Commit messages summarize behavior and evidence. This branch is
+  experimental; do not push to main.
+- The ComfyUI W4A4/INT8 loader contracts were verified against the installed
+  comfy-kitchen 0.2.28 (eager implementations) and ComfyUI v0.30.0+patch
+  (`comfy/ops.py` layer_conf parsing: convrot_w4a4 reads convrot_groupsize,
+  hard-codes quant_group_size 64, reads linear_dtype; int8_tensorwise reads
+  weight_scale plus optional convrot fields).
 
 ## User context
 
 The user runs ComfyUI on Windows at `C:\Comfyui\ComfyUI` (v0.30.0 plus 23
-commits, `g0ab8332bfa`, comfy-kitchen 0.2.27) with the loader patch applied.
-PR #15308 merged upstream on 2026-08-07 (ComfyUI v0.31.0), so after the next
-ComfyUI update the patch can and should be removed: v0.31.0+ loads W4A8
-natively.
-The user tests with `sickOllie_zTurbo.safetensors` there; expect questions about
-load warnings and VRAM behavior.
+commits) with the loader patch. ComfyUI >= v0.31.0 loads all three formats
+natively. The real Boogu-Image-0.1-Turbo (hidden 3360, FFN 13568) is the
+primary target: mixed balanced turns the 364 previously-BF16 layers into
+INT8, bringing the output from ~16 GB to ~9.6 GB while keeping the 54
+K=13568 layers at W4A8.
