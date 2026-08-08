@@ -5,8 +5,8 @@ quantized checkpoints for ComfyUI. It supports two modes:
 
 * `--format w4a8`: the stable single-format path. Every quantized layer uses
   `asym_w4a8_int8` (ConvRot 256, group 16, Lloyd-Max codebook).
-* `--format mixed`: the experimental per-layer optimizer. Each layer gets the
-  cheapest ComfyUI-native format that stays inside a quality gate, chosen from
+* `--format mixed`: the per-layer optimizer. Each layer gets the cheapest
+  ComfyUI-native format that stays inside a quality gate, chosen from
   `convrot_w4a4`, `asym_w4a8_int8`, and `int8_tensorwise`. Layers that cannot
   meet the gate stay at original precision.
 
@@ -15,9 +15,9 @@ or comfy-kitchen code at runtime. Inspection, detection, quantization, packing,
 metadata, and validation are reimplemented inside the file from verified
 reference behavior. See [Research basis](#research-basis).
 
-The mixed mode lives on the experimental branch `experimental/mixed-precision`
-and is not yet merged to main. The w4a8 path on this branch is byte-identical
-to main v1.3.0 (golden vectors prove it).
+Current version: `1.4.0-experimental`. The mixed mode is merged into main.
+The w4a8 path remains byte-identical to v1.3.0; the golden-vector self-tests
+enforce that.
 
 ## Contents
 
@@ -29,6 +29,7 @@ to main v1.3.0 (golden vectors prove it).
 * [Profiles and gates](#profiles-and-gates)
 * [Main options](#main-options)
 * [Output format and metadata](#output-format-and-metadata)
+* [Runtime compatibility](#runtime-compatibility)
 * [Architecture support](#architecture-support)
 * [Validation](#validation)
 * [Known limitations](#known-limitations)
@@ -51,16 +52,16 @@ architectures fail that rule:
 | Boogu | 3360 | no | no | yes |
 | OmniGen2 | 2520 | no | no | yes |
 
-W4A4 needs `K % 64 == 0` (int4 MMA kernel contract) and Boogu's 3360 and
-OmniGen2's 2520 fail even that. INT8 has no shape requirement at all, so it
-closes the coverage gap. In mixed mode, a Boogu checkpoint that used to keep
-364 of 418 layers in BF16 keeps none of them at full precision: the K=3360
-layers become rowwise INT8 and only policy-protected layers stay BF16.
+W4A4 needs `K % 64 == 0` (int4 MMA kernel contract). Boogu's 3360 and
+OmniGen2's 2520 fail even that. INT8 has no shape requirement, so it closes
+the coverage gap. In mixed mode, a Boogu checkpoint that used to keep 364 of
+418 layers in BF16 keeps none of them at full precision: the K=3360 layers
+become rowwise INT8 and only policy-protected layers stay BF16.
 
 Measured on identical weights (K=768): W4A4 weight error 0.142, W4A8 0.070,
-INT8 0.005. W4A4 is about twice as noisy as the W4A8 codebook path, so the
-profiles treat it as a size-first tier, W4A8 as the balanced workhorse, and
-INT8 as the quality and coverage tier.
+INT8 0.005. W4A4 is roughly twice as noisy as the W4A8 codebook path, so the
+profiles use it only where size matters. INT8 is the quality and coverage
+tier.
 
 ## Requirements
 
@@ -88,7 +89,7 @@ uv pip install --python .venv/bin/python comfy-aimdo pillow \
 .venv/bin/python comfyui_wxa8_quantizer.py MODEL.safetensors \
     --output OUT.safetensors --format w4a8 --validate
 
-# experimental mixed mode, automatic GPU/architecture detection
+# mixed mode, automatic GPU/architecture detection
 .venv/bin/python comfyui_wxa8_quantizer.py MODEL.safetensors \
     --output OUT_mixed.safetensors --format mixed --profile auto --validate
 ```
@@ -107,6 +108,8 @@ Quick checks:
 
 ## Mixed mode design
 
+### Candidate evaluation
+
 The planner replaces the binary quantize-or-keep decision with per-layer
 candidate evaluation. For every policy-targeted 2D linear weight it evaluates
 each eligible format:
@@ -121,6 +124,8 @@ Selection is "cheapest acceptable": the smallest candidate whose error is
 below the profile's per-layer gate wins. If no candidate passes, the layer
 stays at original precision with the reason recorded.
 
+### Selection, promotion, and hard gates
+
 After local selection, a global gate runs on the parameter-weighted mean
 error over all selected layers (a huge FFN counts more than a small
 projection). If it fails, the planner promotes greedily: it repeatedly
@@ -132,17 +137,17 @@ in the report and in the console warnings.
 The gates are hard. A plan that cannot meet its gates is not published:
 QualityGateError and CompressionGateError abort the conversion with the
 measured numbers, the largest contributors, and the override that would let
-it through (for example a quality failure reports the remaining quantized
-formats and the top error layers; a compression failure reports the kept
-share and the largest kept layers). A plan that quantizes nothing is rejected
-as a passthrough-only checkpoint.
+it through (a quality failure reports the remaining quantized formats and
+the top error layers; a compression failure reports the kept share and the
+largest kept layers). A plan that quantizes nothing is rejected as a
+passthrough-only checkpoint.
 
 The global quality metric covers the ENTIRE targeted set: layers kept at
 original precision contribute error 0 while their parameters stay in the
 denominator. The report shows both the targeted weighted error (the optimizer
 metric) and the quantized-subset weighted error (diagnostic).
 
-Eligibility rules per format:
+### Eligibility
 
 * `convrot_w4a4`: K % 64 == 0 and K % cgs == 0, cgs picked per layer as the
   largest power of 4 in {16, 64, 256} dividing K.
@@ -154,38 +159,30 @@ candidate set, which is useful for A/B experiments.
 
 The `linear_dtype` field of `convrot_w4a4` is an execution property, not a
 quality fallback. It selects the int4 or int8 activation path in ComfyUI and
-never changes the stored 4-bit weights. The default is `int8`. One caveat:
-the comfy-kitchen eager backend accepts both values but always executes the
-int4 activation path; `linear_dtype=int8` only changes the CUDA kernels. The
+never changes the stored 4-bit weights. The default is `int8`. The
+comfy-kitchen eager backend accepts both values but always executes the int4
+activation path; `linear_dtype=int8` only changes the CUDA kernels. The
 planner's runtime metric simulates the selected variant, so a CPU-only
 conversion evaluates the int4 path.
 
-`--target-runtime` feeds a real capability matrix into the planner.
-Eligibility is per format and per backend, with hardware data from the
-environment probe (GPU name, CUDA compute capability, ROCm architecture).
-Acceleration is never assumed: formats are "expected accelerated (not
-certified)", "eager/fallback", or "runtime-certified" after a certificate
-proves it on the actual target machine. On AMD, acceleration is only
-expected on matrix-core-capable architectures (gfx11/gfx12 and the CDNA
-gfx9 parts); RDNA1/2 stay on fallback paths, matching ComfyUI's gating. A
-format the target runtime cannot run is excluded from the candidates with
-the reason recorded, and the report lists loadable/executable/accelerated/
-certified per format.
+### Runtime capabilities
 
-## Profiles and gates
+`--target-runtime` feeds a capability matrix into the planner. Eligibility is
+per format and per backend, with hardware data from the environment probe
+(GPU name, CUDA compute capability, ROCm architecture). Acceleration is never
+assumed: formats are "expected accelerated (not certified)",
+"eager/fallback", or "runtime-certified" after a certificate proves it on the
+actual target machine. On AMD, acceleration is only expected on
+matrix-core-capable architectures (gfx11/gfx12 and the CDNA gfx9 parts);
+RDNA1/2 stay on fallback paths, matching ComfyUI's gating. A format the target
+runtime cannot run is excluded from the candidates with the reason recorded,
+and the report lists loadable/executable/accelerated/certified per format.
 
-| Profile | Layer gate | Global mean gate | B/param target | Max original share |
-| ------- | ---------: | ---------------: | -------------: | -----------------: |
-| balanced | 0.10 | 0.08 | 0.90 | 5% |
-| conservative | 0.05 | 0.04 | 1.05 | 2% |
-| size-first | 0.15 | 0.10 | 0.75 | 10% |
+### Calibration metric and W4A4 dispatch
 
-The defaults are set against measured W4A8 behavior: the codebook path has
-weight-only relL2 around 0.073, so the balanced global gate sits just above it
-and the conservative gate sits below it. `--quality-gate F` and
-`--global-error-gate F` override both. Without calibration the gates use
-weight-only reconstruction error and the planner prints a warning;
-`--calibration-source` switches them to runtime-output error.
+Without calibration the gates use weight-only reconstruction error and the
+planner prints a warning; `--calibration-source` switches them to
+runtime-output error.
 
 The calibration metric is the real quantized operation, not a
 reconstructed-weight approximation. For every candidate the planner emulates
@@ -215,6 +212,19 @@ implementation in `testdata/runtime_equivalence.py` (exact output agreement
 0 to 5e-8 for W4A4-A4, W4A8, and INT8 across the awkward K matrix; the W4A4
 A8 mode is CUDA-only and its quality-vs-BF16 agreement with the CUDA kernels
 is checked in `testdata/cuda_smoke.py`).
+
+## Profiles and gates
+
+| Profile | Layer gate | Global mean gate | B/param target | Max original share |
+| ------- | ---------: | ---------------: | -------------: | -----------------: |
+| balanced | 0.10 | 0.08 | 0.90 | 5% |
+| conservative | 0.05 | 0.04 | 1.05 | 2% |
+| size-first | 0.15 | 0.10 | 0.75 | 10% |
+
+The defaults are set against measured W4A8 behavior: the codebook path has
+weight-only relL2 around 0.073, so the balanced global gate sits just above it
+and the conservative gate sits below it. `--quality-gate F` and
+`--global-error-gate F` override both.
 
 Compression is enforced, not advisory. `--max-linear-bytes-per-param F`
 replaces the profile's effective bytes/parameter target and
@@ -303,7 +313,7 @@ loadable/executable/accelerated status, and a `quality_validation` block
 with a certification level. The v2 revision is `mixed-r1`, never the W4A8
 revision.
 
-Certification levels are explicit and never overstated:
+Certification levels:
 
 | Level | Meaning |
 | ----- | ------- |
@@ -350,7 +360,7 @@ closed unless `--architecture` is given.
 
 ## Validation
 
-* `--self-test`: 37 embedded checks, including golden vectors for W4A4 and
+* `--self-test`: 38 embedded checks, including golden vectors for W4A4 and
   INT8 (embedded reference weight so every platform quantizes the same
   input; packed nibbles compared with a 99.5% agreement bound for the
   BLAS-dependent Hadamard rotation, fp32 scales with rtol 1e-4, matching the
@@ -384,14 +394,13 @@ closed unless `--architecture` is given.
   original and the quantized checkpoint through real ComfyUI, runs the
   denoiser on identical synthetic inputs at several timesteps, and reports
   relative L2, cosine, SNR, and max error per timestep against a threshold.
-  This is what earns the "model-verified" label; run it on the target
-  machine with real checkpoints.
+  A passing run on the target machine earns the "model-verified" label.
 * `testdata/comfyui_patch_smoke.py`: LoRA / offload / low-VRAM integration
   smoke for real mixed checkpoints. Applies and removes a LoRA, offloads and
   reloads the model under normal, dynamic and low-VRAM modes, asserts every
   transition keeps finite outputs and the per-layer layouts matching the
-  metadata. This is the coverage for ComfyUI issue #14642-class
-  requantization bugs; it needs the target machine.
+  metadata. Covers ComfyUI issue #14642-class requantization bugs; needs the
+  target machine.
 * `tools/runtime_certify.py` and `tools/certified_convert.py`: the runtime
   certificate generator and the staging/publishing orchestrator described
   under Runtime compatibility.
@@ -445,8 +454,8 @@ closed unless `--architecture` is given.
   and should be benchmarked per model.
 * Checkpoints that mix W4A4 with LoRA or dynamic offload have not been
   tested. Issue #14642 (INT8 ConvRot requantized as plain tensorwise on LoRA
-  offload) was a ComfyUI-side bug and is closed, but it is a reminder that
-  quantized weights interact with the patching machinery.
+  offload) was a ComfyUI-side bug and is closed; it still marks quantized
+  weights as interacting with the patching machinery, so test per model.
 
 ## Research basis
 
