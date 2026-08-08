@@ -172,8 +172,10 @@ reset). `.venv` has torch 2.13.0+cu130 and comfy-kitchen 0.2.28.
 # w4a8 (stable path, unchanged)
 .venv/bin/python comfyui_wxa8_quantizer.py MODEL.safetensors --output OUT.safetensors --format w4a8 --validate
 
-# mixed (experimental)
+# mixed
 .venv/bin/python comfyui_wxa8_quantizer.py MODEL.safetensors --output OUT.safetensors --format mixed --profile auto --validate
+# publish-safe conversion (no GPU identity in the checkpoint metadata)
+.venv/bin/python comfyui_wxa8_quantizer.py MODEL.safetensors --output OUT.safetensors --format mixed --strip-gpu-identity --validate
 .venv/bin/python comfyui_wxa8_quantizer.py MODEL.safetensors --output OUT.safetensors --format mixed --profile size-first --validate
 
 # fixtures

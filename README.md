@@ -232,6 +232,7 @@ that misses either aborts with CompressionGateError.
 --w4a4-linear-dtype int4|int8  convrot_w4a4 execution variant (default int8)
 --disable-w4a4 / --disable-w4a8 / --disable-int8
 --require-calibration          refuse planning without activation data
+--strip-gpu-identity          omit GPU name/capability/ROCm from metadata
 --calibration-source PATH      local activation rows (.npz/.pt/.npy/dir)
 --sensitivity-threshold F      legacy w4a8-mode keep-precision threshold
 --max-memory SIZE              per-tensor working budget (default 2G)
@@ -391,6 +392,12 @@ closed unless `--architecture` is given.
 * `tools/runtime_certify.py` and `tools/certified_convert.py`: the runtime
   certificate generator and the staging/publishing orchestrator described
   under Runtime compatibility.
+* `tools/hf_mixed_quantize.py`: Colab-ready script that downloads a model
+  from Hugging Face, converts it with `--target-runtime nvidia` for CUDA
+  inference, strips all GPU identity from the checkpoint metadata
+  (`--strip-gpu-identity`), verifies the strip, and uploads the result plus
+  a generic README to a new repo in the user's HF account (private by
+  default).
 * CI: the GitHub workflows were removed for now and live in git history
   (`ci.yml`, `cuda-smoke.yml`, `nightly-sync.yml`, `release-compat.yml`).
   Until they are restored, run the self-tests, fixture conversions,

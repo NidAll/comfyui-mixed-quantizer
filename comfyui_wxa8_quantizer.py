@@ -2860,7 +2860,15 @@ def detect_architecture(info: CheckpointInfo, override: Optional[str] = None,
         # context dim from the first transformer block's cross-attention to_k
         ctx_dim = None
         lin_attn = False
-        for probe in ("input_blocks.1.0.transformer_blocks.0.attn2.to_k.weight",
+        # real checkpoints place the transformer sub-block at index 1
+        # (input_blocks.1.1 / 2.1 / middle_block.1); the synthetic fixtures
+        # use index 0. Probe the real layouts first, then fall back.
+        for probe in ("input_blocks.1.1.transformer_blocks.0.attn2.to_k.weight",
+                      "input_blocks.2.1.transformer_blocks.0.attn2.to_k.weight",
+                      "input_blocks.4.1.transformer_blocks.0.attn2.to_k.weight",
+                      "input_blocks.5.1.transformer_blocks.0.attn2.to_k.weight",
+                      "middle_block.1.transformer_blocks.0.attn2.to_k.weight",
+                      "input_blocks.1.0.transformer_blocks.0.attn2.to_k.weight",
                       "input_blocks.1.0.transformer_blocks.0.attn2.q.weight",
                       "input_blocks.2.0.transformer_blocks.0.attn2.to_k.weight"):
             shp = shape_lookup(prefix + probe)
@@ -5154,6 +5162,7 @@ def _plan_hash(info: CheckpointInfo, plan: ConversionPlan, args: Any,
         "max_linear_bytes_per_param": getattr(args, "max_linear_bytes_per_param", None),
         "max_bf16_fraction": getattr(args, "max_bf16_fraction", None),
         "w4a4_linear_dtype": getattr(args, "w4a4_linear_dtype", "int8"),
+        "strip_gpu_identity": getattr(args, "strip_gpu_identity", False),
         "runtime_backend": getattr(args, "_effective_runtime", "auto"),
         "runtime_gpu": (getattr(args, "_runtime_gpu_name", None)
                         or getattr(args, "_effective_runtime", None)),
@@ -5733,6 +5742,30 @@ def _architecture_dims_fingerprint(info: CheckpointInfo,
     return {"dims_2d_k": ordered, "n_2d_float": sum(counter.values())}
 
 
+def _w4a4_runtime_block(plan: ConversionPlan, args: Any) -> Dict[str, Any]:
+    """Namespaced W4A4 runtime record. With --strip-gpu-identity the hardware
+    identity fields (GPU name, compute capability, ROCm architecture) are
+    omitted so the checkpoint can be published without revealing the target
+    or conversion machine."""
+    mp = plan.mixed_plan or {}
+    strip = bool(getattr(args, "strip_gpu_identity", False))
+    block = {
+        "requested_linear_dtype": mp.get(
+            "w4a4_linear_dtype", DEFAULT_W4A4_LINEAR_DTYPE),
+        "target": mp.get("runtime_backend"),
+        "effective_activation_bits": "per candidate (see report)",
+        "certified": bool(mp.get("runtime", {}).get("runtime_certified")),
+        "note": "custom fields live in the namespaced extension "
+                "block only; official ComfyUI metadata stays native",
+    }
+    if not strip:
+        runtime = mp.get("runtime") or {}
+        block["gpu"] = runtime.get("gpu_name")
+        block["cuda_capability"] = runtime.get("cuda_capability")
+        block["rocm_arch"] = runtime.get("rocm_arch")
+    return block
+
+
 def build_extension_metadata(info: CheckpointInfo, plan: ConversionPlan,
                              env: EnvironmentInfo, args: Any,
                              calibration: Optional[CalibrationStats],
@@ -5814,23 +5847,7 @@ def build_extension_metadata(info: CheckpointInfo, plan: ConversionPlan,
             "layer_gate": mp.get("layer_gate"),
             "global_gate": mp.get("global_gate"),
             "runtime_backend": mp.get("runtime_backend"),
-            "w4a4_runtime": {
-                "requested_linear_dtype": (plan.mixed_plan or {}).get(
-                    "w4a4_linear_dtype", DEFAULT_W4A4_LINEAR_DTYPE),
-                "target": (plan.mixed_plan or {}).get(
-                    "runtime_backend"),
-                "gpu": (plan.mixed_plan or {}).get("runtime", {}).get(
-                    "gpu_name"),
-                "cuda_capability": (plan.mixed_plan or {}).get(
-                    "runtime", {}).get("cuda_capability"),
-                "rocm_arch": (plan.mixed_plan or {}).get(
-                    "runtime", {}).get("rocm_arch"),
-                "effective_activation_bits": "per candidate (see report)",
-                "certified": bool((plan.mixed_plan or {}).get(
-                    "runtime", {}).get("runtime_certified")),
-                "note": "custom fields live in the namespaced extension "
-                        "block only; official ComfyUI metadata stays native",
-            },
+            "w4a4_runtime": _w4a4_runtime_block(plan, args),
             "quality_validation": {
                 "level": ("calibrated" if calibration is not None
                           else "unverified"),
@@ -7241,6 +7258,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--require-runtime-certificate", action="store_true",
                    help="mixed mode: refuse conversion unless every selected "
                         "format is runtime-certified on the target machine")
+    p.add_argument("--strip-gpu-identity", action="store_true",
+                   help="omit GPU identity (device name, compute capability, "
+                        "ROCm architecture) from the checkpoint extension "
+                        "metadata, for publishing converted checkpoints "
+                        "without revealing the target or conversion machine")
     p.add_argument("--quality-gate", type=float, default=None, metavar="F",
                    help="mixed mode: per-layer error gate override (relL2 "
                         "fraction; default from the profile)")
@@ -7565,6 +7587,7 @@ def run_self_tests() -> int:
         ("mixed-determinism", _test_mixed_determinism),
         ("mixed-metadata-fuzz", _test_mixed_metadata_fuzz),
         ("architecture-sync", _test_architecture_sync),
+        ("strip-gpu-identity", _test_strip_gpu_identity),
         ("fail-on-low-compression", _test_fail_on_low_compression),
         ("architecture-detection-safety", _test_detection_safety),
         ("golden-vectors-vs-reference", _test_golden_vectors),
@@ -9313,6 +9336,50 @@ def _test_mixed_metadata_fuzz() -> str:
                                            if c["status"] == "failed"}
     return ("W4A4/INT8/mixed metadata corruption rejected: bad cgs, K%64, "
             "missing scale, wrong scale shape, format/tensor mismatch")
+
+
+
+
+def _test_strip_gpu_identity() -> str:
+    """--strip-gpu-identity must remove GPU identity from the extension
+    metadata (device name, compute capability, ROCm architecture) so a
+    published checkpoint never reveals the target or conversion machine."""
+    d = _tmpdir()
+    src_path = os.path.join(d, "mini.safetensors")
+    _make_mini_checkpoint(src_path)
+    info = discover_checkpoint(src_path)
+    det = detect_architecture(
+        info, shape_lookup=lambda n: (info.by_name(n).shape if info.by_name(n) else None))
+    dec = classify_tensors(info, det, FORMAT_MIXED, None, [], [], [], None, None)
+    planner = MixedPlanner("balanced", None, 2 * 1024**3, torch.device("cpu"), None)
+    summary = planner.plan(info, dec)
+    plan = ConversionPlan(fmt=FORMAT_MIXED, detection=det, decisions=dec,
+                          metadata_quant={}, metadata_ext={}, output_entries=[])
+    plan.mixed_plan = summary
+    plan.mixed_plan["runtime"] = {
+        "gpu_name": "NVIDIA GeForce RTX 3050", "cuda_capability": [8, 6],
+        "rocm_arch": None, "runtime_certified": False,
+        "formats": {}, "backend": "nvidia"}
+    plan.mixed_plan["runtime_backend"] = "nvidia"
+    args = _selftest_args("x.safetensors", FORMAT_MIXED, extra={
+        "format": "mixed", "strip_gpu_identity": True})
+    hashes = hash_checkpoint_files(info)
+    ext = build_extension_metadata(info, plan, inspect_environment(), args,
+                                   None, None, hashes, "0" * 64, {}, [])
+    block = ext["quantization"]["w4a4_runtime"]
+    assert "gpu" not in block and "cuda_capability" not in block \
+        and "rocm_arch" not in block, block
+    blob = json_dumps(ext)
+    for bad in ("3050", "GeForce", "RTX"):
+        assert bad not in blob, f"GPU identity leaked: {bad}"
+    args2 = _selftest_args("x.safetensors", FORMAT_MIXED, extra={
+        "format": "mixed", "strip_gpu_identity": False})
+    ext2 = build_extension_metadata(info, plan, inspect_environment(), args2,
+                                    None, None, hashes, "0" * 64, {}, [])
+    block2 = ext2["quantization"]["w4a4_runtime"]
+    assert block2.get("gpu") == "NVIDIA GeForce RTX 3050", block2
+    return ("--strip-gpu-identity removes GPU name/capability/ROCm from the "
+            "extension metadata; default keeps them")
 
 
 def _selftest_args(out: str, fmt: str, resume: bool = False, overwrite: bool = False,
