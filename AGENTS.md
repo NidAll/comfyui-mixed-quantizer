@@ -13,7 +13,7 @@ main. `--format w4a8` remains the default and is byte-identical to main
 v1.3.0 (golden vectors and the 37/37 self-test suite prove it).
 
 - Local path: `/home/nidall/projects/testdeepseek/quantizationscripts_w4a8_w3a8`
-- Repo (public): `https://github.com/NidAll/comfyui-w4a8-quantizer`
+- Repo (public): `https://github.com/NidAll/comfyui-mixed-quantizer`
 - Branch: `experimental/mixed-precision` (do not merge to main without review)
 - Script version: `1.4.0-experimental` (`CONVERTER_VERSION`)
 - Audit status: P0 items closed (hard quality/compression gates, BF16
