@@ -342,10 +342,10 @@ closed unless `--architecture` is given.
   determinism, and hashes.
 * `testdata/cuda_smoke.py`: CUDA regression for the fused W4A8 kernels, the
   INT8 non-ConvRot path at K=3360, W4A4 at K=1152 with cgs=16 in both
-  `linear_dtype` variants, and a full mixed checkpoint through the kernels.
-  9/9 checks pass on an RTX 3050. The workflow runs on release tags, pushes
-  to the default branch, and PRs touching the converter, in addition to
-  manual dispatch.
+  `linear_dtype` variants, a full mixed checkpoint through the kernels, and
+  the W4A4 A8-mode simulator-vs-kernel quality check. 10/10 checks pass on
+  an RTX 3050. The workflow runs on release tags, pushes to the default
+  branch, and PRs touching the converter, in addition to manual dispatch.
 * `testdata/comfyui_smoke.py`: real ComfyUI load path for W4A8 and mixed
   checkpoints. It reads the per-layer metadata and asserts each quantized
   module's layout matches its format (TensorCoreConvRotW4A4Layout /
