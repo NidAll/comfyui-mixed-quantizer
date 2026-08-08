@@ -85,10 +85,24 @@ into eligibility: nvidia = all three formats accelerated (verified on the RTX
 3050), amd = HIP/triton paths (not certified here), cpu = eager fallback for
 all three. Capabilities are per-format `FormatRuntimeCapability`
 (loadable/executable/accelerated/backend/reason), never a single boolean.
-The W4A4 simulation is target-accurate via
-`resolve_w4a4_activation_bits`: eager always executes A4 regardless of
-`linear_dtype`, CUDA/HIP honor the request; CandidateResult records
-requested_linear_dtype + effective_activation_bits + backend. Unsupported
+The W4A4 simulation is dispatch-aware via
+`resolve_w4a4_execution_mode` (mirrors the comfy-kitchen CUDA dispatcher:
+int8 -> A8 always; int4 -> native INT4 MMA on SM8x, uncertain on Turing
+SM 7.5, INT8 fallback elsewhere; eager always A4). `W4A4ExecutionMode`
+carries activation_bits/path/certain/reason. Uncertain modes evaluate BOTH
+A4 and A8 and score with the WORST error (never optimistic). A runtime
+certificate (`tools/runtime_certify.py`, `--runtime-certificate`) overrides
+the static model with observed behavior; `--require-runtime-certificate`
+hard-fails when any selected format is not certified. CandidateResult
+records requested_linear_dtype + effective_activation_bits +
+effective_runtime_path + runtime_certified + runtime_certain + backend.
+`RuntimeCapabilities` carries gpu_name/cuda_capability/rocm_arch/torch
+versions/runtime_certified and is built with env data
+(`runtime_capabilities_for(backend, env)`). `FormatRuntimeCapability` uses
+`accelerated: Optional[bool]` + `certified`; describe() distinguishes
+runtime-certified accelerated/fallback, expected accelerated (not
+certified), eager/fallback, and acceleration-unknown. AMD acceleration is
+gated by `rocm_matrix_core_supported` (gfx11/gfx12 + CDNA gfx9). Unsupported
 formats get `eligible=False` with the reason recorded. Before conversion
 `_check_runtime_compatibility` fails closed: every selected format must exist
 in the installed ComfyUI quant_ops registry (when comfy is installed) and
@@ -239,10 +253,28 @@ mixed balanced = 16 W4A8 + 4 INT8; wan mixed size-first = 10 W4A8 + 9 W4A4 +
   the golden-vector and deterministic-conversion self-tests guard this.
 - Extension metadata is schema-versioned: w4a8 outputs use `comfy_wxa8/v1`
   (W4A8-global fields), mixed outputs use `comfy_wxa8/v2` (`mode: mixed`,
-  per-format contracts, distribution, gates, runtime status). Never write
-  W4A8-global fields (fp8 scales, codebook packing) into a v2 block.
-- The global quality metric is the PARAM-WEIGHTED mean over quantized layers.
-  `global_mean_error(info, decisions)` needs `info` now; callers must pass it.
+  per-format contracts, distribution, gates, runtime status, w4a4_runtime
+  block with requested/effective/certified semantics). Never write
+  W4A8-global fields (fp8 scales, codebook packing) into a v2 block, and
+  never put custom fields into official ComfyUI metadata.
+- Original-precision fractions: `original_precision_parameter_fraction` and
+  `original_precision_output_byte_fraction` are distinct and both reported;
+  the hard gate `max_bf16_fraction` limits the OUTPUT BYTE fraction. The CLI
+  alias `--max-original-byte-fraction` is preferred over the legacy
+  `--max-bf16-fraction` name.
+- `decode_w4a8_runtime_weight()` is LOCKED: DO NOT consolidate it with
+  `dequantize_w4a8_weight()`. One returns the runtime-basis INT8 weight, the
+  other the physical FP weight.
+- `W4A4_LINEAR_DTYPE` is gone; the constant is `DEFAULT_W4A4_LINEAR_DTYPE`
+  and the actual value lives on `TensorDecision.linear_dtype` (set when a
+  W4A4 candidate is selected/promoted). Official metadata writes
+  `d.linear_dtype or DEFAULT_W4A4_LINEAR_DTYPE`; extension metadata reads it
+  from `mixed_plan["w4a4_linear_dtype"]`. NEVER mutate module globals from
+  main (the old `globals()["W4A4_LINEAR_DTYPE"]` hack is removed).
+- The global quality metric is the PARAM-WEIGHTED mean over the whole
+  targeted set (`targeted_weighted_error`; original-precision layers count
+  with error 0). `global_mean_error(info, decisions)` needs `info` now;
+  callers must pass it. Promotion logs measure AFTER applying.
 - The calibration metric simulates the runtime operation
   (`runtime_output_rel_l2` / `_simulate_quantized_chunk`): activation
   rotation, activation quantization, scaled GEMM. It is NOT

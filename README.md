@@ -158,11 +158,16 @@ planner's runtime metric simulates the selected variant, so a CPU-only
 conversion evaluates the int4 path.
 
 `--target-runtime` feeds a real capability matrix into the planner.
-Eligibility is per format and per backend: nvidia reports all three formats
-accelerated, amd reports the HIP/triton paths, cpu reports eager fallback for
-every format. A format the target runtime cannot run is excluded from the
-candidates with the reason recorded, and the report lists the support status
-per format (accelerated vs eager fallback vs unsupported).
+Eligibility is per format and per backend, with hardware data from the
+environment probe (GPU name, CUDA compute capability, ROCm architecture).
+Acceleration is never assumed: formats are "expected accelerated (not
+certified)", "eager/fallback", or "runtime-certified" after a certificate
+proves it on the actual target machine. On AMD, acceleration is only
+expected on matrix-core-capable architectures (gfx11/gfx12 and the CDNA
+gfx9 parts); RDNA1/2 stay on fallback paths, matching ComfyUI's gating. A
+format the target runtime cannot run is excluded from the candidates with
+the reason recorded, and the report lists loadable/executable/accelerated/
+certified per format.
 
 ## Profiles and gates
 
@@ -188,12 +193,19 @@ runtime weight; it never multiplies rotated activations by the
 inverse-rotated physical weight). The error is the mean over samples of
 ||Y_quant - Y_bf16|| / ||Y_bf16||.
 
-The W4A4 simulation is target-runtime accurate. The eager backend always
-executes the int4 activation path regardless of `linear_dtype`, so a CPU
-target is evaluated with A4; CUDA/HIP targets honor the requested variant.
-The candidate record stores the requested `linear_dtype`, the effective
-activation bits, and the backend, so the same checkpoint can legitimately
-receive different plans per target runtime.
+The W4A4 simulation is target-runtime accurate and dispatch-aware, mirroring
+the comfy-kitchen CUDA dispatcher: `linear_dtype=int8` always uses the INT8
+activation branch; `linear_dtype=int4` uses native INT4 MMA on SM8x, may use
+the compiled Turing path on SM 7.5, and falls back to INT8 everywhere else.
+The eager backend always executes the int4 activation path regardless of
+`linear_dtype`. When the dispatch is uncertain (Turing, HIP, unknown
+hardware), the planner evaluates BOTH A4 and A8 and scores the candidate
+with the WORST error, so it never optimistically assumes a path it cannot
+prove. A runtime certificate from `tools/runtime_certify.py` overrides the
+static model with observed behavior. The candidate record stores the
+requested `linear_dtype`, the effective activation bits, the dispatch path,
+certainty, certification status, and backend, so the same checkpoint can
+legitimately receive different plans per target runtime.
 
 Every simulator is permanently cross-checked against the real comfy-kitchen
 implementation in `testdata/runtime_equivalence.py` (exact output agreement
@@ -216,7 +228,8 @@ that misses either aborts with CompressionGateError.
 --quality-gate F               per-layer error gate override
 --global-error-gate F          global mean error gate override
 --max-linear-bytes-per-param F hard bytes/parameter target (profile default)
---max-bf16-fraction F          hard original-precision share limit
+--max-bf16-fraction F          hard limit on original-precision output
+                                bytes (alias --max-original-byte-fraction)
 --w4a4-linear-dtype int4|int8  convrot_w4a4 execution variant (default int8)
 --disable-w4a4 / --disable-w4a8 / --disable-int8
 --require-calibration          refuse planning without activation data
@@ -312,6 +325,17 @@ per-format runtime-contract validators remain the verification layer, with a
 warning. `--validate` re-checks the same per-format requirements after the
 conversion.
 
+Static compatibility ("the format exists") is deliberately distinct from
+runtime certification ("the format loaded and forwarded on THIS machine").
+`tools/runtime_certify.py` (a companion script that may import
+comfy-kitchen; the converter stays standalone) executes tiny real operations
+for all three formats and writes a JSON certificate. Pass it with
+`--runtime-certificate` to override W4A4 dispatch guesses with observed
+behavior, or add `--require-runtime-certificate` to refuse conversion unless
+every selected format is certified. `tools/certified_convert.py` orchestrates
+the full chain: convert to a `.staged` file, certify, run the ComfyUI smoke
+and the model-quality gate, and only then atomically publish.
+
 ## Architecture support
 
 The embedded registry keeps its 43 policy families covering all 98 ComfyUI
@@ -360,6 +384,20 @@ closed unless `--architecture` is given.
   relative L2, cosine, SNR, and max error per timestep against a threshold.
   This is what earns the "model-verified" label; run it on the target
   machine with real checkpoints.
+* `testdata/comfyui_patch_smoke.py`: LoRA / offload / low-VRAM integration
+  smoke for real mixed checkpoints. Applies and removes a LoRA, offloads and
+  reloads the model under normal, dynamic and low-VRAM modes, asserts every
+  transition keeps finite outputs and the per-layer layouts matching the
+  metadata. This is the coverage for ComfyUI issue #14642-class
+  requantization bugs; it needs the target machine.
+* `tools/runtime_certify.py` and `tools/certified_convert.py`: the runtime
+  certificate generator and the staging/publishing orchestrator described
+  under Runtime compatibility.
+* CI: `release-compat.yml` certifies against pinned revisions (ComfyUI
+  `344b43989e`, comfy-kitchen 0.2.28) on every release; the nightly workflow
+  tracks ComfyUI and comfy-kitchen main, checks the architecture registry,
+  the three QUANT_ALGOS + scale names, the three layout classes, and runs
+  the simulator equivalence suite against the latest comfy-kitchen.
 * `testdata/comfyui_architecture_sync.py`: compares the embedded registry
   (43 families) with ComfyUI's `supported_models.py` class set. CI runs it
   against the pinned research revision; the nightly workflow runs it against
