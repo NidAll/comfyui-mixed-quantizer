@@ -195,12 +195,15 @@ mixed balanced = 16 W4A8 + 4 INT8; wan mixed size-first = 10 W4A8 + 9 W4A4 +
    randn-generated inputs in new tests), eligibility matrix, mixed planning
    on real Boogu dims, mixed e2e with comfy-kitchen layout reload, hard gate
    failures, BF16 promotion, runtime capability matrix incl. eager-A4 vs
-   CUDA-A8, runtime-output metric vs eager kernels, planner determinism,
-   corrupted heterogeneous metadata rejection, architecture sync.
+   CUDA-A8, runtime-output metric vs eager kernels, planner determinism
+   (mixed-determinism), corrupted heterogeneous metadata rejection
+   (mixed-metadata-fuzz: W4A4 bad cgs / K%64 / missing scale /
+   format-tensor mismatch, INT8 wrong scale dims), architecture sync.
 2. All fixture families must pass `--validate` in BOTH `--format w4a8`
    (regression; max relL2 about 0.073) and `--format mixed --profile balanced`
    (0 failed).
-3. `testdata/cuda_smoke.py` must pass 9/9 on a CUDA machine.
+3. `testdata/cuda_smoke.py` must pass 10/10 on a CUDA machine (includes the
+   W4A4 A8-mode simulator-vs-kernel quality check).
 4. CI matrix (ubuntu/windows/macos) runs self-tests, w4a8 fixture conversions,
    and mixed fixture conversions including a `--validation-only` re-check of a
    mixed output.
@@ -210,7 +213,9 @@ mixed balanced = 16 W4A8 + 4 INT8; wan mixed size-first = 10 W4A8 + 9 W4A4 +
    then check weights are `QuantizedTensor` with the expected layout classes
    (`TensorCoreConvRotW4A4Layout`, `AsymW4A8Int8Layout`, `TensorWiseINT8Layout`).
    `testdata/comfyui_smoke.py` now asserts the layout of every quantized layer
-   against its metadata format for both w4a8 and mixed checkpoints.
+   against its metadata format for both w4a8 and mixed checkpoints, and
+   `--require-format` forces a checkpoint to actually contain the listed
+   formats before the forward runs.
 6. `testdata/comfyui_architecture_sync.py` must pass against the pinned
    ComfyUI revision (CI tarball mode) and against the local
    `research/ComfyUI` checkout when present. The nightly workflow checks
