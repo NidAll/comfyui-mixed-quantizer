@@ -37,6 +37,12 @@ def main() -> int:
     ap.add_argument("--model", required=True,
                     help="converted W4A8 or mixed checkpoint")
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--require-format", action="append", default=[],
+                    choices=["convrot_w4a4", "asym_w4a8_int8",
+                             "int8_tensorwise"],
+                    help="strict mode: the checkpoint must contain this "
+                         "format (repeatable) and it must load with the "
+                         "matching layout")
     args = ap.parse_args()
 
     import torch
@@ -108,6 +114,15 @@ def main() -> int:
             print(f"  - {f}")
         return 2
     print(f"layouts: {layout_counts}")
+    # strict mode: every required format must actually be present and loaded
+    if args.require_format:
+        present = {fmt for fmt in args.require_format
+                   if fmt in layer_formats.values()}
+        missing = [fmt for fmt in args.require_format if fmt not in present]
+        if missing:  # pragma: no cover
+            print(f"FAIL: --require-format missing from the checkpoint: "
+                  f"{missing}")
+            return 2
     if set(layer_formats.values()) - set(EXPECTED_LAYOUTS):
         print(f"WARN: metadata contains unhandled formats: "
               f"{set(layer_formats.values()) - set(EXPECTED_LAYOUTS)}")

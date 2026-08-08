@@ -25,9 +25,11 @@ jobs:
       - name: Install CPU torch (registry import needs torch)
         run: pip install torch --index-url https://download.pytorch.org/whl/cpu
 
-      - name: Compare registry against ComfyUI main
+      - name: Compare registry against ComfyUI main (incl. runtime contract)
         run: |
           python testdata/comfyui_architecture_sync.py \
             --tarball https://codeload.github.com/Comfy-Org/ComfyUI/tar.gz/refs/heads/master \
+            --tarball-kitchen https://codeload.github.com/Comfy-Org/comfy-kitchen/tar.gz/refs/heads/main \
+            --check-runtime-contract \
             --pinned latest-main \
             --json testdata/architecture_sync_latest.json

@@ -12,10 +12,19 @@ Modes:
                      (codeload URL; used by CI when no local checkout exists)
   --pinned REV       ComfyUI revision label for the report (defaults to the
                      converter's COMFYUI_BASE constant)
+  --tarball-kitchen URL
+                     comfy-kitchen source tarball (used with
+                     --check-runtime-contract)
+  --check-runtime-contract
+                     also verify the upstream runtime contract: the three
+                     QUANT_ALGOS names in ComfyUI quant_ops.py and the three
+                     layout classes in comfy-kitchen source. Use against
+                     LATEST upstream (nightly), not the pre-W4A8 pinned
+                     research revision.
 
 Exit codes: 0 = coverage matches or the registry is a superset, 1 = a ComfyUI
-model class is not accounted for by any family policy, 2 = comparison could
-not be run.
+model class is not accounted for by any family policy, or an upstream runtime
+contract regression is detected, 2 = comparison could not be run.
 
 The registry may legally cover MORE classes than the checked revision (older
 revisions keep coverage). It must never cover FEWER. Unknown architectures
@@ -31,6 +40,14 @@ import os
 import sys
 import tarfile
 import urllib.request
+
+
+def requests_get(url: str) -> bytes:
+    if os.path.isfile(url):  # local tarball (testing)
+        with open(url, "rb") as f:
+            return f.read()
+    with urllib.request.urlopen(url, timeout=300) as resp:  # noqa: S310 (CI pin)
+        return resp.read()
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -81,6 +98,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--comfy-src", default=None)
     ap.add_argument("--tarball", default=None)
+    ap.add_argument("--tarball-kitchen", default=None)
+    ap.add_argument("--check-runtime-contract", action="store_true")
     ap.add_argument("--pinned", default=None)
     ap.add_argument("--json", default=None, metavar="PATH")
     args = ap.parse_args()
@@ -125,6 +144,51 @@ def main() -> int:
         "registry_only": extra,
         "ok": ok,
     }
+
+    # ---- upstream runtime-contract monitoring (optional) ----
+    # The three formats must stay registered in ComfyUI quant_ops.py and the
+    # three layout classes must stay present in comfy-kitchen source, or the
+    # mixed checkpoints this converter emits would silently lose their
+    # loading path upstream.
+    REQUIRED_ALGOS = ("convrot_w4a4", "asym_w4a8_int8", "int8_tensorwise")
+    REQUIRED_LAYOUTS = ("AsymW4A8Int8Layout", "TensorCoreConvRotW4A4Layout",
+                        "TensorWiseINT8Layout")
+    if args.check_runtime_contract and args.tarball:
+        import io as _io
+        import tarfile as _tf
+        with _tf.open(fileobj=_io.BytesIO(requests_get(args.tarball)),
+                      mode="r:gz") as tf:
+            qo = next((memb for memb in tf.getmembers()
+                       if memb.name.endswith("/comfy/quant_ops.py")), None)
+            if qo is not None:
+                source = tf.extractfile(qo).read().decode("utf-8")
+                missing_algos = [a for a in REQUIRED_ALGOS if a not in source]
+                result["comfyui_quant_algos"] = {
+                    a: a in source for a in REQUIRED_ALGOS}
+                if missing_algos:
+                    ok = False
+                    result["missing_quant_algos"] = missing_algos
+                    print(f"UPSTREAM RUNTIME REGRESSION: ComfyUI quant_ops.py "
+                          f"no longer registers: {missing_algos}")
+    if args.check_runtime_contract and args.tarball_kitchen:
+        import io as _io
+        import tarfile as _tf
+        with _tf.open(fileobj=_io.BytesIO(requests_get(args.tarball_kitchen)),
+                      mode="r:gz") as tf:
+            py_files = [memb for memb in tf.getmembers()
+                        if memb.name.endswith(".py")]
+            joined = "\n".join(
+                tf.extractfile(m).read().decode("utf-8")
+                for m in py_files)
+            missing_layouts = [l for l in REQUIRED_LAYOUTS
+                               if l not in joined]
+            result["kitchen_layouts"] = {
+                l: l in joined for l in REQUIRED_LAYOUTS}
+            if missing_layouts:
+                ok = False
+                result["missing_layouts"] = missing_layouts
+                print(f"UPSTREAM RUNTIME REGRESSION: comfy-kitchen no longer "
+                      f"contains layouts: {missing_layouts}")
     if args.json:
         with open(args.json, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=2)
