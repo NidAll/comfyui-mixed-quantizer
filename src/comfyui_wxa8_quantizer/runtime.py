@@ -48,6 +48,7 @@ class RuntimeCertificate:
     """Runtime certificate produced by tools/runtime_certify.py on the
     target inference machine: which formats actually loaded and executed,
     with the observed effective W4A4 activation precision."""
+# SPDX-License-Identifier: Apache-2.0
     backend: str
     gpu: Optional[str]
     cuda_capability: Optional[Tuple[int, int]]

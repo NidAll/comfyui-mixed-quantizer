@@ -785,6 +785,7 @@ def _match_signatures(keys: Iterable[str], prefix: str,
                       signatures: Sequence[str]) -> List[str]:
     """Return the signature keys that appear as substrings of some state-dict key
     (with the unet prefix stripped)."""
+# SPDX-License-Identifier: Apache-2.0
     stripped = [k[len(prefix):] if k.startswith(prefix) else k for k in keys]
     found = []
     for sig in signatures:

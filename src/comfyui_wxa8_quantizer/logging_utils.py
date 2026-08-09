@@ -13,6 +13,7 @@ from comfyui_wxa8_quantizer.errors import UsageError
 from comfyui_wxa8_quantizer.utils import _open_regular_nofollow
 class JsonLogHandler(logging.Handler):
     """Emit each record as one JSON line (optional --json-log)."""
+# SPDX-License-Identifier: Apache-2.0
 
     def __init__(self, path: str):
         super().__init__()

@@ -68,7 +68,7 @@ CONVERTER_URL = ("https://raw.githubusercontent.com/NidAll/"
                  "comfyui-mixed-quantizer/"
                  "c4a3b92c73d6220a33b7b859f0160f791afe6f1d/"
                  "comfyui_wxa8_quantizer.py")
-CONVERTER_SHA256 = "5bae38108e40e70b66b203349c2556009a146a95ffb83143e2634f078fcee894"
+CONVERTER_SHA256 = "a75819221430557f1e764784ed9a950e0a9fc8c2a91a1ea26e5ca2f24a891383"
 
 GPU_LEAK_PATTERNS = ("3050", "3060", "3070", "3080", "3090", "4060", "4070",
                      "4080", "4090", "Tesla", "GeForce", "Quadro", "RTX",

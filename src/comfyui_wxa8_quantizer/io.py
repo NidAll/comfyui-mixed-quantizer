@@ -62,6 +62,7 @@ def torch_dtype_from_safe(name: str) -> torch.dtype:
 @dataclass
 class TensorMeta:
     """Header-level information about one tensor (no data loaded)."""
+# SPDX-License-Identifier: Apache-2.0
     name: str
     dtype: torch.dtype
     shape: Tuple[int, ...]

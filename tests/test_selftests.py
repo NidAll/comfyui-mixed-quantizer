@@ -4,6 +4,7 @@ Each embedded self-test runs in its own pytest item so results are reported
 explicitly as PASS (passed), FAIL (raised), or SKIP (pytest.skip inside the
 test). This mirrors the converter's --self-test CLI.
 """
+# SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
 

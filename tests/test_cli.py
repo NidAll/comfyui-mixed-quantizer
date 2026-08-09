@@ -1,4 +1,5 @@
 """CLI-level tests: version, help, verify-output."""
+# SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
 

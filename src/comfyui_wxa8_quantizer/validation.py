@@ -741,6 +741,7 @@ def _fmt_display(fmt: Optional[str]) -> Optional[str]:
 def plan_from_output(output_path: str, detection: DetectionResult,
                      fmt: str, info: Optional[CheckpointInfo] = None) -> ConversionPlan:
     """Reconstruct a minimal plan from an existing output checkpoint (validation-only)."""
+# SPDX-License-Identifier: Apache-2.0
     with safe_open(output_path, framework="pt") as st:
         names = list(st.keys())
         meta = st.metadata() or {}

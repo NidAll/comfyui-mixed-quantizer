@@ -43,6 +43,7 @@ def _quantize_rotated_w4a8_with_codebook(weight: torch.Tensor, group_size: int,
                                          scale_dtype: torch.dtype = torch.float8_e4m3fn,
                                          ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """W4A8 quantization of a rotated weight chunk with a PRE-FIT codebook."""
+# SPDX-License-Identifier: Apache-2.0
     n, k = weight.shape
     groups = k // group_size
     grouped = weight.float().view(n, groups, group_size)

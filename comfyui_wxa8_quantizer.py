@@ -76,6 +76,7 @@ def get_converter_version() -> str:
     set_converter_version) so that plan-hash/resume checks observe changes;
     the self-tests temporarily mutate it to prove version drift is rejected.
     """
+# SPDX-License-Identifier: Apache-2.0
     return _CONVERTER_VERSION
 
 
@@ -145,6 +146,7 @@ TRITON_MIN_VERSION = (3, 7)
 
 class QuantizerError(Exception):
     """Base class for all converter errors."""
+# SPDX-License-Identifier: Apache-2.0
 
 class UsageError(QuantizerError):
     """Bad CLI usage."""
@@ -1929,6 +1931,7 @@ GOLDEN_W4 = GOLDEN["w4a8_default"]
 
 def parse_size(text: str) -> int:
     """Parse a size like 2G, 512M, 1024K or a plain byte count."""
+# SPDX-License-Identifier: Apache-2.0
     m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([KMGTP]?B?)?\s*", text, re.I)
     if not m:
         raise UsageError(f"invalid size {text!r}")
@@ -2092,6 +2095,7 @@ FLOAT_DTYPES = {torch.float32, torch.float16, torch.bfloat16, torch.float64}
 
 class JsonLogHandler(logging.Handler):
     """Emit each record as one JSON line (optional --json-log)."""
+# SPDX-License-Identifier: Apache-2.0
 
     def __init__(self, path: str):
         super().__init__()
@@ -2183,6 +2187,7 @@ def torch_dtype_from_safe(name: str) -> torch.dtype:
 @dataclass
 class TensorMeta:
     """Header-level information about one tensor (no data loaded)."""
+# SPDX-License-Identifier: Apache-2.0
     name: str
     dtype: torch.dtype
     shape: Tuple[int, ...]
@@ -3001,6 +3006,7 @@ def _is_power_of_four(value: int) -> bool:
 
 def build_hadamard(size: int, device: Any = "cpu", dtype: torch.dtype = torch.float32) -> torch.Tensor:
     """Normalized REGULAR orthogonal Hadamard matrix (ConvRot), size = power of 4."""
+# SPDX-License-Identifier: Apache-2.0
     dev = torch.device(device) if not isinstance(device, torch.device) else device
     key = (size, dev, dtype)
     cached = _HADAMARD_CACHE.get(key)
@@ -4199,6 +4205,7 @@ def _match_signatures(keys: Iterable[str], prefix: str,
                       signatures: Sequence[str]) -> List[str]:
     """Return the signature keys that appear as substrings of some state-dict key
     (with the unet prefix stripped)."""
+# SPDX-License-Identifier: Apache-2.0
     stripped = [k[len(prefix):] if k.startswith(prefix) else k for k in keys]
     found = []
     for sig in signatures:
@@ -4564,6 +4571,7 @@ class RuntimeCertificate:
     """Runtime certificate produced by tools/runtime_certify.py on the
     target inference machine: which formats actually loaded and executed,
     with the observed effective W4A4 activation precision."""
+# SPDX-License-Identifier: Apache-2.0
     backend: str
     gpu: Optional[str]
     cuda_capability: Optional[Tuple[int, int]]
@@ -4968,6 +4976,7 @@ def classify_tensors(info: CheckpointInfo, detection: DetectionResult,
                      output_dtype: Optional[torch.dtype],
                      min_numel: Optional[int]) -> List[TensorDecision]:
     """Decide, for every input tensor, whether it is quantized or passed through."""
+# SPDX-License-Identifier: Apache-2.0
     policy = detection.policy
     prefix = detection.unet_prefix
     # effective prefix: if the detected prefix does not actually prefix any key
@@ -5606,6 +5615,7 @@ def _quantize_rotated_w4a8_with_codebook(weight: torch.Tensor, group_size: int,
                                          scale_dtype: torch.dtype = torch.float8_e4m3fn,
                                          ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """W4A8 quantization of a rotated weight chunk with a PRE-FIT codebook."""
+# SPDX-License-Identifier: Apache-2.0
     n, k = weight.shape
     groups = k // group_size
     grouped = weight.float().view(n, groups, group_size)
@@ -5922,6 +5932,7 @@ class MixedPlanner:
     passes. Quality and compression gates are HARD: a plan that cannot meet
     them raises QualityGateError / CompressionGateError instead of silently
     publishing a checkpoint that misses its targets."""
+# SPDX-License-Identifier: Apache-2.0
 
     def __init__(self, profile_name: str,
                  calibration: Optional[CalibrationStats],
@@ -6576,6 +6587,7 @@ def hash_checkpoint_files(info: CheckpointInfo, *, refresh: bool = False) -> Dic
 
 def _portable_file_labels(paths: Sequence[str]) -> List[str]:
     """Stable, non-secret file labels for metadata embedded in moved models."""
+# SPDX-License-Identifier: Apache-2.0
     basenames = [Path(path).name for path in paths]
     if len(set(basenames)) == len(basenames):
         return basenames
@@ -7160,6 +7172,7 @@ class ConversionEngine:
 
 def build_quant_metadata(info: CheckpointInfo, plan: ConversionPlan) -> Dict[str, Any]:
     """Official `_quantization_metadata` payload: {"layers": {layer: conf}}."""
+# SPDX-License-Identifier: Apache-2.0
     layers: Dict[str, Any] = {}
     for d in plan.quantized_layers():
         if d.layer is None:
@@ -7448,6 +7461,7 @@ def compression_stats(info: CheckpointInfo, plan: ConversionPlan,
     precision; the bucket counts show whether ConvRot-256, K%16 shape rules,
     small tensors, sensitivity analysis, or user filters caused it.
     """
+# SPDX-License-Identifier: Apache-2.0
     prefix = detection.unet_prefix
     if not any(k.startswith(prefix) for k in info.key_set()):
         prefix = ""
@@ -8583,6 +8597,7 @@ def _fmt_display(fmt: Optional[str]) -> Optional[str]:
 def plan_from_output(output_path: str, detection: DetectionResult,
                      fmt: str, info: Optional[CheckpointInfo] = None) -> ConversionPlan:
     """Reconstruct a minimal plan from an existing output checkpoint (validation-only)."""
+# SPDX-License-Identifier: Apache-2.0
     with safe_open(output_path, framework="pt") as st:
         names = list(st.keys())
         meta = st.metadata() or {}
@@ -8974,6 +8989,7 @@ def _tmpdir(prefix: str = "wxa8_selftest") -> str:
 
 def _make_mini_checkpoint(path: str, seed: int = 0) -> None:
     """SDXL-shaped mini model: a few linears under model.diffusion_model."""
+# SPDX-License-Identifier: Apache-2.0
     torch.manual_seed(seed)
     sd = {
         "model.diffusion_model.input_blocks.0.0.weight": torch.randn(320, 4, 3, 3) * 0.1,

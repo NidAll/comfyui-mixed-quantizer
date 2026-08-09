@@ -55,6 +55,7 @@ class MixedPlanner:
     passes. Quality and compression gates are HARD: a plan that cannot meet
     them raises QualityGateError / CompressionGateError instead of silently
     publishing a checkpoint that misses its targets."""
+# SPDX-License-Identifier: Apache-2.0
 
     def __init__(self, profile_name: str,
                  calibration: Optional[CalibrationStats],

@@ -14,6 +14,7 @@ from comfyui_wxa8_quantizer.runtime import EnvironmentInfo
 from comfyui_wxa8_quantizer.utils import FLOAT_DTYPES, torch_dtype_name
 def build_quant_metadata(info: CheckpointInfo, plan: ConversionPlan) -> Dict[str, Any]:
     """Official `_quantization_metadata` payload: {"layers": {layer: conf}}."""
+# SPDX-License-Identifier: Apache-2.0
     layers: Dict[str, Any] = {}
     for d in plan.quantized_layers():
         if d.layer is None:

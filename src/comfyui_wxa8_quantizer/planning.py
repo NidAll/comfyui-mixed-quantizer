@@ -65,6 +65,7 @@ def classify_tensors(info: CheckpointInfo, detection: DetectionResult,
                      output_dtype: Optional[torch.dtype],
                      min_numel: Optional[int]) -> List[TensorDecision]:
     """Decide, for every input tensor, whether it is quantized or passed through."""
+# SPDX-License-Identifier: Apache-2.0
     policy = detection.policy
     prefix = detection.unet_prefix
     # effective prefix: if the detected prefix does not actually prefix any key

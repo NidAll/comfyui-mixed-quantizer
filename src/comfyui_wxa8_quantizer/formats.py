@@ -17,6 +17,7 @@ def _is_power_of_four(value: int) -> bool:
 
 def build_hadamard(size: int, device: Any = "cpu", dtype: torch.dtype = torch.float32) -> torch.Tensor:
     """Normalized REGULAR orthogonal Hadamard matrix (ConvRot), size = power of 4."""
+# SPDX-License-Identifier: Apache-2.0
     dev = torch.device(device) if not isinstance(device, torch.device) else device
     key = (size, dev, dtype)
     cached = _HADAMARD_CACHE.get(key)

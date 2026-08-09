@@ -32,6 +32,7 @@ def compression_stats(info: CheckpointInfo, plan: ConversionPlan,
     precision; the bucket counts show whether ConvRot-256, K%16 shape rules,
     small tensors, sensitivity analysis, or user filters caused it.
     """
+# SPDX-License-Identifier: Apache-2.0
     prefix = detection.unet_prefix
     if not any(k.startswith(prefix) for k in info.key_set()):
         prefix = ""

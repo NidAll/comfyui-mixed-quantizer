@@ -6,6 +6,7 @@ LAZILY, only when a self-test calls get_golden(); normal imports never decode
 them. The single-file artifact built by tools/build_single_file.py embeds the
 blob directly so its --self-test stays self-contained.
 """
+# SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
 

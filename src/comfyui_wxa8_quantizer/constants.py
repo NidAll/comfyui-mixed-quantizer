@@ -14,6 +14,7 @@ def get_converter_version() -> str:
     set_converter_version) so that plan-hash/resume checks observe changes;
     the self-tests temporarily mutate it to prove version drift is rejected.
     """
+# SPDX-License-Identifier: Apache-2.0
     return _CONVERTER_VERSION
 
 

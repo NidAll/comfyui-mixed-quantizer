@@ -1,4 +1,5 @@
 """Argument parsing, main entry point and report writing."""
+# SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
 

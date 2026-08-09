@@ -5,6 +5,7 @@ This package is the modular source of the single-file converter artifact
 The package and the artifact share one implementation and produce identical
 outputs.
 """
+# SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
 

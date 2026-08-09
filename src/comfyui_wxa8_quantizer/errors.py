@@ -4,6 +4,7 @@ from __future__ import annotations
 
 class QuantizerError(Exception):
     """Base class for all converter errors."""
+# SPDX-License-Identifier: Apache-2.0
 
 class UsageError(QuantizerError):
     """Bad CLI usage."""

@@ -63,6 +63,7 @@ def _tmpdir(prefix: str = "wxa8_selftest") -> str:
 
 def _make_mini_checkpoint(path: str, seed: int = 0) -> None:
     """SDXL-shaped mini model: a few linears under model.diffusion_model."""
+# SPDX-License-Identifier: Apache-2.0
     torch.manual_seed(seed)
     sd = {
         "model.diffusion_model.input_blocks.0.0.weight": torch.randn(320, 4, 3, 3) * 0.1,

@@ -41,6 +41,7 @@ def hash_checkpoint_files(info: CheckpointInfo, *, refresh: bool = False) -> Dic
 
 def _portable_file_labels(paths: Sequence[str]) -> List[str]:
     """Stable, non-secret file labels for metadata embedded in moved models."""
+# SPDX-License-Identifier: Apache-2.0
     basenames = [Path(path).name for path in paths]
     if len(set(basenames)) == len(basenames):
         return basenames

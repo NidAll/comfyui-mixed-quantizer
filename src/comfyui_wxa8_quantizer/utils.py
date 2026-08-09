@@ -20,6 +20,7 @@ import torch
 from comfyui_wxa8_quantizer.errors import InputError, OutputError, UsageError
 def parse_size(text: str) -> int:
     """Parse a size like 2G, 512M, 1024K or a plain byte count."""
+# SPDX-License-Identifier: Apache-2.0
     m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([KMGTP]?B?)?\s*", text, re.I)
     if not m:
         raise UsageError(f"invalid size {text!r}")
