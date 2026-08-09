@@ -1,0 +1,37 @@
+comfyui-mixed-quantizer
+Copyright (c) 2025 NidAll
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not
+use this software except in compliance with the License. You may obtain a
+copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+License for the specific language governing permissions and limitations
+under the License.
+
+--------------------------------------------------------------------
+Upstream attribution
+
+This project adapts and extends work from the Comfy-Org ecosystem:
+
+* The asym_w4a8_int8 ("W4A8") quantization scheme, its ConvRot layout, and
+  the codebook/scale tensor contracts follow comfy-kitchen PR #90
+  (commit aa1ab2263dc06225d9de6702dfc087313d4bc971) and ComfyUI PR #15308
+  (head 8c3a2b27c37bd34e87b58846baf962407c92843c).
+* The int8_tensorwise rowwise scheme matches the Comfy-Org int8_convrot
+  checkpoint family (without ConvRot).
+* The convrot_w4a4 layout and the W4A4/W4A8/INT8 eager kernels used by the
+  companion tools (tools/runtime_certify.py, testdata/runtime_equivalence.py,
+  testdata/cuda_smoke.py) are implemented in comfy-kitchen
+  (https://github.com/Comfy-Org/comfy-kitchen), Copyright (c) Comfy Org,
+  licensed under the Apache License, Version 2.0.
+
+The standalone converter (comfyui_wxa8_quantizer.py) is original code that
+emits payloads conforming to those upstream contracts; it does not import or
+vendor comfy-kitchen code at runtime. Where upstream code or contracts were
+adapted, the Apache-2.0 license terms of the respective upstream projects
+apply to the adapted portions.
