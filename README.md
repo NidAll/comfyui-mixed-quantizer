@@ -79,8 +79,12 @@ the companion tools that import comfy-kitchen (`tools/runtime_certify.py`,
 
 # sanity checks and model inspection
 .venv/bin/python comfyui_wxa8_quantizer.py --self-test
+.venv/bin/python comfyui_wxa8_quantizer.py --version
 .venv/bin/python comfyui_wxa8_quantizer.py --list-architectures
 .venv/bin/python comfyui_wxa8_quantizer.py MODEL.safetensors --inspect
+
+# source-free verification of an existing output (no original model needed)
+.venv/bin/python comfyui_wxa8_quantizer.py --verify-output OUT.safetensors
 ```
 
 `--inspect` prints the detected architecture, the policy that applies, and the
@@ -151,6 +155,8 @@ measured output error.
 | `--device auto\|cpu\|cuda\|rocm` | quantization compute device |
 | `--max-memory SIZE` | per-tensor working budget (default 2G) |
 | `--validate`, `--validation-only` | full check after conversion / re-check an output |
+| `--verify-output PATH` | source-free check of an existing output: structure, metadata, packing, payload hash |
+| `--version` | print the converter version and exit |
 | `--dry-run`, `--report PATH` | plan and report without writing |
 | `--resume`, `--overwrite` | interruption recovery / replace output |
 | `--include`, `--exclude`, `--keep-precision` | force or protect layers by regex |
@@ -214,11 +220,12 @@ W4A4 and INT8.
 
 ## Checking the result
 
-* `--self-test`: 39 embedded checks. Golden vectors for W4A8, W4A4, and INT8
+* `--self-test`: 40 embedded checks. Golden vectors for W4A8, W4A4, and INT8
   (embedded reference weight, cross-platform safe), the eligibility matrix,
   mixed planning on real Boogu and Kroma dims, hard gate failures, BF16
   promotion, runtime capability matrix, planner determinism, corrupted
-  metadata rejection for all three formats, and architecture sync.
+  metadata rejection for all three formats, source-free `--verify-output`,
+  and architecture sync.
 * `--validate`: reopens the output and checks inventory, shapes, dtypes,
   per-format metadata and runtime contract, scales, packing round trips,
   reconstruction error bounds (W4A8 policy bound, W4A4 0.20, INT8 0.05),

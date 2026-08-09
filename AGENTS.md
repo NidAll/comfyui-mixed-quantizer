@@ -10,7 +10,7 @@ The mixed mode (`--format mixed`) is a per-layer optimizer over the
 ComfyUI-native formats `convrot_w4a4`, `asym_w4a8_int8`, and
 `int8_tensorwise`, merged into main from the `experimental/mixed-precision`
 branch. `--format w4a8` remains the default and is byte-identical to main
-v1.3.0 (golden vectors and the 39/39 self-test suite prove it).
+v1.3.0 (golden vectors and the 40/40 self-test suite prove it).
 
 - Local path: `/home/nidall/projects/testdeepseek/quantizationscripts_w4a8_w3a8`
 - Repo (public): `https://github.com/NidAll/comfyui-mixed-quantizer`
@@ -180,9 +180,11 @@ optional set.
 ## Common commands
 
 ```bash
-.venv/bin/python comfyui_wxa8_quantizer.py --self-test          # 39/39 required
+.venv/bin/python comfyui_wxa8_quantizer.py --self-test          # 40/40 required
+.venv/bin/python comfyui_wxa8_quantizer.py --version
 .venv/bin/python comfyui_wxa8_quantizer.py --list-architectures
 .venv/bin/python comfyui_wxa8_quantizer.py MODEL.safetensors --inspect
+.venv/bin/python comfyui_wxa8_quantizer.py OUT.safetensors --verify-output   # source-free re-check
 
 # w4a8 (stable path, unchanged)
 .venv/bin/python comfyui_wxa8_quantizer.py MODEL.safetensors --output OUT.safetensors --format w4a8 --validate
@@ -219,7 +221,7 @@ mixed balanced = 16 W4A8 + 4 INT8; wan mixed size-first = 10 W4A8 + 9 W4A4 +
 
 ## Verification before claiming success
 
-1. `--self-test` must pass 39/39 (includes W4A4/INT8 golden vectors with an
+1. `--self-test` must pass 40/40 (includes W4A4/INT8 golden vectors with an
    EMBEDDED reference weight: packed nibble agreement >= 0.995 + fp32 scales
    rtol 1e-4, because the Hadamard-rotation matmul and torch.randn differ in
    the last ULPs across platforms; never use byte-exact sha assertions on
@@ -287,6 +289,13 @@ mixed balanced = 16 W4A8 + 4 INT8; wan mixed size-first = 10 W4A8 + 9 W4A4 +
   block with requested/effective/certified semantics). Never write
   W4A8-global fields (fp8 scales, codebook packing) into a v2 block, and
   never put custom fields into official ComfyUI metadata.
+- Runtime certificates: `--runtime-certificate` accepts schema
+  `comfy-wxa8-runtime-cert/v1` (produced by the tools shipped on this
+  branch) and `/v2` (per-probe records, produced by the repaired
+  `tools/runtime_certify.py` on the refactor/modular-package branch);
+  unknown schemas are still rejected.
+- The wan family list includes `WAN_Animate2` (upstream drift from current
+  ComfyUI); keep the list in sync via `testdata/comfyui_architecture_sync.py`.
 - Original-precision fractions: `original_precision_parameter_fraction` and
   `original_precision_output_byte_fraction` are distinct and both reported;
   the hard gate `max_bf16_fraction` limits the OUTPUT BYTE fraction. The CLI
