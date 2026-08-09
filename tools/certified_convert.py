@@ -1,20 +1,29 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Certified conversion orchestrator (staging/publishing workflow).
 
 Keeps the standalone converter free of ComfyUI/comfy-kitchen imports while
 still offering the strongest publish guarantee:
 
-    1. convert with the standalone quantizer      -> MODEL.staged
-    2. run tools/runtime_certify.py                -> cert.json
-    3. run testdata/comfyui_smoke.py               -> real load + forward
-    4. run testdata/model_quality.py               -> BF16-relative model gate
+    1. run tools/runtime_certify.py                 -> cert.json (when
+       --certify is given and --cert-path is not; the certificate MUST exist
+       before conversion so --require-runtime-certificate can be honored)
+    2. convert with the standalone quantizer        -> MODEL.staged
+       (--runtime-certificate cert --require-runtime-certificate)
+    3. run testdata/comfyui_smoke.py                -> real load + forward
+    4. run testdata/model_quality.py                -> BF16-relative model gate
     5. all pass?  -> atomically rename .staged -> final
-       otherwise -> keep the failure report, never publish
+       otherwise   -> keep the failure report, never publish
 
-Only steps 1 and 5 run unconditionally. Steps 2-4 run when the flags are
-given (they need the target machine, ComfyUI >= v0.31.0 and the original
+Only steps 1, 2 and 5 run unconditionally (step 1 produces the certificate
+only when --certify asks for it). Steps 3-4 run when the flags are given
+(they need the target machine, ComfyUI >= v0.31.0 and the original
 checkpoint). Without them the tool behaves like the plain converter plus
 staging.
+
+The report (--output + .cert-report.json) is written before EVERY early
+return, so a failed convert/certify/smoke/quality step still leaves the
+failing step's ok/returncode/tail on disk.
 
 Usage:
     python tools/certified_convert.py MODEL.safetensors \
@@ -49,6 +58,11 @@ def run(cmd: list[str], env: dict | None = None) -> subprocess.CompletedProcess:
         cmd, capture_output=True, text=True, env=full_env, timeout=7200)
 
 
+def write_report(report: dict, path: str) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("model", help="original checkpoint")
@@ -74,28 +88,22 @@ def main() -> int:
     args = ap.parse_args()
 
     staged = args.output + ".staged"
+    report_path = args.output + ".cert-report.json"
     report: dict = {"steps": {}}
-    ok = True
 
-    # 1) convert to the staged path
-    cmd = [sys.executable, CONVERTER, args.model, "--output", staged,
-           "--format", args.format, "--profile", args.profile,
-           "--target-runtime", args.target_runtime]
-    if args.cert_path or args.certify:
-        cmd += ["--require-runtime-certificate"]
-    if args.cert_path:
-        cmd += ["--runtime-certificate", args.cert_path]
-    r = run(cmd)
-    report["steps"]["convert"] = {
-        "ok": r.returncode == 0, "returncode": r.returncode,
-        "tail": (r.stdout + r.stderr)[-800:]}
-    ok = ok and r.returncode == 0
-    if not ok:
-        print("convert FAILED; nothing published")
-        print(report["steps"]["convert"]["tail"])
+    def fail(step: str, rc: int, tail: str, msg: str) -> int:
+        report["steps"][step] = {
+            "ok": False, "returncode": rc, "tail": tail[-800:]}
+        write_report(report, report_path)
+        print(msg)
+        print(tail[-800:])
+        print(f"certificate report: {report_path}")
         return 1
 
-    # 2) runtime certificate (target machine)
+    # 1) runtime certificate FIRST (target machine). The converter is
+    # invoked with --require-runtime-certificate below, so the certificate
+    # must exist before conversion starts; generating it after the convert
+    # step (the historical order) made --certify fail every time.
     cert_path = args.cert_path
     if args.certify and cert_path is None:
         cert_path = args.output + ".runtime-cert.json"
@@ -103,15 +111,30 @@ def main() -> int:
         report["steps"]["certify"] = {
             "ok": r.returncode == 0, "returncode": r.returncode,
             "path": cert_path, "tail": (r.stdout + r.stderr)[-600:]}
-        ok = ok and r.returncode == 0
-        if not ok:
-            print("runtime certification FAILED; nothing published")
-            print(report["steps"]["certify"]["tail"])
-            return 1
+        if r.returncode != 0:
+            return fail("certify", r.returncode,
+                        r.stdout + r.stderr,
+                        "runtime certification FAILED; nothing published")
+
+    # 2) convert to the staged path, requiring the certificate
+    cmd = [sys.executable, CONVERTER, args.model, "--output", staged,
+           "--format", args.format, "--profile", args.profile,
+           "--target-runtime", args.target_runtime]
+    if cert_path:
+        cmd += ["--runtime-certificate", cert_path,
+                "--require-runtime-certificate"]
+    r = run(cmd)
+    report["steps"]["convert"] = {
+        "ok": r.returncode == 0, "returncode": r.returncode,
+        "tail": (r.stdout + r.stderr)[-800:]}
+    if r.returncode != 0:
+        return fail("convert", r.returncode, r.stdout + r.stderr,
+                    "convert FAILED; nothing published")
 
     env = None
     if args.comfyui_src:
         env = {"PYTHONPATH": args.comfyui_src}
+
     # 3) ComfyUI smoke on the staged output
     if args.smoke:
         cmd = [sys.executable, SMOKE, "--model", staged]
@@ -121,16 +144,17 @@ def main() -> int:
         report["steps"]["smoke"] = {
             "ok": r.returncode == 0, "returncode": r.returncode,
             "tail": (r.stdout + r.stderr)[-800:]}
-        ok = ok and r.returncode == 0
-        if not ok:
-            print("ComfyUI smoke FAILED; nothing published")
-            print(report["steps"]["smoke"]["tail"])
-            return 1
+        if r.returncode != 0:
+            return fail("smoke", r.returncode, r.stdout + r.stderr,
+                        "ComfyUI smoke FAILED; nothing published")
 
     # 4) model-level BF16-relative quality gate
     if args.quality:
         if not args.source:
-            ap.error("--quality needs --source (the original BF16 checkpoint)")
+            return fail(
+                "quality", 2,
+                "--quality needs --source (the original BF16 checkpoint)",
+                "model quality gate FAILED; nothing published")
         cmd = [sys.executable, QUALITY, "--model", staged,
                "--source", args.source,
                "--threshold", str(args.quality_threshold)]
@@ -138,24 +162,17 @@ def main() -> int:
         report["steps"]["quality"] = {
             "ok": r.returncode == 0, "returncode": r.returncode,
             "tail": (r.stdout + r.stderr)[-800:]}
-        ok = ok and r.returncode == 0
-        if not ok:
-            print("model quality gate FAILED; nothing published")
-            print(report["steps"]["quality"]["tail"])
-            return 1
+        if r.returncode != 0:
+            return fail("quality", r.returncode, r.stdout + r.stderr,
+                        "model quality gate FAILED; nothing published")
 
     # 5) publish atomically
-    if ok:
-        os.replace(staged, args.output)
-        report["published"] = args.output
-        print(f"certified conversion published: {args.output}")
-    else:
-        print(f"certified conversion FAILED; staged output kept at {staged}")
-    report_path = args.output + ".cert-report.json"
-    with open(report_path, "w", encoding="utf-8") as f:
-        json.dump(report, f, indent=2)
+    os.replace(staged, args.output)
+    report["published"] = args.output
+    write_report(report, report_path)
+    print(f"certified conversion published: {args.output}")
     print(f"certificate report: {report_path}")
-    return 0 if ok else 1
+    return 0
 
 
 if __name__ == "__main__":
