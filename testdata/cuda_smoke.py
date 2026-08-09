@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """CUDA regression smoke test for the W4A8 runtime contract (P0).
 
 Runs three checks on a machine with an NVIDIA GPU:

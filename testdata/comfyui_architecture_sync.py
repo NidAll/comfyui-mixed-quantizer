@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Architecture coverage synchronization check.
 
 Compares the converter's embedded policy registry (the union of

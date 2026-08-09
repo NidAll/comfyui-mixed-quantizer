@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Runtime equivalence: our calibration simulators vs the real comfy-kitchen.
 
 For every format the planner can select, this script quantizes the same

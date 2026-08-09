@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 
 import torch, safetensors.torch, os, sys
 OUT = sys.argv[1]
@@ -8,8 +9,8 @@ def make_sdxl():
     sd = {}; p = "model.diffusion_model."
     sd[p+"input_blocks.0.0.weight"] = torch.randn(320, 4, 3, 3) * 0.1
     sd[p+"input_blocks.0.0.bias"] = torch.randn(320) * 0.01
-    for b in range(2):
-        pre = f"{p}input_blocks.{b+1}.0.transformer_blocks.0."
+    for b in (4, 5):
+        pre = f"{p}input_blocks.{b}.1.transformer_blocks.0."
         # attn1 keeps the real SDXL K=320: K % 256 != 0, so it must pass
         # through (CUDA ConvRot is 256-only); attn2 K=2048 quantizes.
         for a in ("attn1", "attn2"):
@@ -27,13 +28,16 @@ def make_sdxl():
     return sd
 
 def make_sd15():
+    # real checkpoint layout: the transformer sub-block index is 1
+    # (input_blocks.1.1, matching upstream SD1.5 state dicts)
     sd = {}; p = "model.diffusion_model."
     sd[p+"input_blocks.0.0.weight"] = torch.randn(320, 4, 3, 3) * 0.1
-    sd[p+"input_blocks.1.0.transformer_blocks.0.attn1.q.weight"] = torch.randn(320, 320, 1, 1) * 0.1
-    sd[p+"input_blocks.1.0.transformer_blocks.0.attn1.k.weight"] = torch.randn(320, 320, 1, 1) * 0.1
-    sd[p+"input_blocks.1.0.transformer_blocks.0.attn2.to_k.weight"] = L(320, 768)
-    sd[p+"input_blocks.1.0.transformer_blocks.0.ff.net.0.proj.weight"] = L(2560, 320, 0.01)
-    sd[p+"input_blocks.1.0.transformer_blocks.0.ff.net.2.weight"] = L(320, 2560, 0.01)
+    sd[p+"input_blocks.1.1.transformer_blocks.0.attn1.q.weight"] = torch.randn(320, 320, 1, 1) * 0.1
+    sd[p+"input_blocks.1.1.transformer_blocks.0.attn1.k.weight"] = torch.randn(320, 320, 1, 1) * 0.1
+    sd[p+"input_blocks.1.1.transformer_blocks.0.attn2.to_k.weight"] = L(320, 768)
+    sd[p+"input_blocks.1.1.transformer_blocks.0.ff.net.0.proj.weight"] = L(2560, 320, 0.01)
+    sd[p+"input_blocks.1.1.transformer_blocks.0.ff.net.2.weight"] = L(320, 2560, 0.01)
+    sd[p+"middle_block.1.transformer_blocks.0.attn2.to_k.weight"] = L(320, 768)
     sd[p+"time_embed.0.weight"] = L(320, 320)
     sd[p+"out.2.weight"] = L(4, 320) * 0.1
     return sd
