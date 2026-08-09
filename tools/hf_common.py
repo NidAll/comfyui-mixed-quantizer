@@ -66,7 +66,7 @@ import urllib.request
 # CONVERTER_URL; fetch_converter() enforces it.
 CONVERTER_URL = ("https://raw.githubusercontent.com/NidAll/"
                  "comfyui-mixed-quantizer/"
-                 "c4a3b92c73d6220a33b7b859f0160f791afe6f1d/"
+                 "592ed4d2a3d34a449f21717e2dd3e6f2f029ee91/"
                  "comfyui_wxa8_quantizer.py")
 CONVERTER_SHA256 = "a75819221430557f1e764784ed9a950e0a9fc8c2a91a1ea26e5ca2f24a891383"
 
