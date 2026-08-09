@@ -6035,6 +6035,9 @@ class Validator:
             self.check("output-exists", False, f"{out_path} missing")
             return self.summary()
         size = os.path.getsize(out_path)
+        log().info("validation started on %s (%s, %s mode)",
+                   out_path, human_bytes(size),
+                   "full" if full_validation else "representative")
 
         # ---- reopen with safetensors ----
         try:
@@ -6384,7 +6387,12 @@ class Validator:
                 sample = list({id(d): d for d in sample}.values())
             worst: Dict[str, float] = {}
             bounds_used: Dict[str, float] = {}
-            for d in sample:
+            log().info("validation: reconstruction round trips over %d "
+                       "quantized layers (%s)", len(sample),
+                       "full set" if full_validation else "representative sample")
+            for idx, d in enumerate(sample):
+                log().info("validation round trip %d/%d: %s",
+                           idx + 1, len(sample), d.layer or d.name)
                 if d.layer is None:
                     self.check(f"recon-{d.name}", False,
                                "quantized decision has no layer name")
@@ -10018,6 +10026,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         info, plan, env, args, calibration, sensitivity, input_hashes,
         tensor_payload_sha, {"status": "pending"}, warnings)
     qm_meta[METADATA_KEY_EXT] = json_dumps(ext_meta)
+    log().info("building validation copy at %s", validation_path)
     republish_with_metadata(staged_path, validation_path, qm_meta, entries)
 
     # ---- validation ----
