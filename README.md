@@ -59,14 +59,25 @@ comfy-kitchen's eager kernels to 1e-4 relative agreement in
 Python 3.11+, torch, safetensors, numpy. No ComfyUI installation is needed to
 convert.
 
+The converter lives in a modular package under `src/comfyui_wxa8_quantizer/`;
+the standalone single-file script `comfyui_wxa8_quantizer.py` at the repo root
+is a generated artifact (same code, same CLI) built with
+`tools/build_single_file.py`. The artifact is committed so downloads and the
+HF helpers stay self-contained.
+
 ```bash
 uv venv .venv
+uv pip install --python .venv/bin/python -e .        # package + console script
+# or, for the standalone artifact only:
 uv pip install --python .venv/bin/python -r requirements.txt
 ```
 
-`-r requirements-optional.txt` adds comfy-kitchen and packaging, needed only by
-the companion tools that import comfy-kitchen (`tools/runtime_certify.py`,
+The console script is `comfyui-wxa8-quantizer` (same options as the artifact).
+`-r requirements-optional.txt` adds comfy-kitchen and packaging, needed only
+by the companion tools that import comfy-kitchen (`tools/runtime_certify.py`,
 `testdata/runtime_equivalence.py`, `tools/certified_convert.py --certify`).
+Optional extras: `pip install -e ".[hf]"` (Hugging Face helpers) and
+`pip install -e ".[runtime]"` (runtime certification).
 
 ## Quick start
 
@@ -79,8 +90,12 @@ the companion tools that import comfy-kitchen (`tools/runtime_certify.py`,
 
 # sanity checks and model inspection
 .venv/bin/python comfyui_wxa8_quantizer.py --self-test
+.venv/bin/python comfyui_wxa8_quantizer.py --version
 .venv/bin/python comfyui_wxa8_quantizer.py --list-architectures
 .venv/bin/python comfyui_wxa8_quantizer.py MODEL.safetensors --inspect
+
+# source-free verification of an existing output (no original model needed)
+.venv/bin/python comfyui_wxa8_quantizer.py --verify-output OUT.safetensors
 ```
 
 `--inspect` prints the detected architecture, the policy that applies, and the
@@ -151,6 +166,8 @@ measured output error.
 | `--device auto\|cpu\|cuda\|rocm` | quantization compute device |
 | `--max-memory SIZE` | per-tensor working budget (default 2G) |
 | `--validate`, `--validation-only` | full check after conversion / re-check an output |
+| `--verify-output PATH` | source-free check of an existing output: structure, metadata, packing, payload hash |
+| `--version` | print the converter version and exit |
 | `--dry-run`, `--report PATH` | plan and report without writing |
 | `--resume`, `--overwrite` | interruption recovery / replace output |
 | `--include`, `--exclude`, `--keep-precision` | force or protect layers by regex |
@@ -214,11 +231,12 @@ W4A4 and INT8.
 
 ## Checking the result
 
-* `--self-test`: 39 embedded checks. Golden vectors for W4A8, W4A4, and INT8
+* `--self-test`: 40 embedded checks. Golden vectors for W4A8, W4A4, and INT8
   (embedded reference weight, cross-platform safe), the eligibility matrix,
   mixed planning on real Boogu and Kroma dims, hard gate failures, BF16
   promotion, runtime capability matrix, planner determinism, corrupted
-  metadata rejection for all three formats, and architecture sync.
+  metadata rejection for all three formats, source-free `--verify-output`,
+  and architecture sync. The same 40 cases run under pytest (`tests/`).
 * `--validate`: reopens the output and checks inventory, shapes, dtypes,
   per-format metadata and runtime contract, scales, packing round trips,
   reconstruction error bounds (W4A8 policy bound, W4A4 0.20, INT8 0.05),
@@ -234,26 +252,42 @@ W4A4 and INT8.
   `--require-format` forces the checkpoint to actually contain the listed
   formats.
 * `testdata/model_quality.py`: BF16-relative denoiser comparison on the target
-  machine (rel L2, cosine, SNR per timestep against a threshold). A passing
-  run earns the model-verified label.
+  machine (rel L2, cosine, SNR per timestep against a threshold, multiple
+  fixed seeds, sequential GPU evaluation, architecture presets). A passing
+  run writes a hash-bound attestation and earns the model-verified label.
 * `testdata/comfyui_patch_smoke.py`: LoRA, offload, and low-VRAM integration
-  smoke for real mixed checkpoints.
+  smoke for real mixed checkpoints (fixed seeded inputs, real ModelPatcher,
+  explicit PASS/SKIP/FAIL per memory mode).
+* `--verify-output`: source-free structural, metadata, packing and payload-
+  hash verification of an existing output with no original model required.
 
-CI workflows are temporarily removed and live in git history (`ci.yml`,
-`cuda-smoke.yml`, `nightly-sync.yml`, `release-compat.yml`). Until they are
-restored, run the self-tests, fixture conversions, and the sync scripts
-locally before merging or releasing.
+CI is intentionally not configured in this repository. The converter is
+cross-platform and CPU-checkable (`--self-test`, fixture conversions, pytest,
+`testdata/runtime_equivalence.py`, architecture sync), but the GPU kernel and
+real-model checks (`testdata/cuda_smoke.py`, ComfyUI smoke and patch smoke,
+`tools/runtime_certify.py`, `testdata/model_quality.py`, `--certify`) run
+only on the target machine with its GPU, and results are recorded locally
+under `testdata/reports/`. Run the full local battery before merging or
+releasing.
 
 ## Companion tools
 
-* `tools/hf_mixed_quantize.py`: Colab-ready flow that downloads a model from
-  Hugging Face, converts it for CUDA inference, strips GPU identity, and
-  uploads the result to a new repo in the user's HF account.
-* `tools/hf_mixed_quantize_optimized.py`: same flow, faster (hf_transfer
-  downloads, opt-in `--validate`, disk preflight, phase timing). Use this one
-  for real conversions.
+* `tools/hf_mixed_quantize.py` and `tools/hf_mixed_quantize_optimized.py`:
+  Colab-ready flows (download, convert, strip GPU identity, upload) that share
+  one implementation (`tools/hf_common.py`). The optimized variant is the one
+  to use for real conversions. Both fetch the converter from a pinned commit,
+  verify its SHA-256 before executing, refuse unverified local copies
+  (`--trust-local-converter` forces one with a warning), scrub HF credentials
+  from the converter subprocess environment, size downloads via the HF API
+  before the disk preflight, and never pip-install at runtime.
 * `tools/runtime_certify.py` and `tools/certified_convert.py`: the certificate
-  generator and the staged convert-certify-publish chain.
+  generator and the staged convert-certify-publish chain. The certificate
+  (schema v2) records per-probe numeric agreement against the eager reference
+  for every (format, K, ConvRot group, linear_dtype) probe, observes the
+  effective W4A4 activation bits from runtime behavior, binds torch,
+  comfy-kitchen, backend, GPU and converter commit, and writes a failure JSON
+  on every exit. `--certify` generates the certificate before conversion so
+  `--require-runtime-certificate` is honored.
 * `testdata/make_fixtures.py`: builds the fixture checkpoints used in
   verification.
 
@@ -291,4 +325,4 @@ locally before merging or releasing.
 
 ## License
 
-MIT (see LICENSE).
+Apache-2.0 (see LICENSE).

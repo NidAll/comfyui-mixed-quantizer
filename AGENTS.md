@@ -4,27 +4,37 @@
 
 `comfyui_wxa8_quantizer.py` is a standalone, single-file converter that turns
 generative-model checkpoints into ComfyUI-native quantized checkpoints. It
-does not import ComfyUI or comfy-kitchen at runtime.
+does not import ComfyUI or comfy-kitchen at runtime. Since the modular
+refactor, the source of truth is the package under `src/comfyui_wxa8_quantizer/`
+(modules: io, formats, policies, planning, quantize, planner, engine, runtime,
+metadata, validation, reporting, cli, selftests, golden); the single-file
+artifact at the repo root is GENERATED from it by `tools/build_single_file.py`
+and is committed so downloads and the HF helpers stay self-contained. Edit
+the package, rebuild the artifact, and verify both (the artifact must keep
+passing `--self-test` and byte-identical w4a8/mixed outputs).
 
 The mixed mode (`--format mixed`) is a per-layer optimizer over the
 ComfyUI-native formats `convrot_w4a4`, `asym_w4a8_int8`, and
 `int8_tensorwise`, merged into main from the `experimental/mixed-precision`
 branch. `--format w4a8` remains the default and is byte-identical to main
-v1.3.0 (golden vectors and the 39/39 self-test suite prove it).
+v1.3.0 (golden vectors and the 40/40 self-test suite prove it).
 
 - Local path: `/home/nidall/projects/testdeepseek/quantizationscripts_w4a8_w3a8`
 - Repo (public): `https://github.com/NidAll/comfyui-mixed-quantizer`
 - Branch: `main` (the experimental branch was merged)
-- Script version: `1.4.0-experimental` (`CONVERTER_VERSION`)
-- Audit status: P0 items closed (hard quality/compression gates, BF16
-  promotion candidate, runtime-output calibration metric, per-format runtime
-  compatibility probe) and the follow-up implementation plan applied
-  (W4A8 runtime-basis simulation, target-accurate W4A4, simulator
-  equivalence suite, targeted global metric, unified ORIGINAL candidate,
-  per-format capability matrix, certification levels, model-level quality
-  harness, strict mixed smoke mode, upstream runtime-contract nightly sync).
-  Krea2 policy fixed for the real Kroma v0.2 naming (blocks.N / txtfusion
-  layerwise+refiner, commit e0141d7; krea2-real-dims self-test pins it).
+- Version: `1.4.0-experimental` (`_version.py` is the single source;
+  `CONVERTER_VERSION` mirrors it; `--version` prints it)
+- License: Apache-2.0 (README, LICENSE, SPDX headers, NOTICE with upstream
+  Comfy-Org attribution)
+- Audit follow-up applied: license aligned, GPU-agnostic local-only
+  verification policy (no CI in this repo), modular package + pyproject +
+  pytest suite, `--version`, source-free `--verify-output`, certification
+  pipeline repaired (cert-first, v2 per-probe schema), HF helpers hardened
+  (pinned commit + SHA-256, scrubbed subprocess env, no runtime pip install,
+  single shared implementation), ComfyUI harnesses fixed (real prefix
+  detection, real ModelPatcher, PASS/SKIP/FAIL, two-direction layout
+  equality), model-quality harness strengthened (seeds, sequential eval,
+  inference_mode, SNR fix, attestation), WAN_Animate2 added.
   Remaining certification gaps are documented in the README limitations
   (real-model three-layout forward, LoRA/offload/low-VRAM, e2e generation,
   balanced-v1 threshold tuning from the benchmark matrix).
@@ -165,24 +175,39 @@ real here. `research/ComfyUI` is v0.30.0 + loader patch (gitignored, do not
 reset). `.venv` has torch 2.13.0+cu130 and comfy-kitchen 0.2.28.
 
 Tools: `tools/hf_mixed_quantize.py` (original Colab flow) and
-`tools/hf_mixed_quantize_optimized.py` (same flow, faster: hf_transfer
-download, `--validate` opt-in instead of always-on, disk preflight, phase
-timing). The optimized variant is the one to recommend for real conversions;
-the original stays for reference.
+`tools/hf_mixed_quantize_optimized.py` (faster variant) share one
+implementation in `tools/hf_common.py` (pinned-commit converter fetch with
+SHA-256 verification, HF credential scrubbing, API-sized disk preflight
+before download, no runtime pip installs). The optimized variant is the one
+to recommend for real conversions; the original stays for reference.
+`tools/build_single_file.py` regenerates the single-file artifact from the
+package; `tools/runtime_certify.py` + `tools/certified_convert.py` implement
+the v2 cert-first certification chain; `tools/hf_mixed_convert.py` is a
+separate local-conversion flow (git clone + report upload).
 
-Install: `uv pip install --python .venv/bin/python -r requirements.txt`
-(core converter plus huggingface_hub for the Colab download/upload flow);
+Install: `uv pip install --python .venv/bin/python -e .` (package + console
+script) or `-r requirements.txt` for the standalone artifact only
+(requirements.txt also carries huggingface_hub for the Colab flow);
 `-r requirements-optional.txt` adds comfy-kitchen + packaging for the
 companion tools that may import it (runtime_certify, runtime_equivalence,
 certified_convert --certify). The standalone converter never needs the
-optional set.
+optional set. pytest is in the `dev` extra (`uv pip install --python
+.venv/bin/python -e ".[dev]"`).
 
 ## Common commands
 
 ```bash
-.venv/bin/python comfyui_wxa8_quantizer.py --self-test          # 39/39 required
+.venv/bin/python comfyui_wxa8_quantizer.py --self-test          # 40/40 required
+.venv/bin/python comfyui_wxa8_quantizer.py --version
 .venv/bin/python comfyui_wxa8_quantizer.py --list-architectures
 .venv/bin/python comfyui_wxa8_quantizer.py MODEL.safetensors --inspect
+.venv/bin/python comfyui_wxa8_quantizer.py OUT.safetensors --verify-output   # source-free re-check
+
+# rebuild the single-file artifact from the package (after package edits)
+.venv/bin/python tools/build_single_file.py
+
+# pytest suite (40 embedded self-tests + CLI tests)
+.venv/bin/python -m pytest tests/ -q
 
 # w4a8 (stable path, unchanged)
 .venv/bin/python comfyui_wxa8_quantizer.py MODEL.safetensors --output OUT.safetensors --format w4a8 --validate
@@ -198,6 +223,12 @@ optional set.
 .venv/bin/python testdata/make_fixtures.py testdata/boogu_real_fixture.safetensors
 .venv/bin/python comfyui_wxa8_quantizer.py testdata/boogu_real_fixture.safetensors     --output testdata/boogu_real_fixture_mixed.safetensors --format mixed --profile balanced --validate
 
+# runtime certificate (target machine, GPU): v2 per-probe schema
+.venv/bin/python tools/runtime_certify.py --output cert.json --device cuda
+
+# certified conversion (cert-first; report written on every exit)
+.venv/bin/python tools/certified_convert.py MODEL.safetensors --output OUT.safetensors #     --source MODEL_bf16.safetensors --certify --smoke --quality
+
 # CUDA regression (real GPU; 10/10 on the RTX 3050)
 .venv/bin/python testdata/cuda_smoke.py
 
@@ -209,7 +240,8 @@ optional set.
 
 # model-level BF16-relative quality gate (target machine, real checkpoints)
 # PYTHONPATH=<comfyui-src> .venv/bin/python testdata/model_quality.py \
-#     --source original.safetensors --model converted.safetensors --threshold 0.05
+#     --source original.safetensors --model converted.safetensors \
+#     --threshold 0.05 --seeds 0,1,2 --arch-preset auto
 ```
 
 Expected results on the fixtures: boogu_real mixed = 19 W4A8 + 134 INT8
@@ -219,7 +251,7 @@ mixed balanced = 16 W4A8 + 4 INT8; wan mixed size-first = 10 W4A8 + 9 W4A4 +
 
 ## Verification before claiming success
 
-1. `--self-test` must pass 39/39 (includes W4A4/INT8 golden vectors with an
+1. `--self-test` must pass 40/40 (includes W4A4/INT8 golden vectors with an
    EMBEDDED reference weight: packed nibble agreement >= 0.995 + fp32 scales
    rtol 1e-4, because the Hadamard-rotation matmul and torch.randn differ in
    the last ULPs across platforms; never use byte-exact sha assertions on
@@ -232,17 +264,24 @@ mixed balanced = 16 W4A8 + 4 INT8; wan mixed size-first = 10 W4A8 + 9 W4A4 +
    matrix incl. eager-A4 vs CUDA-A8, runtime-output metric vs eager kernels,
    planner determinism (mixed-determinism), corrupted heterogeneous metadata
    rejection (mixed-metadata-fuzz: W4A4 bad cgs / K%64 / missing scale /
-   format-tensor mismatch, INT8 wrong scale dims), architecture sync.
+   format-tensor mismatch, INT8 wrong scale dims), architecture sync, and
+   source-free `--verify-output` (verify-output self-test: a produced mixed
+   checkpoint verifies clean; header corruption is detected).
 2. All fixture families must pass `--validate` in BOTH `--format w4a8`
    (regression; max relL2 about 0.073) and `--format mixed --profile balanced`
-   (0 failed).
+   (0 failed). The generated single-file artifact must stay byte-stable:
+   after any package edit, rebuild with `tools/build_single_file.py` and
+   re-run the self-tests on BOTH the package (`python -c` with PYTHONPATH=src
+   or pytest) and the artifact; w4a8 and mixed conversions must remain
+   byte-identical to the pre-edit artifact (sha256 of the outputs).
 3. `testdata/cuda_smoke.py` must pass 10/10 on a CUDA machine (includes the
-   W4A4 A8-mode simulator-vs-kernel quality check).
-4. CI workflows are temporarily removed (they live in git history:
-   ci.yml, cuda-smoke.yml, nightly-sync.yml, release-compat.yml). Run the
-   self-tests, fixture conversions (w4a8 + mixed, including a
-   `--validation-only` re-check) and the sync scripts locally until they
-   are restored.
+   W4A4 A8-mode simulator-vs-kernel quality check). GPU checks are LOCAL
+   ONLY: this repository has no CI by design (GPU-agnostic policy). Run the
+   full battery on the target machine and record results under
+   `testdata/reports/`.
+4. Pytest suite: `uv pip install --python .venv/bin/python -e ".[dev]"` then
+   `.venv/bin/python -m pytest tests/ -q` (40 embedded self-tests +
+   CLI tests) must pass.
 5. For loader questions, reproduce with the real ComfyUI path:
    `PYTHONPATH=research/ComfyUI .venv/bin/python`, flow
    `load_torch_file -> convert_old_quants -> load_diffusion_model_state_dict`,
@@ -253,12 +292,14 @@ mixed balanced = 16 W4A8 + 4 INT8; wan mixed size-first = 10 W4A8 + 9 W4A4 +
    `--require-format` forces a checkpoint to actually contain the listed
    formats before the forward runs.
 6. `testdata/comfyui_architecture_sync.py` must pass against the pinned
-   ComfyUI revision (CI tarball mode) and against the local
-   `research/ComfyUI` checkout when present. The (currently removed)
-   nightly workflow checked ComfyUI main + comfy-kitchen main with
-   --check-runtime-contract (three QUANT_ALGOS names + scale names + three
-   layout classes) and failed naming any regression; run the check locally
-   until it is restored.
+   ComfyUI revision (tarball mode) and against the local
+   `research/ComfyUI` checkout when present. Run it with
+   `--check-runtime-contract` against ComfyUI main + comfy-kitchen main
+   periodically (the removed nightly workflow's job) and fail the run
+   naming any regression: three QUANT_ALGOS names, the scale names, and the
+   three layout classes must still exist upstream. The wan family includes
+   `WAN_Animate2`; when upstream adds new WAN classes the sync check will
+   list them as missing and the family list must be extended.
 7. `testdata/runtime_equivalence.py` must pass (install comfy-kitchen and
    packaging first): our W4A4-A4 / W4A8 / INT8 simulators must agree with
    the real eager kernels to 1e-4 relative on the awkward K matrix.
@@ -322,7 +363,13 @@ mixed balanced = 16 W4A8 + 4 INT8; wan mixed size-first = 10 W4A8 + 9 W4A4 +
 
 ## Editing and docs conventions
 
-- One converter file. Edit with exact-string edits and recompile.
+- Modular package + generated artifact. Edit the package under
+  `src/comfyui_wxa8_quantizer/` (one file per module; modules keep their own
+  generated import headers), then rebuild the single-file artifact with
+  `tools/build_single_file.py` and verify both (40/40 self-tests on package
+  AND artifact; w4a8/mixed outputs byte-identical). Do not hand-edit the
+  artifact; it is a build output. New code goes into the package, not the
+  artifact.
 - README.md is the user-facing document and the only project markdown file
   besides this one. Keep it aligned with the code AT ALL TIMES:
   * Every feature, format, family, option, profile, test-count change, or
