@@ -1868,7 +1868,7 @@ UNIVERSAL_EXCLUDE = (
     r"visual_embeddings|time_embeddings|ofs_embedding_linear|patch_embedding_mask|"
     r"patch_embedding_pose|patch_embedding_global|emb|embed|embedding|"
     r"condition_embedder|adaln_curve|llm_cond_proj|input_embedder|pos_embed_proj|"
-    r"txtfusion|visual_transformer_blocks|text_transformer_blocks|"
+    r"visual_transformer_blocks|text_transformer_blocks|"
     r"encoder|decoder|lyric_encoder|ssl_|vocoder|first_stage|cond_stage)(\.|$)",
 )
 
@@ -2450,16 +2450,20 @@ _register(FamilyPolicy(
     comfyui_classes=("Krea2",),
     detect_primary=("txtfusion.projector.weight",),
     detect_hints=("txtfusion.layerwise_blocks.0.prenorm.scale",
-                  "layers.0.attn.wq.weight"),
+                  "blocks.0.attn.wq.weight"),
     quantize=(
-        r"layers\.\d+\.attn\.(wq|wk|wv|wo)\.weight$",
-        r"layers\.\d+\.mlp\.(w1|w2|gate_proj|up_proj|down_proj)\.weight$",
-        r"txtfusion\.layerwise_blocks\.\d+\.(attn|mlp)\.\w+\.weight$",
+        r"blocks\.\d+\.attn\.(wq|wk|wv|wo|gate)\.weight$",
+        r"blocks\.\d+\.mlp\.(gate|up|down)\.weight$",
+        r"txtfusion\.(layerwise_blocks|refiner_blocks)\.\d+\.(attn|mlp)\.\w+\.weight$",
     ),
     keep=(r"(^|\.)(first|projector|txtfusion\.projector|input_proj|time_embed|"
           r"pos_embed|final_layer|adaln)\.",),
     exclude=UNIVERSAL_EXCLUDE,
     runtime_status="experimental",
+    notes="Real Kroma v0.2 (Krea2 fine-tune) naming: blocks.N.attn.wq/wk/wv/wo/gate, "
+          "blocks.N.mlp.gate/up/down, txtfusion layerwise+refiner blocks. Verified "
+          "against the published kroma-v0.2-turbo checkpoint header (K 6144/16384/"
+          "2560/6912 are all ConvRot-256 compatible).",
 ))
 
 # --- kandinsky5 ---
@@ -7572,6 +7576,7 @@ def run_self_tests() -> int:
         ("registry-behavior", _test_registry),
         ("compression-stats", _test_compression_stats),
         ("boogu-real-dims", _test_boogu_real_dims),
+        ("krea2-real-dims", _test_krea2_real_dims),
         ("real-dim-gate", _test_real_dim_gate),
         ("policy-miss", _test_policy_miss),
         ("metadata-fuzz", _test_metadata_fuzz),
@@ -8059,6 +8064,128 @@ def _real_dim_case(family: str, keys: Sequence[Tuple[str, Tuple[int, ...]]]):
     return (det, compression_stats(info, plan, det),
             low_compression_warning(compression_stats(info, plan, det),
                                     det.architecture))
+
+
+def _make_krea2_real_dims_checkpoint(path: str, n: int = 8) -> Dict[str, Tuple[int, int]]:
+    """Small checkpoint with the REAL Kroma v0.2 (Krea2 fine-tune) key naming
+    and widths, verified against the published kroma-v0.2-turbo.safetensors
+    header: blocks.N.attn.wq/wk/wv/wo/gate [., 6144], blocks.N.mlp.gate/up
+    [., 6144] + down [., 16384], txtfusion layerwise/refiner blocks at
+    2560/6912. Returns the shape map for the quantize-set keys."""
+    torch.manual_seed(13)
+    sd: Dict[str, torch.Tensor] = {}
+
+    def L(n_: int, k_: int, s: float = 0.02) -> torch.Tensor:
+        return torch.randn(n_, k_) * s
+
+    for i in range(2):
+        pre = f"blocks.{i}."
+        for w in ("wq", "wk", "wv", "wo", "gate"):
+            sd[pre + f"attn.{w}.weight"] = L(n, 6144)
+        sd[pre + "mlp.gate.weight"] = L(n, 6144)
+        sd[pre + "mlp.up.weight"] = L(n, 6144)
+        sd[pre + "mlp.down.weight"] = L(n, 16384)
+    for i in range(2):
+        pre = f"txtfusion.layerwise_blocks.{i}."
+        sd[pre + "attn.wq.weight"] = L(n, 2560)
+        sd[pre + "attn.wo.weight"] = L(n, 2560)
+        sd[pre + "mlp.gate.weight"] = L(n, 2560)
+        sd[pre + "mlp.down.weight"] = L(n, 6912)
+    for i in range(2):
+        pre = f"txtfusion.refiner_blocks.{i}."
+        sd[pre + "attn.wq.weight"] = L(n, 2560)
+        sd[pre + "mlp.up.weight"] = L(n, 2560)
+    # keepers / passthroughs with the real names
+    sd["first.weight"] = L(n, 64)
+    sd["last.linear.weight"] = L(n, 6144)
+    sd["tmlp.0.weight"] = L(n, 256)
+    sd["tmlp.2.weight"] = L(n, 6144)
+    sd["txtmlp.1.weight"] = L(n, 2560)
+    sd["txtmlp.3.weight"] = L(n, 6144)
+    sd["tproj.1.weight"] = L(n, 6144)
+    sd["txtfusion.projector.weight"] = L(1, 12)
+    sd["blocks.0.mod.lin"] = torch.randn(36864) * 0.02
+    sd["blocks.0.prenorm.scale"] = torch.randn(6144) * 0.02
+    safetensors.torch.save_file(sd, path)
+    return {k: tuple(v.shape) for k, v in sd.items()}
+
+
+def _test_krea2_real_dims() -> str:
+    """Real Kroma v0.2 / Krea2 naming: blocks.N.attn.wq/wk/wv/wo/gate and
+    blocks.N.mlp.gate/up/down plus txtfusion layerwise/refiner blocks must be
+    quantized (all K values are ConvRot-256 compatible), while first/last/
+    tmlp/txtmlp/tproj/txtfusion.projector stay at original precision. This is
+    the regression for the reported 'no tensors selected under the krea2
+    policy' failure on kroma-v0.2-turbo.safetensors (the policy used
+    'layers.N' but the real checkpoint uses 'blocks.N', and the universal
+    exclude swallowed txtfusion)."""
+    d = _tmpdir()
+    src_path = os.path.join(d, "kroma_real.safetensors")
+    out = os.path.join(d, "kroma_real_w4a8.safetensors")
+    shapes = _make_krea2_real_dims_checkpoint(src_path)
+    args = _selftest_args(out, FORMAT_W4A8)
+    info = discover_checkpoint(src_path)
+    det = detect_architecture(
+        info, shape_lookup=lambda n: (info.by_name(n).shape if info.by_name(n) else None))
+    assert det.architecture == "krea2", det.architecture
+    dec = classify_tensors(info, det, FORMAT_W4A8, None, [], [], [], None, None)
+    quantized = {d.name for d in dec if d.kind == DecisionKind.QUANTIZE}
+    # 2 blocks x (5 attn + 3 mlp) + 2 layerwise x (2 attn + 2 mlp)
+    # + 2 refiner x (1 attn + 1 mlp) = 16 + 8 + 4 = 28
+    assert len(quantized) == 28, sorted(quantized)
+    assert "blocks.0.attn.wq.weight" in quantized
+    assert "blocks.0.attn.gate.weight" in quantized
+    assert "blocks.1.mlp.down.weight" in quantized
+    assert "txtfusion.layerwise_blocks.0.attn.wq.weight" in quantized
+    assert "txtfusion.layerwise_blocks.1.mlp.down.weight" in quantized
+    assert "txtfusion.refiner_blocks.1.attn.wq.weight" in quantized
+    by_name = {d.name: d for d in dec}
+    for keep_name in ("first.weight", "last.linear.weight", "tmlp.0.weight",
+                      "tmlp.2.weight", "txtmlp.1.weight", "txtmlp.3.weight",
+                      "tproj.1.weight"):
+        d = by_name[keep_name]
+        assert d.kind in (DecisionKind.KEEP, DecisionKind.KEEP_PRECISION), (
+            keep_name, d)
+    # patch embedder and the tiny text projector are policy keeps at FP
+    assert by_name["first.weight"].kind == DecisionKind.KEEP_PRECISION
+    assert by_name["txtfusion.projector.weight"].kind == DecisionKind.KEEP_PRECISION
+    # full w4a8 conversion runs and metadata lists exactly the block layers
+    plan = ConversionPlan(fmt=FORMAT_W4A8, detection=det, decisions=dec,
+                          metadata_quant={}, metadata_ext={}, output_entries=[])
+    entries, total = build_output_entries(info, dec, FORMAT_W4A8, None)
+    plan.output_entries = entries
+    plan.total_out_bytes = total
+    plan.n_quantized = len(plan.quantized_layers())
+    plan.n_kept = len(dec) - plan.n_quantized
+    plan.metadata_quant = build_quant_metadata(info, plan)
+    engine = ConversionEngine(info, plan, args, out + ".state.json", out + ".tmp", out)
+    try:
+        engine.run()
+    finally:
+        engine.close()
+    meta = dict(info.metadata)
+    meta[METADATA_KEY_QUANT] = json_dumps(plan.metadata_quant)
+    meta[METADATA_KEY_EXT] = json_dumps(build_extension_metadata(
+        info, plan, inspect_environment(), args, None, None,
+        hash_checkpoint_files(info), sha256_safetensors_payload(out),
+        {"status": "selftest"}, []))
+    republish_with_metadata(out, out, meta, entries)
+    with safe_open(out, framework="pt") as st:
+        meta = st.metadata()
+        qm = json.loads(meta["_quantization_metadata"])
+        assert set(qm["layers"].keys()) == {
+            n[:-len(".weight")] for n in quantized}, (set(qm["layers"].keys())
+                                                      ^ quantized)
+        for _, conf in qm["layers"].items():
+            assert conf["convrot_groupsize"] == 256 and conf["group_size"] == 16
+    # mixed planning must select real layers under the balanced profile
+    mdec = classify_tensors(info, det, FORMAT_MIXED, None, [], [], [], None, None)
+    planner = MixedPlanner("balanced", None, 2 * 1024**3, torch.device("cpu"), None)
+    summary = planner.plan(info, mdec)
+    assert summary["selected"] >= 28, summary
+    assert planner.global_mean_error(info, mdec) <= planner.global_gate
+    return ("real Kroma v0.2 dims convert (28 quantized, metadata exact); "
+            "mixed balanced plan selects " + str(summary["selected"]) + " layers")
 
 
 def _test_policy_miss() -> str:
