@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """End-to-end ComfyUI smoke inference for a converted checkpoint (W4A8 or mixed).
 
 Loads the checkpoint through the real ComfyUI path (load_torch_file ->
-convert_old_quants -> model_config_from_unet -> get_model ->
-load_model_weights), asserts every quantized layer is a QuantizedTensor whose
-layout matches its per-layer metadata format, then runs one diffusion-model
-forward on the selected device. The forward uses synthetic latents/context
-(no text encoder), so it reaches the attention/FFN linears including the
-fused CUDA kernels.
+convert_old_quants(metadata=meta) -> model_config_from_unet(ckpt, prefix) ->
+get_model -> load_model_weights), using ComfyUI's own
+model_detection.unet_prefix_from_state_dict for the state-dict prefix
+(fallback: the old key heuristic with a warning). It then asserts every
+quantized layer is a QuantizedTensor whose layout matches its per-layer
+metadata format in BOTH directions (every metadata layer with a format must
+be loaded with the expected layout, and every loaded QuantizedTensor layer
+must exist in the metadata), and runs one diffusion-model forward on the
+selected device. The forward uses synthetic latents/context (no text
+encoder), so it reaches the attention/FFN linears including the fused CUDA
+kernels.
 
 Expected layouts per metadata format:
 
@@ -62,19 +68,29 @@ def main() -> int:
         meta = dict(f.metadata() or {})
     try:
         qm = json.loads(meta.get("_quantization_metadata", "{}"))
-        layer_formats = {
+        # raw metadata keys carry the unet prefix (full state-dict keys);
+        # they are normalized against the derived prefix below.
+        raw_layer_formats = {
             layer: conf.get("format")
             for layer, conf in (qm.get("layers") or {}).items()
             if isinstance(conf, dict)
         }
     except (TypeError, json.JSONDecodeError):  # pragma: no cover
-        layer_formats = {}
+        raw_layer_formats = {}
     ckpt = load_torch_file(args.model)
     ckpt, _ = convert_old_quants(ckpt, metadata=meta)
-    # prefix-less checkpoints (Comfy-Org repacks) use an empty key prefix;
-    # prefixed checkpoints are detected automatically by their keys.
-    prefix = next((k[:k.index(".") + 1] for k in ckpt
-                   if k.startswith("model.diffusion_model.")), "")
+    # ComfyUI's own prefix detection (exists since v0.30). The old key
+    # heuristic returned "model." instead of "model.diffusion_model." for
+    # prefixed checkpoints; keep it only as a fallback for older checkouts.
+    try:
+        from comfy.model_detection import unet_prefix_from_state_dict
+        prefix = unet_prefix_from_state_dict(ckpt)
+    except (ImportError, AttributeError):
+        print("WARN: comfy.model_detection.unet_prefix_from_state_dict "
+              "unavailable (ComfyUI < v0.30?); falling back to the key "
+              "heuristic")
+        prefix = next((k[:k.index(".") + 1] for k in ckpt
+                       if k.startswith("model.diffusion_model.")), "")
     mc = model_detection.model_config_from_unet(ckpt, prefix)
     if mc is None:  # pragma: no cover
         print("FAIL: model_config_from_unet returned None; is the checkpoint "
@@ -82,9 +98,20 @@ def main() -> int:
         return 2
     model = mc.get_model(ckpt)
     model.load_model_weights(ckpt, prefix)
-    print(f"loaded {type(mc).__name__}; weights on {model.diffusion_model.device}")
+    print(f"loaded {type(mc).__name__} (prefix {prefix!r}); "
+          f"weights on {model.diffusion_model.device}")
 
     # ---- per-layer layout assertions against the metadata ----
+    # Metadata layer names carry the unet prefix (the converter stores the
+    # full state-dict key); module names from named_modules() do not.
+    def strip_prefix(layer: str) -> str:
+        if prefix and layer.startswith(prefix):
+            return layer[len(prefix):]
+        return layer
+
+    layer_formats = {strip_prefix(layer): fmt
+                     for layer, fmt in raw_layer_formats.items()}
+
     qt_by_layer = {}
     for name, m in model.diffusion_model.named_modules():
         w = getattr(m, "weight", None)
@@ -101,13 +128,22 @@ def main() -> int:
     for layer, w in qt_by_layer.items():
         layout = type(w._params).__name__
         layout_counts[layout] = layout_counts.get(layout, 0) + 1
-        expected = EXPECTED_LAYOUTS.get(layer_formats.get(layer, ""))
+        fmt = layer_formats.get(layer)
+        if fmt is None:
+            failures.append(f"{layer}: QuantizedTensor loaded but missing "
+                            f"from metadata")
+            continue
+        expected = EXPECTED_LAYOUTS.get(fmt)
         if expected is not None and layout != expected:
-            failures.append(f"{layer}: metadata {layer_formats.get(layer)} "
-                            f"but layout {layout}")
-    for fmt, layout in EXPECTED_LAYOUTS.items():
-        if fmt in layer_formats.values() and layout not in layout_counts:
-            failures.append(f"metadata format {fmt} produced no {layout} layers")
+            failures.append(f"{layer}: metadata {fmt} but layout {layout}")
+    # metadata -> loaded: every metadata layer with a known format must be
+    # present as a QuantizedTensor with the expected layout
+    for layer, fmt in layer_formats.items():
+        if fmt not in EXPECTED_LAYOUTS:
+            continue
+        if layer not in qt_by_layer:
+            failures.append(f"{layer}: metadata format {fmt} but layer not "
+                            f"loaded as QuantizedTensor")
     if failures:  # pragma: no cover
         print("FAIL: layout/metadata mismatches:")
         for f in failures[:10]:
@@ -123,12 +159,13 @@ def main() -> int:
             print(f"FAIL: --require-format missing from the checkpoint: "
                   f"{missing}")
             return 2
-    if set(layer_formats.values()) - set(EXPECTED_LAYOUTS):
-        print(f"WARN: metadata contains unhandled formats: "
-              f"{set(layer_formats.values()) - set(EXPECTED_LAYOUTS)}")
+    unhandled = set(layer_formats.values()) - set(EXPECTED_LAYOUTS)
+    if unhandled:
+        print(f"WARN: metadata contains unhandled formats: {unhandled}")
     if n_qt != len(layer_formats):
         print(f"WARN: {n_qt} quantized modules vs {len(layer_formats)} "
-              "metadata entries (expected when shapes mismatch the model)")
+              "metadata entries (expected for unhandled formats or layers "
+              "outside the unet)")
 
     # ---- one model evaluation with synthetic inputs ----
     model = model.to(dev)
