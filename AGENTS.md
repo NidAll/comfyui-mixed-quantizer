@@ -1,4 +1,4 @@
-# AGENTS.md (experimental/mixed-precision branch)
+# AGENTS.md
 
 ## Project
 
@@ -10,7 +10,7 @@ The mixed mode (`--format mixed`) is a per-layer optimizer over the
 ComfyUI-native formats `convrot_w4a4`, `asym_w4a8_int8`, and
 `int8_tensorwise`, merged into main from the `experimental/mixed-precision`
 branch. `--format w4a8` remains the default and is byte-identical to main
-v1.3.0 (golden vectors and the 37/37 self-test suite prove it).
+v1.3.0 (golden vectors and the 39/39 self-test suite prove it).
 
 - Local path: `/home/nidall/projects/testdeepseek/quantizationscripts_w4a8_w3a8`
 - Repo (public): `https://github.com/NidAll/comfyui-mixed-quantizer`
@@ -23,6 +23,8 @@ v1.3.0 (golden vectors and the 37/37 self-test suite prove it).
   equivalence suite, targeted global metric, unified ORIGINAL candidate,
   per-format capability matrix, certification levels, model-level quality
   harness, strict mixed smoke mode, upstream runtime-contract nightly sync).
+  Krea2 policy fixed for the real Kroma v0.2 naming (blocks.N / txtfusion
+  layerwise+refiner, commit e0141d7; krea2-real-dims self-test pins it).
   Remaining certification gaps are documented in the README limitations
   (real-model three-layout forward, LoRA/offload/low-VRAM, e2e generation,
   balanced-v1 threshold tuning from the benchmark matrix).
@@ -178,7 +180,7 @@ optional set.
 ## Common commands
 
 ```bash
-.venv/bin/python comfyui_wxa8_quantizer.py --self-test          # 37/37 required
+.venv/bin/python comfyui_wxa8_quantizer.py --self-test          # 39/39 required
 .venv/bin/python comfyui_wxa8_quantizer.py --list-architectures
 .venv/bin/python comfyui_wxa8_quantizer.py MODEL.safetensors --inspect
 
@@ -217,16 +219,19 @@ mixed balanced = 16 W4A8 + 4 INT8; wan mixed size-first = 10 W4A8 + 9 W4A4 +
 
 ## Verification before claiming success
 
-1. `--self-test` must pass 37/37 (includes W4A4/INT8 golden vectors with an
+1. `--self-test` must pass 39/39 (includes W4A4/INT8 golden vectors with an
    EMBEDDED reference weight: packed nibble agreement >= 0.995 + fp32 scales
    rtol 1e-4, because the Hadamard-rotation matmul and torch.randn differ in
    the last ULPs across platforms; never use byte-exact sha assertions on
    randn-generated inputs in new tests), eligibility matrix, mixed planning
-   on real Boogu dims, mixed e2e with comfy-kitchen layout reload, hard gate
-   failures, BF16 promotion, runtime capability matrix incl. eager-A4 vs
-   CUDA-A8, runtime-output metric vs eager kernels, planner determinism
-   (mixed-determinism), corrupted heterogeneous metadata rejection
-   (mixed-metadata-fuzz: W4A4 bad cgs / K%64 / missing scale /
+   on real Boogu dims AND real Kroma v0.2 (krea2) dims
+   (krea2-real-dims: blocks.N.attn.wq/wk/wv/wo/gate, blocks.N.mlp.gate/up/
+   down, txtfusion layerwise+refiner blocks must quantize; first/last/tmlp/
+   txtmlp/tproj/txtfusion.projector must not), mixed e2e with comfy-kitchen
+   layout reload, hard gate failures, BF16 promotion, runtime capability
+   matrix incl. eager-A4 vs CUDA-A8, runtime-output metric vs eager kernels,
+   planner determinism (mixed-determinism), corrupted heterogeneous metadata
+   rejection (mixed-metadata-fuzz: W4A4 bad cgs / K%64 / missing scale /
    format-tensor mismatch, INT8 wrong scale dims), architecture sync.
 2. All fixture families must pass `--validate` in BOTH `--format w4a8`
    (regression; max relL2 about 0.073) and `--format mixed --profile balanced`
@@ -257,6 +262,12 @@ mixed balanced = 16 W4A8 + 4 INT8; wan mixed size-first = 10 W4A8 + 9 W4A4 +
 7. `testdata/runtime_equivalence.py` must pass (install comfy-kitchen and
    packaging first): our W4A4-A4 / W4A8 / INT8 simulators must agree with
    the real eager kernels to 1e-4 relative on the awkward K matrix.
+8. Docs sync: every user-visible change (new family, format, option, profile,
+   self-test count, CLI behavior, bug fix) must be reflected in README.md in
+   the same commit; if a change needs no README update, the commit message
+   says so. AGENTS.md facts (self-test count, commands, known behavior) must
+   match the code and the README. Before claiming completion, diff the docs
+   against the change and fix anything stale.
 
 ## Known behavior, do not "fix" it
 
@@ -312,8 +323,24 @@ mixed balanced = 16 W4A8 + 4 INT8; wan mixed size-first = 10 W4A8 + 9 W4A4 +
 ## Editing and docs conventions
 
 - One converter file. Edit with exact-string edits and recompile.
-- README.md is the only markdown file. Humanizer-clean: no em dashes, no AI
-  vocabulary, no rule-of-three padding, plain technical prose.
+- README.md is the user-facing document and the only project markdown file
+  besides this one. Keep it aligned with the code AT ALL TIMES:
+  * Every feature, format, family, option, profile, test-count change, or
+    user-visible bug fix updates README.md in the same commit.
+  * A commit that changes user-visible behavior without a README update must
+    state why in the commit message.
+  * Before claiming a task complete, re-read the README sections that the
+    change touches (quick start, options, formats, profiles, architecture
+    table, validation, limitations) and fix anything stale: self-test counts,
+    option lists, example outputs, numbers, and tables.
+  * New families or formats are added to the README architecture table and
+    format sections; new self-tests update the self-test count and the
+    validation list.
+- README.md is humanizer-clean: no em dashes, no AI vocabulary, no
+  rule-of-three padding, plain technical prose.
+- AGENTS.md is agent-facing and follows the same plain-prose rules; its facts
+  (self-test count, commands, known behavior, format facts) must match the
+  code and the README.
 - Commit messages summarize behavior and evidence. This branch is
   experimental; do not push to main.
 - The ComfyUI W4A4/INT8 loader contracts were verified against the installed
@@ -330,3 +357,10 @@ natively. The real Boogu-Image-0.1-Turbo (hidden 3360, FFN 13568) is the
 primary target: mixed balanced turns the 364 previously-BF16 layers into
 INT8, bringing the output from ~16 GB to ~9.6 GB while keeping the 54
 K=13568 layers at W4A8.
+
+The user also converts Kroma v0.2 Turbo (Krea2 fine-tune, lodestones/Kroma,
+kroma-v0.2-turbo.safetensors, 25.64 GB BF16). The krea2 family policy must
+match its real naming (blocks.N.attn.wq/wk/wv/wo/gate, blocks.N.mlp.gate/
+up/down, txtfusion.layerwise_blocks / refiner_blocks), which the
+krea2-real-dims self-test pins. Expected w4a8 result: 256 of 430 tensors
+quantized, ~7.7 GB output.
