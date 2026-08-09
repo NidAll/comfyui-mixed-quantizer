@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "comfyui-wxa8-quantizer"
+description = "Standalone ComfyUI-native checkpoint quantizer (W4A8 / mixed W4A4+W4A8+INT8)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "NidAll" }]
+keywords = ["comfyui", "quantization", "w4a8", "safetensors", "checkpoint"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dynamic = ["version"]
+dependencies = [
+    "torch>=2.1",
+    "safetensors>=0.4.3",
+    "numpy",
+]
+
+[project.optional-dependencies]
+hf = ["huggingface_hub", "hf-transfer"]
+runtime = ["comfy-kitchen", "packaging"]
+dev = ["pytest", "ruff"]
+
+[project.scripts]
+comfyui-wxa8-quantizer = "comfyui_wxa8_quantizer.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+comfyui_wxa8_quantizer = ["golden_data/*.txt"]
+
+[tool.setuptools.dynamic]
+version = { attr = "comfyui_wxa8_quantizer._version.__version__" }
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "S"]
+ignore = ["S603", "S607", "E501"]
