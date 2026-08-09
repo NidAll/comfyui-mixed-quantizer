@@ -66,9 +66,9 @@ import urllib.request
 # CONVERTER_URL; fetch_converter() enforces it.
 CONVERTER_URL = ("https://raw.githubusercontent.com/NidAll/"
                  "comfyui-mixed-quantizer/"
-                 "1d0e0985f47ff01a755f68a0cf1f6c81328fde56/"
+                 "c4a3b92c73d6220a33b7b859f0160f791afe6f1d/"
                  "comfyui_wxa8_quantizer.py")
-CONVERTER_SHA256 = "d00c4d2290ba47500e44d238f649763e510f1072aac2c3703cbdb59a12dff145"
+CONVERTER_SHA256 = "5bae38108e40e70b66b203349c2556009a146a95ffb83143e2634f078fcee894"
 
 GPU_LEAK_PATTERNS = ("3050", "3060", "3070", "3080", "3090", "4060", "4070",
                      "4080", "4090", "Tesla", "GeForce", "Quadro", "RTX",
