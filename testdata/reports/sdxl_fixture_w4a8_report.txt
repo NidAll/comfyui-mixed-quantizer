@@ -1,0 +1,93 @@
+==============================================================================
+comfyui_wxa8_quantizer 1.3.0 -- conversion report
+==============================================================================
+format            : asym_w4a8_int8 (asym-w4a8-int8-r1)
+architecture      : sdxl (confidence low)
+unet prefix       : model.diffusion_model.
+input             : safetensors (testdata/sdxl_fixture.safetensors)
+output            : testdata/sdxl_fixture_w4a8.safetensors (154.80 MiB)
+elapsed           : 7.807 s
+peak RSS          : 860.44 MiB
+warnings:
+  - low detection confidence; consider --architecture override
+
+-- detection evidence --
+  + input_blocks.0.0.weight
+
+-- tensor statistics --
+  input tensors   : 28
+  quantized layers: 8
+  kept tensors    : 20
+
+-- compression --
+  quantized      : 8 / 20 policy-targeted 2D layers
+  byte share     : 72.0% of targeted 2D bytes
+  gate victims   : K in [320] not divisible by 256 (ConvRot-256); kept at original precision
+  convrot groups : {256: 8}
+  group sizes    : {16: 8}
+  quantized       : 8 layers, 18.12 MiB; K in [1280, 2048]
+  convrot_rejected: 12 layers, 7.03 MiB; K in [320]
+  policy_kept     : 2 layers, 405.00 KiB; K in [320]
+  outside_prefix  : 1 layers, 144.75 MiB; K in [768]
+
+-- quantization --
+  model.diffusion_model.input_blocks.1.0.transformer_blocks.0.attn2.to_k: (320, 2048) gs=16 cgs=256
+  model.diffusion_model.input_blocks.1.0.transformer_blocks.0.attn2.to_q: (320, 2048) gs=16 cgs=256
+  model.diffusion_model.input_blocks.1.0.transformer_blocks.0.attn2.to_v: (320, 2048) gs=16 cgs=256
+  model.diffusion_model.input_blocks.1.0.transformer_blocks.0.ff.net.2: (320, 1280) gs=16 cgs=256
+  model.diffusion_model.input_blocks.2.0.transformer_blocks.0.attn2.to_k: (320, 2048) gs=16 cgs=256
+  model.diffusion_model.input_blocks.2.0.transformer_blocks.0.attn2.to_q: (320, 2048) gs=16 cgs=256
+  model.diffusion_model.input_blocks.2.0.transformer_blocks.0.attn2.to_v: (320, 2048) gs=16 cgs=256
+  model.diffusion_model.input_blocks.2.0.transformer_blocks.0.ff.net.2: (320, 1280) gs=16 cgs=256
+
+-- calibration --
+  calibration-free (reference format; per-group absmax scales)
+
+-- validation --
+  [passed                ] output-reopen -- 52 tensors, 154.81 MiB
+  [passed                ] output-entry-count -- 52 vs 52 expected
+  [passed                ] output-inventory -- missing=[] extra=[]
+  [passed                ] shape-preservation
+  [passed                ] dtype-check
+  [passed                ] metadata-present -- present
+  [passed                ] extension-metadata-present -- present
+  [passed                ] extension-metadata-schema -- required fields, revision and architecture
+  [passed                ] metadata-source-hash -- source content hashes match
+  [passed                ] tensor-payload-hash -- sha256=ef24b912e4bab9c7740e4e8d3f7e10aab76c83c2f6cdc31ff94d325637c32ed2
+  [passed                ] metadata-layer-inventory -- 8 layers match
+  [passed                ] metadata-layer-conf -- format/group/ConvRot fields valid
+  [passed                ] metadata-runtime-contract -- convrot=256, group_size=16, exact shapes, K%256==0
+  [passed                ] passthrough-integrity -- 20 passthrough tensors byte-identical
+  [passed                ] recon-model.diffusion_model.input_blocks.1.0.transformer_blocks.0.attn2.to_k -- relL2=0.0729 snr=22.7dB cos=0.9973
+  [passed                ] pack-rt-model.diffusion_model.input_blocks.1.0.transformer_blocks.0.attn2.to_k -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.input_blocks.1.0.transformer_blocks.0.attn2.to_q -- relL2=0.0727 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.input_blocks.1.0.transformer_blocks.0.attn2.to_q -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.input_blocks.1.0.transformer_blocks.0.attn2.to_v -- relL2=0.0727 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.input_blocks.1.0.transformer_blocks.0.attn2.to_v -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.input_blocks.1.0.transformer_blocks.0.ff.net.2 -- relL2=0.0727 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.input_blocks.1.0.transformer_blocks.0.ff.net.2 -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.input_blocks.2.0.transformer_blocks.0.attn2.to_k -- relL2=0.0728 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.input_blocks.2.0.transformer_blocks.0.attn2.to_k -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.input_blocks.2.0.transformer_blocks.0.attn2.to_q -- relL2=0.0728 snr=22.8dB cos=0.9973
+  [passed                ] pack-rt-model.diffusion_model.input_blocks.2.0.transformer_blocks.0.attn2.to_q -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.input_blocks.2.0.transformer_blocks.0.attn2.to_v -- relL2=0.0727 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.input_blocks.2.0.transformer_blocks.0.attn2.to_v -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.input_blocks.2.0.transformer_blocks.0.ff.net.2 -- relL2=0.0727 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.input_blocks.2.0.transformer_blocks.0.ff.net.2 -- pack/unpack round trip
+  [passed                ] reconstruction-error-bound -- max full relL2 0.0729 (policy bound 0.25)
+  [passed                ] scale-validation -- 8 layers OK (fp8 s_rel finite/nonnegative, fp32 s_channel finite/positive)
+  [passed                ] deterministic-conversion -- two runs byte-identical
+  [passed                ] deterministic-vs-disk -- recomputed packed weight matches the file
+  [passed                ] output-hash -- sha256=10e7654af95c8caf51683f3e03a2e3a0050cd5dce6eecf015392a1b315dd1aa0
+  [passed                ] compat-comfy-kitchen -- installed comfy-kitchen: 0.2.28, static package source contains AsymW4A8Int8Layout: True
+  [skipped               ] compat-comfyui -- ComfyUI not installed (skipped)
+  [passed                ] input-hash -- {"sdxl_fixture.safetensors":"d283dbbc60dfb24e4c4b0b2c7361ca64f6f34dc67282551680ed05fba0099ad5"}
+  [passed                ] final-publication -- final file reopens; embedded tensor payload hash matches
+
+-- compatibility requirements --
+  comfy-kitchen >= aa1ab2263dc06225d9de6702dfc087313d4bc971 (PR #90, merged) with AsymW4A8Int8Layout; ComfyUI >= v0.31.0 (PR #15308 merged as 344b43989e; older builds need patches/comfyui_w4a8_loader.patch); CUDA: PyTorch cu130+, SM >= 8.0; ROCm: triton >= 3.7; eager works anywhere
+
+-- output integrity --
+  sha256          : 10e7654af95c8caf51683f3e03a2e3a0050cd5dce6eecf015392a1b315dd1aa0
+  input sdxl_fixture.safetensors : d283dbbc60dfb24e4c4b0b2c7361ca64f6f34dc67282551680ed05fba0099ad5
+==============================================================================

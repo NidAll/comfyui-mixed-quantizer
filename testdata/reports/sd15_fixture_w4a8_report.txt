@@ -1,0 +1,74 @@
+==============================================================================
+comfyui_wxa8_quantizer 1.3.0 -- conversion report
+==============================================================================
+format            : asym_w4a8_int8 (asym-w4a8-int8-r1)
+architecture      : sd15 (confidence low)
+unet prefix       : model.diffusion_model.
+input             : safetensors (testdata/sd15_fixture.safetensors)
+output            : testdata/sd15_fixture_w4a8.safetensors (4.92 MiB)
+elapsed           : 1.483 s
+peak RSS          : 613.28 MiB
+warnings:
+  - low detection confidence; consider --architecture override
+
+-- detection evidence --
+  + input_blocks.0.0.weight
+
+-- tensor statistics --
+  input tensors   : 8
+  quantized layers: 2
+  kept tensors    : 6
+
+-- compression --
+  quantized      : 2 / 3 policy-targeted 2D layers
+  byte share     : 56.5% of targeted 2D bytes
+  gate victims   : K in [320] not divisible by 256 (ConvRot-256); kept at original precision
+  convrot groups : {256: 2}
+  group sizes    : {16: 2}
+  quantized       : 2 layers, 4.06 MiB; K in [768, 2560]
+  convrot_rejected: 1 layers, 3.12 MiB; K in [320]
+  policy_kept     : 2 layers, 405.00 KiB; K in [320]
+
+-- quantization --
+  model.diffusion_model.input_blocks.1.0.transformer_blocks.0.attn2.to_k: (320, 768) gs=16 cgs=256
+  model.diffusion_model.input_blocks.1.0.transformer_blocks.0.ff.net.2: (320, 2560) gs=16 cgs=256
+
+-- calibration --
+  calibration-free (reference format; per-group absmax scales)
+
+-- validation --
+  [passed                ] output-reopen -- 14 tensors, 4.92 MiB
+  [passed                ] output-entry-count -- 14 vs 14 expected
+  [passed                ] output-inventory -- missing=[] extra=[]
+  [passed                ] shape-preservation
+  [passed                ] dtype-check
+  [passed                ] metadata-present -- present
+  [passed                ] extension-metadata-present -- present
+  [passed                ] extension-metadata-schema -- required fields, revision and architecture
+  [passed                ] metadata-source-hash -- source content hashes match
+  [passed                ] tensor-payload-hash -- sha256=36f6bf81c5fcc43ad5dc9e9b7624f7ce8bf11ed13bde54f0b5cc813b5b5a7067
+  [passed                ] metadata-layer-inventory -- 2 layers match
+  [passed                ] metadata-layer-conf -- format/group/ConvRot fields valid
+  [passed                ] metadata-runtime-contract -- convrot=256, group_size=16, exact shapes, K%256==0
+  [passed                ] passthrough-integrity -- 6 passthrough tensors byte-identical
+  [passed                ] recon-model.diffusion_model.input_blocks.1.0.transformer_blocks.0.attn2.to_k -- relL2=0.0727 snr=22.8dB cos=0.9974
+  [passed                ] pack-rt-model.diffusion_model.input_blocks.1.0.transformer_blocks.0.attn2.to_k -- pack/unpack round trip
+  [passed                ] recon-model.diffusion_model.input_blocks.1.0.transformer_blocks.0.ff.net.2 -- relL2=0.0729 snr=22.8dB cos=0.9973
+  [passed                ] pack-rt-model.diffusion_model.input_blocks.1.0.transformer_blocks.0.ff.net.2 -- pack/unpack round trip
+  [passed                ] reconstruction-error-bound -- max full relL2 0.0729 (policy bound 0.25)
+  [passed                ] scale-validation -- 2 layers OK (fp8 s_rel finite/nonnegative, fp32 s_channel finite/positive)
+  [passed                ] deterministic-conversion -- two runs byte-identical
+  [passed                ] deterministic-vs-disk -- recomputed packed weight matches the file
+  [passed                ] output-hash -- sha256=86822e038aa5dcfedf800ed01d6dc6df58295fd0f9994470aa0b3339ab99ec28
+  [passed                ] compat-comfy-kitchen -- installed comfy-kitchen: 0.2.28, static package source contains AsymW4A8Int8Layout: True
+  [skipped               ] compat-comfyui -- ComfyUI not installed (skipped)
+  [passed                ] input-hash -- {"sd15_fixture.safetensors":"ea69a2525e9be57e865aa36ac120add9e80728282626da6c660d552c13ad5dc0"}
+  [passed                ] final-publication -- final file reopens; embedded tensor payload hash matches
+
+-- compatibility requirements --
+  comfy-kitchen >= aa1ab2263dc06225d9de6702dfc087313d4bc971 (PR #90, merged) with AsymW4A8Int8Layout; ComfyUI >= v0.31.0 (PR #15308 merged as 344b43989e; older builds need patches/comfyui_w4a8_loader.patch); CUDA: PyTorch cu130+, SM >= 8.0; ROCm: triton >= 3.7; eager works anywhere
+
+-- output integrity --
+  sha256          : 86822e038aa5dcfedf800ed01d6dc6df58295fd0f9994470aa0b3339ab99ec28
+  input sd15_fixture.safetensors : ea69a2525e9be57e865aa36ac120add9e80728282626da6c660d552c13ad5dc0
+==============================================================================

@@ -1,0 +1,123 @@
+# ComfyUI loader patch for W4A8 ("asym_w4a8_int8") checkpoints
+#
+# Adds the ComfyUI-side loader support for the W4A8 format produced by
+# comfyui_wxa8_quantizer.py. Without it ComfyUI fails with:
+#     KeyError: 'asym_w4a8_int8'   (comfy/ops.py, QUANT_ALGOS[module.quant_format])
+#
+# Source : ComfyUI PR #15308 "Support asym w4a8_int" (OPEN as of 2026-08-07),
+#          head 8c3a2b27c37bd34e87b58846baf962407c92843c.
+# Target : ComfyUI v0.30.0 (commit b1693ecba9f5b65f8c80ab36b195ab963ec92413) and
+#          the v0.30.0-based checkout at g0ab8332bfa ("v0.30.0-23-g0ab8332bfa").
+# Files  : comfy/ops.py, comfy/quant_ops.py
+#
+# Apply from the ComfyUI root (git checkout recommended):
+#     git apply patches/comfyui_w4a8_loader.patch
+# or, if git apply reports drifted context (custom forks):
+#     patch -p1 --fuzz=3 < patches/comfyui_w4a8_loader.patch
+# Then restart ComfyUI. The startup log should list asym_w4a8_int8 among the
+# native ops, e.g. "Native ops: asym_w4a8_int8, convrot_w4a4, int8_tensorwise".
+#
+# This patch is the ComfyUI runtime half of the W4A8 support. The other half is
+# comfy-kitchen >= 0.2.x with AsymW4A8Int8Layout (comfy-kitchen PR #90, merged).
+diff --git a/comfy/ops.py b/comfy/ops.py
+index 077a4235..48d30f57 100644
+--- a/comfy/ops.py
++++ b/comfy/ops.py
+@@ -1209,6 +1209,26 @@ def _load_quantized_module(module, super_load, state_dict, prefix, local_metadat
+                 "quant_group_size": 64,
+                 "linear_dtype": layer_conf.get("linear_dtype", params_conf.get("linear_dtype", "int4")),
+             }
++        elif module.quant_format == "asym_w4a8_int8":
++            # int4 weight (packed int8 [N,K/2]) + fp8 per-group scale (weight_s_rel),
++            # fp32 per-channel scale (weight_s_channel) + optional Lloyd-Max codebook.
++            scale = pop_scale("weight_s_rel")
++            if scale is None:
++                raise ValueError(f"Missing W4A8 group scale (weight_s_rel) for layer {layer_name}")
++            if scale.dtype == torch.uint8:
++                scale = scale.view(torch.float8_e4m3fn)
++            params_conf = layer_conf.get("params", {})
++            if not isinstance(params_conf, dict):
++                params_conf = {}
++            scales = {
++                "scale": scale,
++                "s_channel": pop_scale("weight_s_channel"),
++                "codebook": pop_scale("weight_codebook"),
++                "group_size": int(layer_conf.get("group_size", params_conf.get("group_size", 16))),
++                "convrot_groupsize": int(
++                    layer_conf.get("convrot_groupsize", params_conf.get("convrot_groupsize", 256))
++                ),
++            }
+         else:
+             raise ValueError(f"Unsupported quantization format: {module.quant_format}")
+ 
+@@ -1260,6 +1280,9 @@ def _quantized_weight_state_dict(module, sd, prefix, extra_quant_conf=None, extr
+             linear_dtype = getattr(params, "linear_dtype", "int4")
+             if linear_dtype != "int4":
+                 quant_conf["linear_dtype"] = linear_dtype
++        elif module.quant_format == "asym_w4a8_int8":
++            quant_conf["group_size"] = getattr(params, "group_size", 16)
++            quant_conf["convrot_groupsize"] = getattr(params, "convrot_groupsize", 256)
+         if extra_quant_conf:
+             quant_conf.update(extra_quant_conf)
+         sd[f"{prefix}comfy_quant"] = torch.tensor(list(json.dumps(quant_conf).encode("utf-8")), dtype=torch.uint8)
+diff --git a/comfy/quant_ops.py b/comfy/quant_ops.py
+index 53586956..6d9112db 100644
+--- a/comfy/quant_ops.py
++++ b/comfy/quant_ops.py
+@@ -28,6 +28,7 @@ try:
+         TensorCoreNVFP4Layout as _CKNvfp4Layout,
+         TensorCoreConvRotW4A4Layout as _CKTensorCoreConvRotW4A4Layout,
+         TensorWiseINT8Layout as _CKTensorWiseINT8Layout,
++        AsymW4A8Int8Layout as _CKAsymW4A8Int8Layout,
+         register_layout_op,
+         register_layout_class,
+         get_layout_class,
+@@ -83,6 +84,9 @@ except ImportError as e:
+     class _CKTensorCoreConvRotW4A4Layout:
+         pass
+ 
++    class _CKAsymW4A8Int8Layout:
++        pass
++
+     def register_layout_class(name, cls):
+         pass
+ 
+@@ -212,7 +216,7 @@ class TensorCoreFP8E5M2Layout(_TensorCoreFP8LayoutBase):
+ TensorCoreFP8Layout = TensorCoreFP8E4M3Layout
+ TensorWiseINT8Layout = _CKTensorWiseINT8Layout
+ TensorCoreConvRotW4A4Layout = _CKTensorCoreConvRotW4A4Layout
+-
++AsymW4A8Int8Layout = _CKAsymW4A8Int8Layout
+ 
+ # ==============================================================================
+ # Registry
+@@ -226,6 +230,7 @@ register_layout_class("TensorWiseINT8Layout", _CKTensorWiseINT8Layout)
+ register_layout_class("TensorCoreConvRotW4A4Layout", _CKTensorCoreConvRotW4A4Layout)
+ if _CK_MXFP8_AVAILABLE:
+     register_layout_class("TensorCoreMXFP8Layout", TensorCoreMXFP8Layout)
++register_layout_class("AsymW4A8Int8Layout", _CKAsymW4A8Int8Layout)
+ 
+ QUANT_ALGOS = {
+     "float8_e4m3fn": {
+@@ -268,6 +273,13 @@ QUANT_ALGOS["convrot_w4a4"] = {
+     "quantize_input": False,
+ }
+ 
++QUANT_ALGOS["asym_w4a8_int8"] = {
++    "storage_t": torch.int8,
++    "parameters": {"weight_scale"},
++    "comfy_tensor_layout": "AsymW4A8Int8Layout",
++    "quantize_input": False,
++}
++
+ 
+ # ==============================================================================
+ # Re-exports for backward compatibility
+@@ -282,6 +294,7 @@ __all__ = [
+     "TensorCoreNVFP4Layout",
+     "TensorCoreConvRotW4A4Layout",
+     "TensorWiseINT8Layout",
++    "AsymW4A8Int8Layout",
+     "QUANT_ALGOS",
+     "register_layout_op",
+ ]

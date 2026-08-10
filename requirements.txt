@@ -1,0 +1,7 @@
+# Core converter: standalone, no ComfyUI/comfy-kitchen imports at runtime
+torch>=2.1
+safetensors>=0.4.3
+numpy
+
+# Hugging Face download/upload (tools/hf_mixed_quantize.py, Colab flow)
+huggingface_hub
