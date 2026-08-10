@@ -111,6 +111,8 @@ DEFAULT_W4A4_LINEAR_DTYPE = "int8"  # default execution variant: "int4" or "int8
 
 INT8_SCALE_MAX = 127
 
+CODEBOOK_SAMPLE_COUNT = 300000  # canonical Lloyd-Max sample size (chunk-invariant)
+
 W4A4_MAX_REL_L2 = 0.20
 
 INT8_MAX_REL_L2 = 0.05
@@ -121,7 +123,7 @@ FORMAT_MIXED_REVISION = "mixed-r1"
 
 W4A8_CONVROT_GROUPSIZE = 256
 
-QUANT_ALGORITHM_REVISION = "lloydmax-codebook-r1"
+QUANT_ALGORITHM_REVISION = "lloydmax-codebook-r2"  # canonical sample count; --seed controls sampling
 
 # Algorithm identity (Phase 0): independent revisions per algorithm surface, so
 # a converter version bump is never the only provenance signal. Each fix that
@@ -3170,15 +3172,17 @@ def w4_weight_is_quantizable(shape: Sequence[int], dtype: torch.dtype,
     return True, "ok"
 
 def fit_codebook(normalized: torch.Tensor, levels: int = 16, iterations: int = 25,
-                 sample_size: int = 300000) -> torch.Tensor:
+                 sample_size: int = CODEBOOK_SAMPLE_COUNT,
+                 seed: int = 0) -> torch.Tensor:
     """Data-free Lloyd-Max codebook on normalized rotated weights.
 
     Deterministic: subsampling (when needed) uses a fixed-seed generator, exactly
-    like the reference implementation.
+    like the reference implementation. The sample count is canonical (never
+    derived from the memory budget), so chunked and in-memory paths agree.
     """
     samples = normalized.flatten()
     if samples.numel() > sample_size:
-        generator = torch.Generator(device=samples.device).manual_seed(0)
+        generator = torch.Generator(device=samples.device).manual_seed(seed)
         indices = torch.randint(0, samples.numel(), (sample_size,),
                                 device=samples.device, generator=generator)
         samples = samples[indices]
@@ -3220,7 +3224,7 @@ def assign_grid(weight: torch.Tensor, levels: torch.Tensor, s_channel: torch.Ten
 def quantize_w4a8_weight(weight: torch.Tensor, group_size: int = 16,
                          convrot_groupsize: int = 256, symmetric: bool = True,
                          scale_dtype: torch.dtype = torch.float8_e4m3fn,
-                         codebook: bool = True,
+                         codebook: bool = True, seed: int = 0,
                          ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
                                     Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Quantize a floating 2D weight into W4A8 storage.
@@ -3233,10 +3237,12 @@ def quantize_w4a8_weight(weight: torch.Tensor, group_size: int = 16,
         raise PolicyError(f"scale_dtype must be float32 or float8_e4m3fn, got {scale_dtype}")
     validate_w4_shape(int(weight.shape[1]), group_size, convrot_groupsize)
     rotated = rotate_int8_convrot_weight(weight, convrot_groupsize)
-    return _quantize_rotated_w4a8(rotated, group_size, symmetric, scale_dtype, codebook)
+    return _quantize_rotated_w4a8(rotated, group_size, symmetric, scale_dtype,
+                                  codebook, seed=seed)
 
 def _quantize_rotated_w4a8(weight: torch.Tensor, group_size: int, symmetric: bool,
                            scale_dtype: torch.dtype, codebook: bool,
+                           seed: int = 0,
                            ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
                                       Optional[torch.Tensor], Optional[torch.Tensor]]:
     original_dtype = weight.dtype
@@ -3249,7 +3255,7 @@ def _quantize_rotated_w4a8(weight: torch.Tensor, group_size: int, symmetric: boo
     if symmetric and codebook:
         group_scale = grouped_weight.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
         normalized = grouped_weight / group_scale
-        codebook_tensor = fit_codebook(normalized, levels=16)
+        codebook_tensor = fit_codebook(normalized, levels=16, seed=seed)
         quantized = assign_codes(normalized, codebook_tensor)
         for _ in range(3):
             qc = codebook_tensor[quantized]
@@ -3480,14 +3486,16 @@ def decode_w4a8_runtime_weight(packed: torch.Tensor, s_rel: torch.Tensor,
     return values.view(n, k).round().clamp_(-127, 127).to(torch.int8)
 
 def quantize_weight_by_format(weight: torch.Tensor, fmt: str, group_size: int,
-                              convrot_groupsize: int) -> Dict[str, torch.Tensor]:
+                              convrot_groupsize: int,
+                              seed: int = 0) -> Dict[str, torch.Tensor]:
     """Quantize with the W4A8 layout; returns the per-layer output tensors
     keyed by suffix ('' for the packed weight, '_s_rel', '_s_channel',
     '_codebook', optional '_correction')."""
     if fmt == FORMAT_W4A8:
         packed, s_rel, s_ch, corr, cb = quantize_w4a8_weight(
             weight, group_size=group_size, convrot_groupsize=convrot_groupsize,
-            symmetric=True, scale_dtype=torch.float8_e4m3fn, codebook=True)
+            symmetric=True, scale_dtype=torch.float8_e4m3fn, codebook=True,
+            seed=seed)
         out = {"": packed, "_s_rel": s_rel, "_s_channel": s_ch, "_codebook": cb}
         if corr is not None:
             out["_correction"] = corr
@@ -5733,11 +5741,10 @@ def _chunk_rows_for_budget(k: int, n: int, max_mem: int) -> int:
             f"working row (estimated {human_bytes(row_work)})")
     return max(1, min(n, max_mem // row_work))
 
-def _codebook_sample_size(max_mem: int, total_elements: int) -> int:
-    # Lloyd-Max temporarily materializes distances/assignments.  Keep that
-    # working set below roughly half the user budget.
-    budgeted = max(4096, max_mem // 128)
-    return min(300000, total_elements, budgeted)
+def _codebook_sample_size(total_elements: int) -> int:
+    """Canonical Lloyd-Max sample count. Independent of the memory budget so
+    that chunking never changes the quantization algorithm."""
+    return min(CODEBOOK_SAMPLE_COUNT, total_elements)
 
 def _quantize_rotated_w4a8_with_codebook(weight: torch.Tensor, group_size: int,
                                          codebook: torch.Tensor,
@@ -5769,18 +5776,19 @@ def _gather_codebook_samples(reader: CheckpointReader, name: str, k: int,
                              group_size: int, convrot_groupsize: int,
                              sample_size: int, chunk_rows: int,
                              device: Any = "cpu",
-                             compute_dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+                             compute_dtype: Optional[torch.dtype] = None,
+                             seed: int = 0) -> torch.Tensor:
     """Deterministic subsample of normalized rotated weights for codebook fitting.
 
-    Draws `sample_size` flattened indices with the reference seed-0 generator,
-    then gathers those elements chunk by chunk.  Used only when a tensor does
+    Draws `sample_size` flattened indices with the seeded generator, then
+    gathers those elements chunk by chunk.  Used only when a tensor does
     not fit in the memory budget; identical distribution to the reference path.
     """
     meta = reader.info.by_name(name)
     n = int(meta.shape[0])
     total = n * k
     if total > sample_size:
-        gen = torch.Generator(device="cpu").manual_seed(0)
+        gen = torch.Generator(device="cpu").manual_seed(seed)
         idx = torch.randint(0, total, (sample_size,), device="cpu", generator=gen)
     else:
         idx = torch.arange(total, device="cpu")
@@ -5815,6 +5823,7 @@ def quantize_tensor_bounded(reader: CheckpointReader, name: str, fmt: str,
                             group_size: int, convrot_groupsize: int,
                             max_mem: int, device: Any,
                             compute_dtype: Optional[torch.dtype] = None,
+                            seed: int = 0,
                             ) -> Dict[str, torch.Tensor]:
     """Quantize one tensor with a bounded working set (chunked when needed).
 
@@ -5833,7 +5842,8 @@ def quantize_tensor_bounded(reader: CheckpointReader, name: str, fmt: str,
         if device.type == "cuda":
             w = w.to(device)
         try:
-            out = quantize_weight_by_format(w, fmt, group_size, convrot_groupsize)
+            out = quantize_weight_by_format(w, fmt, group_size,
+                                            convrot_groupsize, seed=seed)
         finally:
             del w
         if device.type != "cpu":
@@ -5855,16 +5865,17 @@ def quantize_tensor_bounded(reader: CheckpointReader, name: str, fmt: str,
             if device.type == "cuda":
                 chunk = chunk.to(device)
             part = quantize_weight_by_format(chunk, fmt, group_size,
-                                             convrot_groupsize)
+                                             convrot_groupsize, seed=seed)
             for s in parts:
                 t = part[s]
                 parts[s].append(t.cpu() if device.type != "cpu" else t)
             del chunk, part
         return {s: torch.cat(v, dim=0).contiguous() for s, v in parts.items()}
-    sample_size = _codebook_sample_size(max_mem, n * k)
+    sample_size = _codebook_sample_size(n * k)
     codebook = _gather_codebook_samples(reader, name, k, group_size,
                                         convrot_groupsize, sample_size, chunk_rows,
-                                        device="cpu", compute_dtype=compute_dtype)
+                                        device="cpu", compute_dtype=compute_dtype,
+                                        seed=seed)
     # per-chunk processing
     packed_parts: List[torch.Tensor] = []
     s_rel_parts: List[torch.Tensor] = []
@@ -5964,7 +5975,8 @@ def apply_sensitivity_prepass(info: CheckpointInfo,
                               decisions: List[TensorDecision],
                               analyzer: SensitivityAnalyzer,
                               max_mem: int, device: torch.device,
-                              compute_dtype: Optional[torch.dtype]) -> None:
+                              compute_dtype: Optional[torch.dtype],
+                              seed: int = 0) -> None:
     """Freeze sensitivity decisions before the safetensors inventory is built."""
     with CheckpointReader(info) as reader:
         for decision in decisions:
@@ -5983,7 +5995,7 @@ def apply_sensitivity_prepass(info: CheckpointInfo,
                 quantized = quantize_tensor_bounded(
                     reader, decision.name, FORMAT_W4A8, decision.group_size,
                     decision.convrot_groupsize, max_mem, device,
-                    compute_dtype=compute_dtype)
+                    compute_dtype=compute_dtype, seed=seed)
                 dequant = dequantize_weight_by_format(
                     quantized, FORMAT_W4A8, decision.group_size,
                     decision.convrot_groupsize, torch.float32)
@@ -5993,11 +6005,11 @@ def apply_sensitivity_prepass(info: CheckpointInfo,
             else:
                 n, k = int(meta.shape[0]), int(meta.shape[1])
                 chunk_rows = _chunk_rows_for_budget(k, n, max_mem)
-                sample_size = _codebook_sample_size(max_mem, n * k)
+                sample_size = _codebook_sample_size(n * k)
                 codebook = _gather_codebook_samples(
                     reader, decision.name, k, decision.group_size,
                     decision.convrot_groupsize, sample_size, chunk_rows,
-                    compute_dtype=compute_dtype)
+                    compute_dtype=compute_dtype, seed=seed)
                 accumulator = _MetricAccumulator(decision.name)
                 for r0 in range(0, n, chunk_rows):
                     r1 = min(n, r0 + chunk_rows)
@@ -6238,10 +6250,10 @@ class MixedPlanner:
                 act_q, act_scale = _act_quant_int8(x_rot)
                 out_acc = _OutputErrorAccumulator(n_samples)
         if fmt == FORMAT_W4A8:
-            sample_size = _codebook_sample_size(self.max_mem, n * k)
+            sample_size = _codebook_sample_size(n * k)
             codebook = _gather_codebook_samples(
                 reader, d.name, k, d.group_size, cgs, sample_size, chunk_rows,
-                compute_dtype=self.compute_dtype)
+                compute_dtype=self.compute_dtype, seed=self.seed)
             for r0 in range(0, n, chunk_rows):
                 r1 = min(n, r0 + chunk_rows)
                 q = _quantize_row_chunk(reader, d.name, r0, r1, d.group_size,
@@ -7111,7 +7123,8 @@ class ConversionEngine:
                     quant_tensors = quantize_tensor_bounded(
                         self.reader, d.name, d.format, d.group_size,
                         d.convrot_groupsize, max_mem, device,
-                        compute_dtype=compute_dtype)
+                        compute_dtype=compute_dtype,
+                        seed=getattr(self.args, "seed", 0))
                     self._write_quantized(d, quant_tensors, entries_by_name)
                     del quant_tensors
             else:
@@ -7177,10 +7190,11 @@ class ConversionEngine:
                                                   device, compute_dtype)
             return
         chunk_rows = _chunk_rows_for_budget(k, n, max_mem)
-        sample_size = _codebook_sample_size(max_mem, n * k)
+        sample_size = _codebook_sample_size(n * k)
         codebook = _gather_codebook_samples(
             self.reader, d.name, k, d.group_size, d.convrot_groupsize,
-            sample_size, chunk_rows, compute_dtype=compute_dtype)
+            sample_size, chunk_rows, compute_dtype=compute_dtype,
+            seed=getattr(self.args, "seed", 0))
         suffix_map = {"": ".weight", "_s_rel": ".weight_s_rel",
                       "_s_channel": ".weight_s_channel"}
         hashers = {suffix: hashlib.sha256() for suffix in suffix_map}
@@ -7238,7 +7252,8 @@ class ConversionEngine:
             if device.type == "cuda":
                 chunk = chunk.to(device)
             part = quantize_weight_by_format(chunk, d.format, d.group_size,
-                                             d.convrot_groupsize)
+                                             d.convrot_groupsize,
+                                             seed=getattr(self.args, "seed", 0))
             for suffix in suffixes:
                 name = d.layer + output_suffixes[suffix]
                 data = tensor_to_bytes(part[suffix].cpu() if device.type != "cpu"
@@ -8644,11 +8659,13 @@ class Validator:
                 out1 = quantize_tensor_bounded(
                     reader, d0.name, d0.format, d0.group_size,
                     d0.convrot_groupsize, max_mem, torch.device("cpu"),
-                    compute_dtype=compute_dtype)
+                    compute_dtype=compute_dtype,
+                    seed=getattr(args, "seed", 0))
                 out2 = quantize_tensor_bounded(
                     reader, d0.name, d0.format, d0.group_size,
                     d0.convrot_groupsize, max_mem, torch.device("cpu"),
-                    compute_dtype=compute_dtype)
+                    compute_dtype=compute_dtype,
+                    seed=getattr(args, "seed", 0))
                 det = all(torch.equal(out1[k], out2[k]) for k in out1)
                 self.check("deterministic-conversion", det, "two runs byte-identical")
                 if conv_device == "cpu" and d0.name not in getattr(self.plan, "chunked_layers", set()):
@@ -9159,6 +9176,59 @@ def _test_w4_pack_roundtrip() -> str:
         rt = unpack_w4(packed)
         assert torch.equal(rt, codes), f"K={k} mismatch"
     return "K=16..256 round trips"
+
+def _run_w4a8_payload(src: str, out: str, max_mem: int, seed: int = 0) -> str:
+    """Convert a w4a8 checkpoint at a given memory budget and return the
+    tensor payload hash (stable across metadata rewrites)."""
+    info = discover_checkpoint(src)
+    det = detect_architecture(
+        info, shape_lookup=lambda nm: (info.by_name(nm).shape
+                                       if info.by_name(nm) else None))
+    dec = classify_tensors(info, det, FORMAT_W4A8, None, [], [], [], None, None)
+    args = _selftest_args(out, FORMAT_W4A8, extra={
+        "max_memory": max_mem, "seed": seed})
+    plan = ConversionPlan(fmt=FORMAT_W4A8, detection=det, decisions=dec,
+                          metadata_quant={}, metadata_ext={}, output_entries=[])
+    entries, total = build_output_entries(info, dec, FORMAT_W4A8, None)
+    plan.output_entries = entries
+    plan.total_out_bytes = total
+    plan.n_quantized = len(plan.quantized_layers())
+    plan.n_kept = len(dec) - plan.n_quantized
+    plan.metadata_quant = build_quant_metadata(info, plan)
+    engine = ConversionEngine(info, plan, args, out + ".state.json",
+                              out + ".tmp", out)
+    try:
+        engine.run()
+    finally:
+        engine.close()
+    return sha256_safetensors_payload(out)
+
+
+def _test_chunk_invariant_payload() -> str:
+    """The quantization algorithm is independent of --max-memory (canonical
+    codebook sample count) and --seed deterministically controls sampling."""
+    d = _tmpdir()
+    src = os.path.join(d, "fixture.safetensors")
+    _make_boogu_real_dims_checkpoint(src, n=64, n_fail=2, n_ok=2)
+    hashes: Dict[str, str] = {}
+    for label, mem in (("32M", MIN_CHUNK_MEMORY),
+                       ("64M", 64 * 1024**2),
+                       ("8G", 8 * 1024**3)):
+        hashes[label] = _run_w4a8_payload(
+            src, os.path.join(d, f"out_{label}.safetensors"), mem)
+    assert hashes["32M"] == hashes["64M"] == hashes["8G"], hashes
+    # --seed controls sampling: same seed reproduces, different seed changes
+    s1a = _run_w4a8_payload(src, os.path.join(d, "out_s1a.safetensors"),
+                            64 * 1024**2, seed=1)
+    s1b = _run_w4a8_payload(src, os.path.join(d, "out_s1b.safetensors"),
+                            64 * 1024**2, seed=1)
+    s2 = _run_w4a8_payload(src, os.path.join(d, "out_s2.safetensors"),
+                           64 * 1024**2, seed=2)
+    assert s1a == s1b, (s1a, s1b)
+    assert s1a != s2, (s1a, s2)
+    return (f"chunk-invariant payload (32M==64M==8G, {hashes['64M'][:8]}...); "
+            "--seed deterministic (1!=2, 1==1)")
+
 
 def _test_odd_dims() -> str:
     torch.manual_seed(3)
@@ -11388,6 +11458,7 @@ def _selftest_args(out: str, fmt: str, resume: bool = False, overwrite: bool = F
 SELF_TEST_CASES: List[Tuple[str, Callable[[], str]]] = [
 
             ("w4-pack-roundtrip", _test_w4_pack_roundtrip),
+            ("chunk-invariant-payload", _test_chunk_invariant_payload),
             ("odd-dims", _test_odd_dims),
             ("padding-removal", _test_padding_removal),
             ("scale-calculations", _test_scale_calculations),
@@ -11976,7 +12047,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             compression_target_bpp=args.max_linear_bytes_per_param,
             max_bf16_fraction=args.max_bf16_fraction,
             linear_dtype=args.w4a4_linear_dtype,
-            runtime_certificate=certificate)
+            runtime_certificate=certificate,
+            seed=args.seed)
         if args.require_runtime_certificate and certificate is None:
             raise RuntimeCompatibilityError(
                 "--require-runtime-certificate needs --runtime-certificate "
@@ -12019,7 +12091,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             else detection.policy.max_rel_l2,
             calibration)
         apply_sensitivity_prepass(info, decisions, sensitivity, args.max_memory,
-                                  effective_device, compute_dtype)
+                                  effective_device, compute_dtype,
+                                  seed=args.seed)
         kept_by_sensitivity = sum(1 for m in sensitivity.results.values() if m.kept)
         if kept_by_sensitivity:
             warnings.append(

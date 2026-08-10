@@ -153,6 +153,7 @@ measured output error.
 | `--runtime-certificate PATH`, `--require-runtime-certificate` | observed-behavior override / hard certification |
 | `--strip-gpu-identity` | omit GPU name, capability, ROCm from metadata |
 | `--device auto\|cpu\|cuda\|rocm` | quantization compute device |
+| `--seed N` | seed for codebook sampling (default 0; 0 keeps the reference path) |
 | `--max-memory SIZE` | per-tensor working budget (default 2G) |
 | `--validate`, `--validation-only` | full check after conversion / re-check an output |
 | `--verify-output PATH` | source-free check of an existing output: structure, metadata, packing, payload hash |
@@ -221,7 +222,7 @@ W4A4 and INT8.
 
 ## Checking the result
 
-* `--self-test`: 45 embedded checks. Golden vectors for W4A8, W4A4, and INT8
+* `--self-test`: 46 embedded checks. Golden vectors for W4A8, W4A4, and INT8
   (embedded reference weight, cross-platform safe), the eligibility matrix,
   mixed planning on real Boogu and Kroma dims, hard gate failures, BF16
   promotion, runtime capability matrix, planner determinism, corrupted
