@@ -1,0 +1,41 @@
+Behavior baseline freeze - 1.4.0-experimental (pre-hardening)
+Recorded: 2026-08-10, commit be610d9 + clean tree
+Purpose: reference for the remove-experimental plan; every fix must keep
+w4a8 payloads byte-identical and mixed payloads reproducible.
+
+converter_version      = 1.4.0-experimental
+self_test_count        = 40/40 (passed)
+torch                  = 2.13.0+cu130
+comfy-kitchen          = 0.2.28
+safetensors            = 0.8.0
+
+fixture                = testdata/boogu_real_fixture.safetensors
+input sha256           = c72f5a44c7a8ed7d15d80ced980a56ecb564f735acf34c556bc298ee09287e4c
+input size             = 1.14 GiB
+
+--format w4a8 (--validate)
+output sha256          = 50c73afb426d5682d90427ad064949385e64593bba5e1cf9bd8b0c48788d6eec
+tensor_data_sha256     = 8e549e673565fadb4f81edb577687eb01d56336abed1a33cc45b7b6e689bb17c
+validation             = 60 passed, 0 warnings, 0 failed, 1 skipped
+quantized              = 19 layers asym_w4a8_int8; 336 kept; output 841.08 MiB
+note                   = pre-existing artifact boogu_real_fixture_w4a8.safetensors
+                          (0c140cdc...) differs ONLY in the embedded validation
+                          summary (older validator revision: 50 passed); payload
+                          hash identical. Full-file byte-identity requires
+                          pinned VALIDATION_REVISION (Phase 0).
+
+--format mixed --profile balanced (--validate)
+output sha256          = eda3185c91c61b66cf6db9ba4fd11208059e7fe5edff5d0e5aa88e79303579ad
+tensor_data_sha256     = caeef3a717baa95297aba929ffde56ad86fb17442c0682de7e147a280afd9525
+validation             = 328 passed, 0 warnings, 0 failed, 1 skipped
+quantized              = 153 layers (W4A8 x19, INT8 x134); 202 kept; output 346.69 MiB
+gates                  = layer<=0.10 global<=0.08 (mean 0.0320); 0.842 B/param (target 0.9)
+note                   = FILE byte-identical to pre-existing artifact
+                          boogu_real_fixture_mixed.safetensors (eda3185c...) -
+                          full-file determinism holds for mixed at this revision.
+
+regression commands (per fix):
+  .venv/bin/python comfyui_wxa8_quantizer.py testdata/boogu_real_fixture.safetensors \
+      --output testdata/baseline_w4a8.safetensors --format w4a8 --validate --overwrite
+  ... same with --format mixed --profile balanced -> baseline_mixed.safetensors
+  compare: sha256sum outputs; extract tensor_data_sha256 from metadata
