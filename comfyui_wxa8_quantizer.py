@@ -129,7 +129,7 @@ QUANT_ALGORITHM_REVISION = "lloydmax-codebook-r1"
 # embedded in the extension metadata of every output.
 MIXED_PLANNER_REVISION = "mixed-planner-r2"  # per-format runtime_certified; cert applied pre-plan
 VALIDATION_REVISION = "validator-r2"  # chunked INT8 validation fixed
-CALIBRATION_REVISION = "calibration-r1"
+CALIBRATION_REVISION = "calibration-r2"  # content-addressed cache (v2 fingerprint)
 
 
 def get_algorithm_identity() -> Dict[str, str]:
@@ -5217,6 +5217,24 @@ def _check_calibration_file_budget(path: str, max_memory: int) -> int:
             f"above --max-memory {human_bytes(max_memory)}")
     return required
 
+def _calibration_checkpoint_fingerprint(info: CheckpointInfo) -> Dict[str, str]:
+    """Content-addressed binding of a calibration cache to its checkpoint:
+    portable file labels -> sha256 of each input file. Same layer names and
+    widths are NOT sufficient (they are not content)."""
+    labels = _portable_file_labels(sorted(info.files))
+    hashes = hash_checkpoint_files(info)
+    return dict(zip(labels, (hashes[p] for p in sorted(info.files))))
+
+
+def _calibration_layer_mapping_fingerprint(info: CheckpointInfo) -> str:
+    """Fingerprint of the linear-layer inventory (name/dtype/shape), so a
+    cache cannot silently survive a layer-mapping change that keeps content."""
+    lines = sorted(
+        f"{t.name}:{t.dtype}:{','.join(str(s) for s in t.shape)}"
+        for t in info.tensors if t.name.endswith(".weight"))
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
+
 def load_calibration(source: str, info: CheckpointInfo, max_samples: Optional[int],
                      cache_path: Optional[str],
                      max_memory: int = 2 * 1024**3) -> CalibrationStats:
@@ -5288,6 +5306,21 @@ def load_calibration(source: str, info: CheckpointInfo, max_samples: Optional[in
                 raise CalibrationError("calibration cache provenance must be an object")
             prov = dict(prov)
             prov["cache_file_sha256"] = cache_hash_after
+            if prov.get("schema") == "comfy-wxa8-calibration/v2":
+                # content-addressed: the cache is bound to the checkpoint it
+                # was built from; a different checkpoint (even with identical
+                # layer names and widths) must not reuse it
+                expected_fp = _calibration_checkpoint_fingerprint(info)
+                if prov.get("checkpoint_fingerprint") != expected_fp:
+                    log().warning(
+                        "calibration cache %s: checkpoint fingerprint mismatch "
+                        "(model changed); cache ignored, fresh load", cache_path)
+                    stats = {}
+            elif not prov.get("checkpoint_fingerprint"):
+                log().warning(
+                    "calibration cache %s has no v2 checkpoint fingerprint; "
+                    "accepting as legacy (rebuild the cache to bind it)",
+                    cache_path)
             if stats:
                 log().info("calibration activation rows loaded from cache %s", cache_path)
                 return CalibrationStats(source=source, files=[cache_path],
@@ -5389,6 +5422,14 @@ def load_calibration(source: str, info: CheckpointInfo, max_samples: Optional[in
         stats[k] = {"samples": v.contiguous(), "rows": int(v.shape[0])}
 
     provenance = {
+        "schema": "comfy-wxa8-calibration/v2",
+        "checkpoint_fingerprint": _calibration_checkpoint_fingerprint(info),
+        "layer_mapping_fingerprint": _calibration_layer_mapping_fingerprint(info),
+        "calibration_files": {
+            Path(f).name: h for f, h in final_calibration_hashes.items()},
+        "preprocessing_revision": CALIBRATION_REVISION,
+        "max_samples": effective_max_samples,
+        "compute_precision": "float32",
         "source": source,
         "files": files,
         "n_files": len(files),
@@ -9161,7 +9202,26 @@ def _test_activation_calibration() -> str:
     fake_value = activation_aware_error(original, dequant, fake)
     assert expected is not None and abs(metrics.act_rel_l2 - expected) < 1e-8
     assert abs(metrics.act_rel_l2 - fake_value) > 1e-6
-    return "real rows used directly; compressed safe cache round-trips"
+    # content-addressed cache (v2): the cache is bound to the checkpoint it
+    # was built from; a different checkpoint with identical layer names and
+    # widths must NOT reuse it
+    model2_path = os.path.join(d, "calibration_model2.safetensors")
+    safetensors.torch.save_file(
+        {"layer.weight": torch.randn(8, 16) * 3.0}, model2_path)
+    info2 = discover_checkpoint(model2_path)
+    hashes2 = hash_checkpoint_files(info2)
+    labels2 = _portable_file_labels(sorted(info2.files))
+    cal2 = load_calibration(source_path, info2, 5, cache_path)
+    fp = cal2.provenance.get("checkpoint_fingerprint")
+    assert isinstance(fp, dict) and fp, \
+        "cache must be content-addressed (v2 checkpoint fingerprint)"
+    assert fp == dict(zip(labels2, (hashes2[p] for p in sorted(info2.files)))), fp
+    # and the first model still reuses its own cache
+    cal1 = load_calibration(source_path, info, 5, cache_path)
+    fp1 = cal1.provenance.get("checkpoint_fingerprint")
+    assert isinstance(fp1, dict) and fp1 and fp1 != fp
+    return ("real rows used directly; compressed safe cache round-trips; "
+            "v2 content-addressed cache rejects a different checkpoint")
 
 def _test_standalone_environment() -> str:
     import builtins
