@@ -1,7 +1,0 @@
-# Optional: ONLY for the companion tools that may import comfy-kitchen:
-#   tools/runtime_certify.py
-#   testdata/runtime_equivalence.py
-#   tools/certified_convert.py --certify
-# The standalone converter itself never needs these.
-comfy-kitchen
-packaging

@@ -1,24 +1,21 @@
 # ComfyUI mixed precision quantizer
 
-A single-file converter that turns a diffusion model checkpoint into a quantized
-checkpoint ComfyUI can load. It runs standalone: detection, quantization,
-packing, metadata, and validation are reimplemented in one file against
-verified reference behavior, and no ComfyUI or comfy-kitchen code is imported
-at runtime.
+A single-file converter that turns a diffusion model checkpoint into a
+quantized checkpoint ComfyUI can load. Detection, quantization, packing,
+metadata, and validation are reimplemented in one file against verified
+reference behavior; no ComfyUI or comfy-kitchen code is imported at runtime.
 
 Two modes:
 
-* `--format w4a8` (default, stable): every quantized layer uses `asym_w4a8_int8`
-  (ConvRot 256, group 16, Lloyd-Max codebook). This path is byte-identical to
-  v1.3.0, guarded by the golden-vector self-tests.
-* `--format mixed` (experimental, requires `--experimental`): a per-layer
-  optimizer over `convrot_w4a4`, `asym_w4a8_int8`, and `int8_tensorwise`.
-  Each layer gets the cheapest format that stays inside a quality gate; layers
-  that cannot meet the gate stay at original precision. Mixed stays behind the
-  experimental flag until its planner/calibration/runtime-probe qualification
-  cycle is complete.
+* `--format w4a8` (default, stable channel): every quantized layer uses
+  `asym_w4a8_int8` (ConvRot 256, group 16, Lloyd-Max codebook). This path is
+  byte-identical to v1.3.0, guarded by golden-vector self-tests.
+* `--format mixed` (experimental channel, requires `--experimental`): a
+  per-layer optimizer over `convrot_w4a4`, `asym_w4a8_int8`, and
+  `int8_tensorwise`. Each layer gets the cheapest format that stays inside a
+  quality gate; layers that cannot meet the gate stay at original precision.
 
-Current version: `1.5.0` (stable channel: `--format w4a8`).
+Current version: `1.5.0`.
 
 ## How it works
 
@@ -27,8 +24,8 @@ gates.
 
 1. **Inspect.** The safetensors header (names, shapes, dtypes) is read and the
    architecture is matched against an embedded registry of 43 policy families
-   covering all 98 ComfyUI model classes. Unknown architectures fail closed
-   unless `--architecture` is given.
+   covering all 99 ComfyUI model classes at the research revision. Unknown
+   architectures fail closed unless `--architecture` is given.
 2. **Decide.** Each family policy defines which 2D float linear weights are
    quantizable and which stay at original precision (patch embedders, time and
    text embedders, output heads, norms). In w4a8 mode the only further rule is
@@ -47,14 +44,18 @@ gates.
    overwrites the input.
 5. **Validate.** `--validate` reopens the output and checks inventory, shapes,
    dtypes, per-format metadata, packing round trips, reconstruction error
-   against the source, determinism, and hashes.
+   against the source, determinism, and hashes. Reconstruction uses an
+   independent reference decoder for each format, written from the format spec
+   and sharing no code with the production dequantizers, so a bug in one path
+   cannot hide inside the other. A `payload-size-accurate` check confirms the
+   serialized tensor payload matches the planned inventory byte for byte.
 
-Without `--calibration-source` the quality gates use weight-only reconstruction
-error. With calibration activations they use the simulated runtime output
-error: activation rotation, activation quantization, and the scaled quantized
-GEMM, always in the ConvRot basis. The simulators are cross-checked against
-comfy-kitchen's eager kernels to 1e-4 relative agreement in
-`testdata/runtime_equivalence.py`.
+Without `--calibration-source` the quality gates use weight-only
+reconstruction error. With calibration activations they use the simulated
+runtime output error: activation rotation, activation quantization, and the
+scaled quantized GEMM, always in the ConvRot basis. The simulators are
+cross-checked against comfy-kitchen's eager kernels to 1e-4 relative
+agreement in `testdata/runtime_equivalence.py`.
 
 ## Requirements and install
 
@@ -73,7 +74,7 @@ the companion tools that import comfy-kitchen (`tools/runtime_certify.py`,
 ## Quick start
 
 ```bash
-# stable W4A8 (stable channel)
+# stable W4A8
 .venv/bin/python comfyui_wxa8_quantizer.py MODEL.safetensors --output OUT.safetensors --format w4a8 --validate
 
 # mixed, experimental channel (requires --experimental)
@@ -115,10 +116,10 @@ Measured on identical weights (K=768): W4A4 weight error 0.142, W4A8 0.070,
 INT8 0.005. W4A4 is about twice as noisy as the W4A8 codebook path, so the
 profiles use it only where size matters.
 
-Real conversions: Boogu-Image-0.1-Turbo mixed balanced goes from ~16 GB to
-~9.6 GB (the K=3360 layers become rowwise INT8, the K=13568 layers stay W4A8).
-Kroma v0.2 Turbo (Krea2) with `--format w4a8` goes from 25.64 GB to ~7.7 GB
-(256 of 430 tensors quantized, 97.5% of parameters).
+Real conversions: Boogu-Image-0.1-Turbo mixed balanced goes from about 16 GB to
+about 9.6 GB (the K=3360 layers become rowwise INT8, the K=13568 layers stay
+W4A8). Kroma v0.2 Turbo (Krea2) with `--format w4a8` goes from 25.64 GB to
+about 7.7 GB (256 of 430 tensors quantized, 97.5% of parameters).
 
 ## Profiles and gates
 
@@ -154,9 +155,11 @@ measured output error.
 | `--w4a4-linear-dtype int4\|int8` | W4A4 execution variant (default int8) |
 | `--disable-w4a4`, `--disable-w4a8`, `--disable-int8` | drop a format from the candidate set |
 | `--runtime-certificate PATH`, `--require-runtime-certificate` | observed-behavior override / hard certification |
+| `--seed N` | seed for codebook sampling (default 0; 0 keeps the reference path) |
+| `--nonfinite-policy error\|keep` | NaN/Inf in quantizable layers: error (default, names the layer) or keep at original precision |
+| `--allow-extra-shard-tensors` | tolerate shard tensors the index does not list (default: error; the index is authoritative) |
 | `--strip-gpu-identity` | omit GPU name, capability, ROCm from metadata |
 | `--device auto\|cpu\|cuda\|rocm` | quantization compute device |
-| `--seed N` | seed for codebook sampling (default 0; 0 keeps the reference path) |
 | `--max-memory SIZE` | per-tensor working budget (default 2G) |
 | `--validate`, `--validation-only` | full check after conversion / re-check an output |
 | `--verify-output PATH` | source-free check of an existing output: structure, metadata, packing, payload hash |
@@ -165,10 +168,14 @@ measured output error.
 | `--resume`, `--overwrite` | interruption recovery / replace output |
 | `--include`, `--exclude`, `--keep-precision` | force or protect layers by regex |
 | `--architecture NAME` | override detection |
-| `--nonfinite-policy error\|keep` | NaN/Inf in quantizable layers: error (default, names the layer) or keep at original precision |
 | `--trust-pickle` | allow pickle inputs |
-| `--allow-extra-shard-tensors` | tolerate shard tensors the index does not list (default: error; the index is authoritative) |
 | `--sensitivity-threshold F` | legacy w4a8-mode keep-precision threshold |
+
+The codebook sample count is canonical (300000 elements, never derived from
+the memory budget), so `--max-memory` changes how much is processed at once,
+not the math. A conversion run at 32 MiB and one run at 8 GiB produce the
+same tensor payload. `--seed` controls the sampling indices; seed 0 is the
+reference path.
 
 ## Output format and metadata
 
@@ -187,9 +194,12 @@ record; no custom format names are introduced.
 The `comfy_wxa8` extension block is schema-versioned: single-format W4A8
 output uses `comfy_wxa8/v1`, mixed output uses `comfy_wxa8/v2` (mode,
 per-format contracts, distribution, profile and gates, runtime status,
-quality_validation level). Levels: `unverified` (weight-only gates),
-`calibrated` (activation data), `model-verified` (testdata/model_quality.py
-passed on the target machine).
+quality_validation level). Every output carries an `algorithm_identity` block
+with independent revisions for the quantization algorithm, the W4A8 format,
+the mixed planner, the validator, and the calibration loader, so a converter
+version bump is never the only provenance signal. Levels: `unverified`
+(weight-only gates), `calibrated` (activation data), `model-verified`
+(testdata/model_quality.py passed on the target machine).
 
 ## Loading in ComfyUI
 
@@ -206,6 +216,12 @@ comfy-kitchen, otherwise it aborts with RuntimeCompatibilityError and suggests
 the `--disable-*` escape. When neither package is installed it warns and
 relies on the runtime-contract validators.
 
+Runtime capabilities are tri-state: loadable, executable, and accelerated are
+each known-supported, known-unsupported, or unknown. Missing information is
+never reported as supported. A machine without a detected CUDA device gets
+`unknown` for the nvidia path, not an optimistic yes, and mixed planning fails
+closed on it.
+
 Static existence is not the same as proof on your machine.
 `tools/runtime_certify.py` runs tiny real operations for all three formats and
 writes a JSON certificate; pass it with `--runtime-certificate` to override
@@ -217,12 +233,30 @@ atomic publish.
 
 ## Architecture support
 
-The embedded registry holds 43 policy families covering all 98 ComfyUI model
+The embedded registry holds 43 policy families covering all 99 ComfyUI model
 classes at the research revision. Each family defines its quantize set and its
 protected layers. Mixed mode does not change detection or protection; it only
 changes what happens to a layer once it is a policy candidate. Instead of
 passing through when K fails the W4A8 shape rule, the layer is evaluated for
 W4A4 and INT8.
+
+## Sharded inputs and publication safety
+
+When a directory contains `model.safetensors.index.json`, the index
+`weight_map` is authoritative. A tensor in a shard that the index does not
+list is an error, a missing or duplicate tensor is an error, and a referenced
+shard that does not exist is an error. `--allow-extra-shard-tensors` restores
+the old lenient behavior and records a warning. Source hashes are validated as
+a label-to-hash mapping, so swapping two shard names with identical content is
+detected.
+
+Publication is race-safe. Without `--overwrite` the validated candidate is
+published with a no-clobber hard link, so a destination created by another
+process during conversion is never replaced. With `--overwrite` the
+destination identity (device, inode, non-symlink) is captured before
+conversion and re-verified immediately before publication; a concurrent
+swap, deletion, or symlink replacement aborts with an error and leaves the
+staged file intact.
 
 ## Checking the result
 
@@ -230,12 +264,14 @@ W4A4 and INT8.
   (embedded reference weight, cross-platform safe), the eligibility matrix,
   mixed planning on real Boogu and Kroma dims, hard gate failures, BF16
   promotion, runtime capability matrix, planner determinism, corrupted
-  metadata rejection for all three formats, source-free `--verify-output`,
+  metadata rejection for all three formats, chunk-invariant payloads,
+  chunked vs full validation equality, reference-decoder consensus, source-free
+  `--verify-output`, shard-hash identity, publication races, channel gating,
   and architecture sync.
 * `--validate`: reopens the output and checks inventory, shapes, dtypes,
   per-format metadata and runtime contract, scales, packing round trips,
-  reconstruction error bounds (W4A8 policy bound, W4A4 0.20, INT8 0.05),
-  determinism, and hashes.
+  reconstruction error bounds (W4A8 policy bound, W4A4 0.20, INT8 0.05) via
+  the independent reference decoders, determinism, payload size, and hashes.
 * `testdata/cuda_smoke.py`: CUDA regression, 10/10 on an RTX 3050: fused W4A8
   kernels, INT8 at K=3360, W4A4 at K=1152 in both `linear_dtype` variants, a
   full mixed checkpoint through the kernels.
@@ -286,6 +322,8 @@ locally before merging or releasing.
   worse error than int8 on synthetic data (0.24 vs 0.16 total); benchmark it
   per model.
 * W4A4 checkpoints combined with LoRA or dynamic offload are untested.
+* A stale calibration cache from an older converter (no v2 fingerprint) is
+  accepted with a warning; rebuild it to bind it to the checkpoint.
 
 ## Research basis
 
