@@ -2229,6 +2229,7 @@ class CheckpointInfo:
     total_bytes: int = 0
     is_quantized_input: bool = False
     source_hashes: Dict[str, str] = field(default_factory=dict)
+    input_warnings: List[str] = field(default_factory=list)
     _tensor_by_name: Dict[str, TensorMeta] = field(
         init=False, repr=False, default_factory=dict)
 
@@ -2442,19 +2443,25 @@ def _is_safetensors(path: str) -> bool:
         return False
     return 0 < hlen < 512 * 1024 * 1024
 
-def discover_checkpoint(input_path: str, trust_pickle: bool = False) -> CheckpointInfo:
+def discover_checkpoint(input_path: str, trust_pickle: bool = False,
+                        allow_extra_shard_tensors: bool = False) -> CheckpointInfo:
     """Discover and header-inspect an input checkpoint.
 
     Accepts: single safetensors file, sharded safetensors (index + shards),
     model directory (HF-style), or pickle checkpoints with --trust-pickle.
+    When a shard index is present its weight_map is authoritative: shard
+    tensors not listed there are an error unless allow_extra_shard_tensors
+    opts into the legacy append behavior.
     """
     p = Path(input_path)
     if not p.exists():
         raise InputError(f"input path does not exist: {input_path}")
     if p.is_dir():
-        return _discover_directory(p, trust_pickle)
+        return _discover_directory(p, trust_pickle,
+                                   allow_extra_shard_tensors=allow_extra_shard_tensors)
     if p.name.endswith(".safetensors.index.json"):
-        return _discover_directory(p.parent, trust_pickle, index_path=p)
+        return _discover_directory(p.parent, trust_pickle, index_path=p,
+                                   allow_extra_shard_tensors=allow_extra_shard_tensors)
 
     # Single file
     if _is_safetensors(str(p)):
@@ -2534,7 +2541,8 @@ def _load_pickle_state_dict(path: str) -> Dict[str, torch.Tensor]:
     return _extract_tensor_state_dict(obj, path)
 
 def _discover_directory(d: Path, trust_pickle: bool,
-                        index_path: Optional[Path] = None) -> CheckpointInfo:
+                        index_path: Optional[Path] = None,
+                        allow_extra_shard_tensors: bool = False) -> CheckpointInfo:
     config: Dict[str, Any] = {}
     model_index: Dict[str, Any] = {}
     shard_index: Dict[str, Any] = {}
@@ -2648,10 +2656,28 @@ def _discover_directory(d: Path, trust_pickle: bool,
             for rf in readers.values():
                 for name in sorted(rf.entries):
                     if name not in seen:
-                        dtype, shape, start, end = rf.entries[name]
-                        tensors.append(TensorMeta(name, dtype, shape, end - start,
-                                                  rf.path, start, end))
-                        seen.add(name)
+                        if allow_extra_shard_tensors:
+                            dtype, shape, start, end = rf.entries[name]
+                            tensors.append(TensorMeta(name, dtype, shape, end - start,
+                                                      rf.path, start, end))
+                            seen.add(name)
+                        else:
+                            raise InputError(
+                                f"tensor {name!r} in {Path(rf.path).name} is not "
+                                "listed in the shard index weight_map; the shard "
+                                "index is authoritative (pass "
+                                "--allow-extra-shard-tensors to accept it)")
+            if allow_extra_shard_tensors:
+                # record any extras that were actually tolerated
+                indexed = set(shard_index["weight_map"])
+                extra_warnings: List[str] = []
+                for rf in readers.values():
+                    extras = sorted(set(rf.entries) - indexed)
+                    if extras:
+                        extra_warnings.append(
+                            f"shard {Path(rf.path).name} contains tensors not "
+                            f"listed in the shard index: {extras[:5]}"
+                            + ("..." if len(extras) > 5 else ""))
         else:
             for rf in readers.values():
                 for name in sorted(rf.entries):
@@ -2666,6 +2692,8 @@ def _discover_directory(d: Path, trust_pickle: bool,
             config=config, model_index=model_index, shard_index=shard_index,
             total_bytes=sum(t.nbytes for t in tensors),
         )
+        if allow_extra_shard_tensors and shard_index and "weight_map" in shard_index:
+            cp.input_warnings = extra_warnings
         _flag_quantized_input(cp)
         return cp
     finally:
@@ -10053,9 +10081,17 @@ def _test_checkpoint_variants() -> str:
     }, str(shard))
     with open(d / "model.safetensors.index.json", "w", encoding="utf-8") as f:
         json.dump({"weight_map": {"mapped": shard.name}}, f)
-    sharded = discover_checkpoint(str(d))
+    # the shard index is authoritative: an unindexed shard tensor is an
+    # error by default and requires the explicit opt-in flag
+    try:
+        discover_checkpoint(str(d))
+        raise AssertionError("unindexed shard tensor accepted without opt-in")
+    except InputError as exc:
+        assert "not listed in the shard index" in str(exc) or "extra" in str(exc), exc
+    sharded = discover_checkpoint(str(d), allow_extra_shard_tensors=True)
     assert sharded.key_set() == {"mapped", "extra_bool"}
     assert sharded.by_name("extra_bool").nbytes == 1
+    assert any("extra" in w for w in sharded.input_warnings), sharded.input_warnings
     shard2 = d / "model-00002-of-00002.safetensors"
     safetensors.torch.save_file({
         "mapped2": torch.arange(2, dtype=torch.float32),
@@ -10078,8 +10114,8 @@ def _test_checkpoint_variants() -> str:
     assert pickled.key_set() == {"nested.weight"}
     with CheckpointReader(pickled) as reader:
         assert bytes(reader.read_bytes("nested.weight")) == tensor_to_bytes(expected)
-    return ("indexed extra tensor and nested BF16 pickle load; duplicate shard "
-            "tensor rejected")
+    return ("authoritative shard index (extra tensor opt-in); duplicate shard "
+            "tensor rejected; nested BF16 pickle load")
 
 
 def _test_shard_hash_identity() -> str:
@@ -11255,7 +11291,7 @@ def _selftest_args(out: str, fmt: str, resume: bool = False, overwrite: bool = F
         streaming=True, resume=resume, overwrite=overwrite, dry_run=False,
         inspect=False, validate=False, validation_only=False, metadata_only=False,
         report=None, log_level="warning", json_log=None, trust_pickle=False,
-        yes=True, self_test=False, model=None)
+        allow_extra_shard_tensors=False, yes=True, self_test=False, model=None)
     if extra:
         for k, v in extra.items():
             setattr(ns, k, v)
@@ -11462,6 +11498,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--trust-pickle", action="store_true",
                    help="allow deserializing pickle-based checkpoints (unsafe for "
                         "untrusted files)")
+    p.add_argument("--allow-extra-shard-tensors", action="store_true",
+                   help="when a shard index is present, tolerate tensors in "
+                        "shards that the index does not list (default: error; "
+                        "the index is authoritative)")
     p.add_argument("--yes", action="store_true", help="assume yes for confirmations")
     p.add_argument("--self-test", action="store_true",
                    help="run the embedded engineering self-tests and exit")
@@ -11570,7 +11610,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                           ("--error-threshold", args.error_threshold)):
         if value is not None and (not math.isfinite(value) or value < 0):
             raise UsageError(f"{option} must be a finite non-negative number")
-    info = discover_checkpoint(args.model, trust_pickle=args.trust_pickle)
+    info = discover_checkpoint(args.model, trust_pickle=args.trust_pickle,
+                               allow_extra_shard_tensors=
+                               args.allow_extra_shard_tensors)
+    warnings.extend(info.input_warnings)
     _validate_destination_paths(info, args)
     if args.json_log:
         log().addHandler(JsonLogHandler(args.json_log))

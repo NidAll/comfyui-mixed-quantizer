@@ -162,6 +162,7 @@ measured output error.
 | `--include`, `--exclude`, `--keep-precision` | force or protect layers by regex |
 | `--architecture NAME` | override detection |
 | `--trust-pickle` | allow pickle inputs |
+| `--allow-extra-shard-tensors` | tolerate shard tensors the index does not list (default: error; the index is authoritative) |
 | `--sensitivity-threshold F` | legacy w4a8-mode keep-precision threshold |
 
 ## Output format and metadata
