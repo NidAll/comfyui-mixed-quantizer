@@ -129,7 +129,7 @@ QUANT_ALGORITHM_REVISION = "lloydmax-codebook-r2"  # canonical sample count; --s
 # a converter version bump is never the only provenance signal. Each fix that
 # changes an algorithm's behavior bumps its own revision here, and the value is
 # embedded in the extension metadata of every output.
-MIXED_PLANNER_REVISION = "mixed-planner-r2"  # per-format runtime_certified; cert applied pre-plan
+MIXED_PLANNER_REVISION = "mixed-planner-r3"  # three-state runtime caps (unknown != True)
 VALIDATION_REVISION = "validator-r4"  # payload-size-accurate check (F9)
 CALIBRATION_REVISION = "calibration-r2"  # content-addressed cache (v2 fingerprint)
 
@@ -4839,15 +4839,16 @@ def inspect_environment() -> EnvironmentInfo:
 class FormatRuntimeCapability:
     """One format's status on one target runtime.
 
-    loadable: the target ComfyUI/comfy-kitchen can deserialize the format.
-    executable: a compute path exists (possibly eager fallback).
+    loadable/executable: True = known supported, False = known unsupported,
+    None = UNKNOWN (the environment did not provide the information). Missing
+    information is never translated into True.
     accelerated: None = not proven, True/False = expected accelerated /
                  expected fallback from static analysis.
     certified: True only after a real runtime probe executed the format
                (tools/runtime_certify.py on the target machine).
     """
-    loadable: bool
-    executable: bool
+    loadable: Optional[bool]
+    executable: Optional[bool]
     accelerated: Optional[bool]
     certified: bool = False
     backend: str = "unknown"
@@ -4855,10 +4856,12 @@ class FormatRuntimeCapability:
 
     @property
     def supported(self) -> bool:
-        return self.loadable and self.executable
+        return self.loadable is True and self.executable is True
 
     def describe(self) -> str:
-        if not self.supported:
+        if self.loadable is None or self.executable is None:
+            return f"unknown: {self.reason}" if self.reason else "unknown"
+        if not (self.loadable and self.executable):
             return f"unsupported: {self.reason}" if self.reason else "unsupported"
         if self.certified:
             if self.accelerated:
@@ -5001,6 +5004,21 @@ def runtime_capabilities_for(
                                        False, backend, reason)
 
     if backend == "nvidia":
+        have_cuda = env is not None and env.cuda_device is not None
+        if not have_cuda:
+            return RuntimeCapabilities(
+                target="nvidia",
+                w4a4=_fmt(None, None, None, "cuda",
+                          reason="no CUDA device detected; runtime behavior "
+                                 "unknown"),
+                w4a8=_fmt(None, None, None, "cuda",
+                          reason="no CUDA device detected; runtime behavior "
+                                 "unknown"),
+                int8=_fmt(None, None, None, "cuda",
+                          reason="no CUDA device detected; runtime behavior "
+                                 "unknown"),
+                gpu_name=gpu_name, cuda_capability=cuda_cap,
+                rocm_arch=rocm_arch, torch_cuda=torch_cuda, torch_hip=torch_hip)
         return RuntimeCapabilities(
             target="nvidia",
             w4a4=_fmt(True, True, True, "cuda"),
@@ -5009,6 +5027,22 @@ def runtime_capabilities_for(
             gpu_name=gpu_name, cuda_capability=cuda_cap,
             rocm_arch=rocm_arch, torch_cuda=torch_cuda, torch_hip=torch_hip)
     if backend == "amd":
+        have_hip = env is not None and env.cuda_device is not None \
+            and getattr(env, "torch_hip", None) is not None
+        if not have_hip:
+            return RuntimeCapabilities(
+                target="amd",
+                w4a4=_fmt(None, None, None, "hip",
+                          reason="no HIP device detected; runtime behavior "
+                                 "unknown"),
+                w4a8=_fmt(None, None, None, "triton/hip",
+                          reason="no HIP device detected; runtime behavior "
+                                 "unknown"),
+                int8=_fmt(None, None, None, "triton/hip",
+                          reason="no HIP device detected; runtime behavior "
+                                 "unknown"),
+                gpu_name=gpu_name, cuda_capability=cuda_cap,
+                rocm_arch=rocm_arch, torch_cuda=torch_cuda, torch_hip=torch_hip)
         matrix_core = rocm_matrix_core_supported(rocm_arch)
         return RuntimeCapabilities(
             target="amd",
@@ -6131,7 +6165,8 @@ class MixedPlanner:
                  compression_target_bpp: Optional[float] = None,
                  max_bf16_fraction: Optional[float] = None,
                  linear_dtype: str = DEFAULT_W4A4_LINEAR_DTYPE,
-                 runtime_certificate: Optional["RuntimeCertificate"] = None):
+                 runtime_certificate: Optional["RuntimeCertificate"] = None,
+                 seed: int = 0):
         if profile_name not in MIXED_PROFILE_DEFAULTS:
             raise PolicyError(f"unknown mixed profile {profile_name!r}")
         self.profile = MIXED_PROFILE_DEFAULTS[profile_name]
@@ -6144,6 +6179,7 @@ class MixedPlanner:
             else runtime_capabilities_for("cpu")
         self.linear_dtype = linear_dtype
         self.runtime_certificate = runtime_certificate
+        self.seed = seed
         self.layer_gate = (layer_gate if layer_gate is not None
                            else self.profile.layer_gate)
         self.global_gate = (global_gate if global_gate is not None
@@ -9366,6 +9402,41 @@ def _test_nonfinite_policy() -> str:
             "NaN calibration rows rejected")
 
 
+def _test_runtime_three_state() -> str:
+    """Capabilities are tri-state: missing environment information must never
+    be translated into optimistic True/True/True."""
+    env = inspect_environment()
+    if env.cuda_device is not None:
+        # a real GPU keeps the expected-accelerated model
+        caps = runtime_capabilities_for("nvidia", env)
+        assert caps.w4a8.loadable is True and caps.w4a8.executable is True
+        assert caps.w4a8.accelerated is True
+        assert caps.w4a8.describe() == "expected accelerated (not certified)"
+    # simulate a machine with no CUDA device: unknown, never optimistic
+    env_nogpu = dataclasses.replace(
+        env, cuda_device=None, cuda_capability=None, torch_cuda=None)
+    caps = runtime_capabilities_for("nvidia", env_nogpu)
+    for fmt in MIXED_FORMATS:
+        cap = caps.capability(fmt)
+        assert cap.loadable is None and cap.executable is None, (fmt, cap)
+        assert cap.accelerated is None, (fmt, cap)
+        assert "unknown" in cap.describe(), cap.describe()
+    # fail closed: unknown capabilities are never "supported"
+    assert not caps.supports(FORMAT_W4A8)
+    assert not caps.supports(FORMAT_W4A4)
+    assert not caps.supports(FORMAT_INT8)
+    # amd without a HIP device is unknown too
+    env_nohip = dataclasses.replace(
+        env, cuda_device=None, cuda_capability=None, torch_hip=None)
+    caps_amd = runtime_capabilities_for("amd", env_nohip)
+    assert caps_amd.int8.loadable is None and caps_amd.int8.accelerated is None
+    # cpu eager is always known
+    caps_cpu = runtime_capabilities_for("cpu", env_nogpu)
+    assert caps_cpu.w4a8.loadable is True and caps_cpu.w4a8.accelerated is False
+    return ("three-state runtime caps: missing CUDA/HIP info -> unknown, "
+            "fail-closed; cpu eager stays known")
+
+
 def _test_odd_dims() -> str:
     torch.manual_seed(3)
     # odd N, K=48 (divisible by 16 but not by 32)
@@ -11154,6 +11225,19 @@ def _test_mixed_bf16_promotion() -> str:
             "empty plan correctly rejected by the quality gate" % (
                 len(planner.promotions), len(promoted_original)))
 
+def _selftest_nvidia_caps(cuda_capability: Optional[Tuple[int, int]] = None,
+                          ) -> RuntimeCapabilities:
+    """Environment-independent NVIDIA caps for self-tests (a real GPU is not
+    required to exercise planner/cert logic)."""
+    return RuntimeCapabilities(
+        target="nvidia",
+        w4a4=FormatRuntimeCapability(True, True, True, False, "cuda"),
+        w4a8=FormatRuntimeCapability(True, True, True, False, "cuda"),
+        int8=FormatRuntimeCapability(True, True, True, False, "cuda"),
+        gpu_name="selftest-gpu", cuda_capability=cuda_capability,
+        torch_cuda="12.8")
+
+
 def _test_mixed_runtime_caps() -> str:
     """--target-runtime feeds the eligibility matrix: unsupported formats are
     excluded with a recorded reason, eager vs accelerated is reported."""
@@ -11194,21 +11278,19 @@ def _test_mixed_runtime_caps() -> str:
     assert mode.activation_bits == 4 and mode.certain, \
         "eager must simulate the int4 activation path"
     # cuda SM8x honors requested int4 via native MMA; int8 request is certain
-    nv8 = runtime_capabilities_for("nvidia")
+    nv8 = _selftest_nvidia_caps((8, 9))
     planner = MixedPlanner("balanced", None, 2 * 1024**3, torch.device("cpu"),
                            None, runtime=nv8, linear_dtype="int8")
     planner.plan(info, list(dec))
     assert planner.w4a4_execution_mode_for_candidate().activation_bits == 8
     # SM8x + requested int4 -> certain native A4
-    nv8 = dataclasses.replace(nv8, cuda_capability=(8, 9))
     planner = MixedPlanner("balanced", None, 2 * 1024**3, torch.device("cpu"),
                            None, runtime=nv8, linear_dtype="int4")
     mode = planner.w4a4_execution_mode_for_candidate()
     assert mode.activation_bits == 4 and mode.certain and \
         mode.path == "cuda-native-int4", mode
     # Turing (7.5) + int4 -> uncertain; worst-case evaluation must kick in
-    nv75 = dataclasses.replace(runtime_capabilities_for("nvidia"),
-                               cuda_capability=(7, 5))
+    nv75 = _selftest_nvidia_caps((7, 5))
     planner = MixedPlanner("balanced", None, 2 * 1024**3, torch.device("cpu"),
                            None, runtime=nv75, linear_dtype="int4")
     mode = planner.w4a4_execution_mode_for_candidate()
@@ -11238,8 +11320,7 @@ def _test_mixed_cert_seq() -> str:
         rocm_arch=None,
         formats={FORMAT_W4A8: {"load": True, "forward": True,
                                "backend": "cuda"}})
-    caps = runtime_capabilities_for("nvidia")
-    caps = dataclasses.replace(caps, cuda_capability=(8, 9))
+    caps = _selftest_nvidia_caps((8, 9))
     _check_runtime_certificate(cert, caps, [])
     cap_map = {FORMAT_W4A4: ("w4a4", caps.w4a4),
                FORMAT_W4A8: ("w4a8", caps.w4a8),
@@ -11635,6 +11716,7 @@ SELF_TEST_CASES: List[Tuple[str, Callable[[], str]]] = [
             ("mixed-gates-hard-fail", _test_mixed_gates_hard_fail),
             ("mixed-bf16-promotion", _test_mixed_bf16_promotion),
             ("mixed-runtime-caps", _test_mixed_runtime_caps),
+            ("runtime-three-state", _test_runtime_three_state),
             ("mixed-cert-seq", _test_mixed_cert_seq),
             ("mixed-runtime-metric", _test_mixed_runtime_metric),
             ("mixed-determinism", _test_mixed_determinism),
