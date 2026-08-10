@@ -3,6 +3,9 @@
 __pycache__/
 *.pyc
 
+# agent guidance (machine-local runbook, not part of the published repo)
+AGENTS.md
+
 # research checkouts (reference material only, not part of the project)
 research/
 
