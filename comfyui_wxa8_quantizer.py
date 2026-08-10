@@ -128,7 +128,7 @@ QUANT_ALGORITHM_REVISION = "lloydmax-codebook-r1"
 # changes an algorithm's behavior bumps its own revision here, and the value is
 # embedded in the extension metadata of every output.
 MIXED_PLANNER_REVISION = "mixed-planner-r2"  # per-format runtime_certified; cert applied pre-plan
-VALIDATION_REVISION = "validator-r2"  # chunked INT8 validation fixed
+VALIDATION_REVISION = "validator-r3"  # source-hash mapping equality (rename-safe)
 CALIBRATION_REVISION = "calibration-r2"  # content-addressed cache (v2 fingerprint)
 
 
@@ -8140,10 +8140,15 @@ class Validator:
                 if input_hashes:
                     recorded_source_hashes = ext_payload.get("source", {}).get(
                         "sha256", {})
+                    # Shard identity is part of provenance: compare the full
+                    # label->hash mapping, never sorted hash values (a rename
+                    # attack must be detected).
+                    labels = _portable_file_labels(sorted(input_hashes))
+                    expected_hashes = dict(zip(
+                        labels, (input_hashes[p] for p in sorted(input_hashes))))
                     source_hash_ok = (
                         isinstance(recorded_source_hashes, dict)
-                        and sorted(recorded_source_hashes.values()) ==
-                        sorted(input_hashes.values())
+                        and recorded_source_hashes == expected_hashes
                     )
                     self.check(
                         "metadata-source-hash", source_hash_ok,
@@ -10076,6 +10081,78 @@ def _test_checkpoint_variants() -> str:
     return ("indexed extra tensor and nested BF16 pickle load; duplicate shard "
             "tensor rejected")
 
+
+def _test_shard_hash_identity() -> str:
+    """Source-hash validation is mapping identity: the same hash values under
+    swapped shard labels must be detected (a rename attack must fail)."""
+    d = Path(_tmpdir())
+    shard1 = d / "model-00001-of-00002.safetensors"
+    shard2 = d / "model-00002-of-00002.safetensors"
+    safetensors.torch.save_file({
+        "double_stream_layers.0.img_self_attn.to_q.weight": torch.randn(64, 768) * 0.02,
+        "single_stream_layers.0.feed_forward.linear_2.weight": torch.randn(64, 13568) * 0.02,
+    }, str(shard1))
+    safetensors.torch.save_file({
+        "single_stream_layers.1.feed_forward.linear_2.weight": torch.randn(64, 13568) * 0.02,
+    }, str(shard2))
+    with open(d / "model.safetensors.index.json", "w", encoding="utf-8") as f:
+        json.dump({"weight_map": {
+            "double_stream_layers.0.img_self_attn.to_q.weight": shard1.name,
+            "single_stream_layers.0.feed_forward.linear_2.weight": shard1.name,
+            "single_stream_layers.1.feed_forward.linear_2.weight": shard2.name,
+        }}, f)
+    info = discover_checkpoint(str(d))
+    assert info.kind == "sharded-safetensors", info.kind
+    det = detect_architecture(
+        info, shape_lookup=lambda nm: (info.by_name(nm).shape
+                                       if info.by_name(nm) else None))
+    assert det.architecture == "boogu", det.architecture
+    dec = classify_tensors(info, det, FORMAT_W4A8, None, [], [], [], None, None)
+    out = os.path.join(d, "out_w4a8.safetensors")
+    args = _selftest_args(out, FORMAT_W4A8)
+    plan = ConversionPlan(fmt=FORMAT_W4A8, detection=det, decisions=dec,
+                          metadata_quant={}, metadata_ext={}, output_entries=[])
+    entries, total = build_output_entries(info, dec, FORMAT_W4A8, None)
+    plan.output_entries = entries
+    plan.total_out_bytes = total
+    plan.n_quantized = len(plan.quantized_layers())
+    plan.n_kept = len(dec) - plan.n_quantized
+    plan.metadata_quant = build_quant_metadata(info, plan)
+    engine = ConversionEngine(info, plan, args, out + ".state.json",
+                              out + ".tmp", out)
+    try:
+        engine.run()
+    finally:
+        engine.close()
+    meta = dict(info.metadata)
+    meta[METADATA_KEY_QUANT] = json_dumps(plan.metadata_quant)
+    ext = build_extension_metadata(
+        info, plan, inspect_environment(), args, None, None,
+        hash_checkpoint_files(info), sha256_safetensors_payload(out),
+        {"status": "selftest"}, [])
+    meta[METADATA_KEY_EXT] = json_dumps(ext)
+    republish_with_metadata(out, out, meta, entries)
+    vplan = plan_from_output(out, det, FORMAT_W4A8, info)
+    input_hashes = hash_checkpoint_files(info)
+    # patch the embedded source hashes: swap the two shard labels, keeping
+    # the same values (a rename attack: same bytes, different identity)
+    meta2 = dict(meta)
+    ext2 = json.loads(meta2[METADATA_KEY_EXT])
+    sha = ext2["source"]["sha256"]
+    l1, l2 = sorted(sha)
+    sha[l1], sha[l2] = sha[l2], sha[l1]
+    meta2[METADATA_KEY_EXT] = json_dumps(ext2)
+    republish_with_metadata(out, out, meta2, entries)
+    validator = Validator(info, vplan, out,
+                          _selftest_args(out, FORMAT_W4A8,
+                                         extra={"validate": True}),
+                          inspect_environment())
+    with CheckpointReader(info) as reader:
+        summary = validator.run(reader=reader, input_hashes=input_hashes)
+    checks = {c["name"]: c["status"] for c in summary["checks"]}
+    assert checks.get("metadata-source-hash") == "failed", checks
+    return "shard hash identity: label swap detected (mapping equality)"
+
 def _test_unsupported() -> str:
     d = _tmpdir()
     path = os.path.join(d, "mini.safetensors")
@@ -11223,6 +11300,7 @@ SELF_TEST_CASES: List[Tuple[str, Callable[[], str]]] = [
             ("golden-vectors-vs-reference", _test_golden_vectors),
             ("malformed-checkpoints", _test_malformed),
             ("checkpoint-input-variants", _test_checkpoint_variants),
+            ("shard-hash-identity", _test_shard_hash_identity),
             ("unsupported-tensors", _test_unsupported),
             ("sensitivity-output-planning", _test_sensitivity_planning),
             ("resume-state-recovery", _test_resume),
