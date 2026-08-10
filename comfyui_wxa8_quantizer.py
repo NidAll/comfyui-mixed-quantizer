@@ -130,7 +130,7 @@ QUANT_ALGORITHM_REVISION = "lloydmax-codebook-r2"  # canonical sample count; --s
 # changes an algorithm's behavior bumps its own revision here, and the value is
 # embedded in the extension metadata of every output.
 MIXED_PLANNER_REVISION = "mixed-planner-r3"  # three-state runtime caps (unknown != True)
-VALIDATION_REVISION = "validator-r4"  # payload-size-accurate check (F9)
+VALIDATION_REVISION = "validator-r5"  # independent reference decoders in recon checks
 CALIBRATION_REVISION = "calibration-r2"  # content-addressed cache (v2 fingerprint)
 
 
@@ -3370,6 +3370,81 @@ def dequantize_w4a4_weight(packed: torch.Tensor, scale: torch.Tensor,
     w_rot = w_int * scale.to(device=packed.device, dtype=torch.float32).reshape(-1, 1)
     h = build_hadamard(convrot_groupsize, device=packed.device, dtype=torch.float32)
     return rotate_weight(w_rot.float(), h, convrot_groupsize).to(output_dtype)
+
+
+def reference_hadamard(size: int) -> torch.Tensor:
+    """INDEPENDENT regular-Hadamard construction for the validation-only
+    reference decoders. Deliberately shares no code with build_hadamard:
+    the point is that a bug in the production path cannot hide inside the
+    validator. Slow, unnormalized-cached, fine for validation."""
+    h4 = torch.tensor([[1, 1, 1, -1],
+                       [1, 1, -1, 1],
+                       [1, -1, 1, 1],
+                       [-1, 1, 1, 1]], dtype=torch.float32)
+    h = h4
+    current = 4
+    while current < size:
+        h = torch.kron(h, h4)
+        current *= 4
+    return h / math.sqrt(size)
+
+
+def _reference_rotate(weight: torch.Tensor, convrot_groupsize: int) -> torch.Tensor:
+    """W @ H^T per ConvRot group (plain matmul; no fast paths)."""
+    h = reference_hadamard(convrot_groupsize)
+    n, k = weight.shape
+    groups = k // convrot_groupsize
+    return torch.matmul(weight.float().reshape(n, groups, convrot_groupsize),
+                        h.T).reshape(n, k)
+
+
+def reference_decode_w4a8(packed: torch.Tensor, s_rel: torch.Tensor,
+                          s_channel: torch.Tensor, codebook: torch.Tensor,
+                          group_size: int, convrot_groupsize: int,
+                          output_dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """Independent W4A8 decode from the format spec: even column = low nibble
+    (unsigned 4-bit code), codebook lookup, per-group fp8 scale, rowwise
+    fp32 channel scale, round to int8, inverse ConvRot. Validation only."""
+    n, k_half = packed.shape
+    k = k_half * 2
+    groups = k // group_size
+    p = packed.to(torch.int32) & 0xFF
+    codes = torch.empty(n, k, dtype=torch.int32, device=packed.device)
+    codes[:, 0::2] = p & 0xF
+    codes[:, 1::2] = (p >> 4) & 0xF
+    values = codebook.to(device=packed.device, dtype=torch.float32)[codes]
+    values = values.view(n, groups, group_size) * s_rel.float().unsqueeze(-1)
+    int8_weight = values.view(n, k).round().clamp_(-127, 127).to(torch.int8)
+    weight_rotated = (int8_weight.float().view(n, groups, group_size)
+                      * s_channel.float().view(n, 1, 1)).view(n, k)
+    return _reference_rotate(weight_rotated, convrot_groupsize).to(output_dtype)
+
+
+def reference_decode_w4a4(packed: torch.Tensor, scale: torch.Tensor,
+                          convrot_groupsize: int,
+                          output_dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """Independent W4A4 decode: SIGNED nibbles ([-8, 7], low = even column),
+    rowwise absmax/7 scale, inverse ConvRot. Validation only."""
+    n, k_half = packed.shape
+    k = k_half * 2
+    p = packed.to(torch.int32) & 0xFF
+    lo = p & 0xF
+    hi = (p >> 4) & 0xF
+    lo = torch.where(lo >= 8, lo - 16, lo)
+    hi = torch.where(hi >= 8, hi - 16, hi)
+    codes = torch.empty(n, k, dtype=torch.float32, device=packed.device)
+    codes[:, 0::2] = lo
+    codes[:, 1::2] = hi
+    w_rot = codes * scale.to(device=packed.device, dtype=torch.float32).reshape(-1, 1)
+    return _reference_rotate(w_rot, convrot_groupsize).to(output_dtype)
+
+
+def reference_decode_int8(q: torch.Tensor, scale: torch.Tensor,
+                          output_dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """Independent rowwise INT8 decode: q.float() * scale [N, 1]. Validation
+    only (matches the eager backend broadcast exactly)."""
+    return (q.float() * scale.to(device=q.device, dtype=torch.float32).reshape(-1, 1)
+            ).to(output_dtype)
 
 def _pick_w4a4_convrot_group(k: int) -> int:
     """Largest power of 4 in {16, 64, 256} dividing K (kernel-supported set)."""
@@ -8576,11 +8651,10 @@ class Validator:
                                     packed = packed_slice[r0:r1]
                                     s_rel = s_rel_slice[r0:r1]
                                     s_ch = s_ch_slice[r0:r1]
-                                    dq = dequantize_w4a8_weight(
+                                    dq = reference_decode_w4a8(
                                         packed, s_rel, s_ch, codebook=cb,
                                         group_size=d.group_size,
-                                        convrot_groupsize=d.convrot_groupsize,
-                                        output_dtype=torch.float32)
+                                        convrot_groupsize=d.convrot_groupsize)
                                     acc.update(original_view[r0:r1], dq, None)
                                     rt = unpack_w4(packed)
                                     repacked = (
@@ -8595,10 +8669,10 @@ class Validator:
                                     r1 = min(n, r0 + chunk_rows)
                                     packed = packed_slice[r0:r1]
                                     scale = scale_slice[r0:r1]
-                                    dq = dequantize_weight_by_format(
-                                        {"": packed, "_scale": scale},
-                                        d.format, d.group_size,
-                                        d.convrot_groupsize, torch.float32)
+                                    dq = (reference_decode_w4a4(packed, scale,
+                                                                d.convrot_groupsize)
+                                          if d.format == FORMAT_W4A4 else
+                                          reference_decode_int8(packed, scale))
                                     acc.update(original_view[r0:r1], dq, None)
                                     if d.format == FORMAT_W4A4:
                                         rt = unpack_int4_signed(packed)
@@ -8616,17 +8690,16 @@ class Validator:
                                 cb = st.get_tensor(d.layer + ".weight_codebook")
                                 s_rel = st.get_tensor(d.layer + ".weight_s_rel")
                                 s_ch = st.get_tensor(d.layer + ".weight_s_channel")
-                                dq = dequantize_w4a8_weight(
+                                dq = reference_decode_w4a8(
                                     packed, s_rel, s_ch, codebook=cb,
                                     group_size=d.group_size,
-                                    convrot_groupsize=d.convrot_groupsize,
-                                    output_dtype=torch.float32)
+                                    convrot_groupsize=d.convrot_groupsize)
                             else:
                                 scale = st.get_tensor(d.layer + ".weight_scale")
-                                dq = dequantize_weight_by_format(
-                                    {"": packed, "_scale": scale},
-                                    d.format, d.group_size,
-                                    d.convrot_groupsize, torch.float32)
+                                dq = (reference_decode_w4a4(
+                                    packed, scale, d.convrot_groupsize)
+                                    if d.format == FORMAT_W4A4 else
+                                    reference_decode_int8(packed, scale))
                             orig_t = reader.read_tensor(d.name).float()
                             m = compute_weight_metrics(orig_t, dq)
                             if d.format == FORMAT_W4A4:
@@ -9435,6 +9508,104 @@ def _test_runtime_three_state() -> str:
     assert caps_cpu.w4a8.loadable is True and caps_cpu.w4a8.accelerated is False
     return ("three-state runtime caps: missing CUDA/HIP info -> unknown, "
             "fail-closed; cpu eager stays known")
+
+
+def _test_reference_decoder_consensus() -> str:
+    """Independent reference decoders (validation-only) agree with the
+    production dequantizers within 1e-4, and the Validator's reconstruction
+    checks use the reference path (a broken production dequant must not
+    change validation results)."""
+    torch.manual_seed(9)
+    def rel_l2(a: torch.Tensor, b: torch.Tensor) -> float:
+        return float((a.float() - b.float()).norm() / a.float().norm().clamp(min=1e-12))
+    for (n, k, cgs, gs) in ((16, 256, 256, 16), (8, 1152, 64, 16),
+                            (12, 768, 256, 16), (7, 768, 64, 16)):
+        w = torch.randn(n, k) * 0.05
+        packed, s_rel, s_ch, corr, cb = quantize_w4a8_weight(
+            w, group_size=gs, convrot_groupsize=cgs)
+        prod = dequantize_w4a8_weight(packed, s_rel, s_ch, codebook=cb,
+                                      group_size=gs, convrot_groupsize=cgs,
+                                      output_dtype=torch.float32)
+        ref = reference_decode_w4a8(packed, s_rel, s_ch, cb, gs, cgs)
+        assert rel_l2(prod, ref) < 1e-4, (n, k, cgs, gs, rel_l2(prod, ref))
+        p4, s4 = quantize_w4a4_weight(w, cgs)
+        prod4 = dequantize_w4a4_weight(p4, s4, cgs)
+        ref4 = reference_decode_w4a4(p4, s4, cgs)
+        assert rel_l2(prod4, ref4) < 1e-4, (n, k, rel_l2(prod4, ref4))
+        qi, si = quantize_int8_tensorwise_weight(w)
+        prodi = dequantize_int8_tensorwise_weight(qi, si)
+        refi = reference_decode_int8(qi, si)
+        assert rel_l2(prodi, refi) < 1e-6, (n, k, rel_l2(prodi, refi))
+    # validator independence: break the production dequant and run validation;
+    # recon checks must still pass because they use the reference decoders
+    d = _tmpdir()
+    src = os.path.join(d, "consensus.safetensors")
+    safetensors.torch.save_file({
+        "single_stream_layers.0.feed_forward.linear_2.weight": torch.randn(32, 13568) * 0.02,
+        "single_stream_layers.1.feed_forward.linear_2.weight": torch.randn(32, 1152) * 0.02,
+        "double_stream_layers.0.img_self_attn.to_q.weight": torch.randn(32, 3360) * 0.02,
+    }, src)
+    info = discover_checkpoint(src)
+    det = detect_architecture(
+        info, shape_lookup=lambda nm: (info.by_name(nm).shape
+                                       if info.by_name(nm) else None))
+    dec = classify_tensors(info, det, FORMAT_MIXED, None, [], [], [], None, None)
+    for dd in dec:
+        if dd.kind != DecisionKind.QUANTIZE:
+            continue
+        k = int(info.by_name(dd.name).shape[1])
+        dd.format = FORMAT_W4A8 if k % 256 == 0 else (FORMAT_W4A4 if k % 64 == 0 else FORMAT_INT8)
+        dd.convrot_groupsize = MixedPlanner.cgs_for(dd, k, dd.format)
+    out = os.path.join(d, "out.safetensors")
+    args = _selftest_args(out, FORMAT_MIXED, extra={
+        "validate": False, "profile": "balanced", "format": "mixed"})
+    plan = ConversionPlan(fmt=FORMAT_MIXED, detection=det, decisions=dec,
+                          metadata_quant={}, metadata_ext={}, output_entries=[])
+    entries, total = build_output_entries(info, dec, FORMAT_MIXED, None)
+    plan.output_entries = entries
+    plan.total_out_bytes = total
+    plan.n_quantized = len(plan.quantized_layers())
+    plan.n_kept = len(dec) - plan.n_quantized
+    plan.mixed_plan = {
+        "counts": {fmt: 1 for fmt in (FORMAT_INT8, FORMAT_W4A8, FORMAT_W4A4)},
+        "layer_params": {}, "layer_bytes": {},
+        "kept_params": 0, "kept_bytes": 0, "effective_bpp": 0.9,
+        "original_precision_parameter_fraction": 0.0,
+        "original_precision_output_byte_fraction": 0.0,
+        "global_mean_error": 0.05,
+        "w4a4_linear_dtype": DEFAULT_W4A4_LINEAR_DTYPE,
+    }
+    plan.metadata_quant = build_quant_metadata(info, plan)
+    engine = ConversionEngine(info, plan, args, out + ".state.json",
+                              out + ".tmp", out)
+    try:
+        engine.run()
+    finally:
+        engine.close()
+    meta = dict(info.metadata)
+    meta[METADATA_KEY_QUANT] = json_dumps(plan.metadata_quant)
+    meta[METADATA_KEY_EXT] = json_dumps(build_extension_metadata(
+        info, plan, inspect_environment(), args, None, None,
+        hash_checkpoint_files(info), sha256_safetensors_payload(out),
+        {"status": "selftest"}, []))
+    republish_with_metadata(out, out, meta, entries)
+    vplan = plan_from_output(out, det, FORMAT_MIXED, info)
+    saved = dequantize_w4a8_weight
+    try:
+        def broken_dequant(*a, **kw):
+            return torch.zeros(1, 1)
+        globals()["dequantize_w4a8_weight"] = broken_dequant
+        validator = Validator(info, vplan, out, args, inspect_environment())
+        with CheckpointReader(info) as reader:
+            summary = validator.run(reader=reader,
+                                    input_hashes=hash_checkpoint_files(info))
+    finally:
+        globals()["dequantize_w4a8_weight"] = saved
+    recon = [c for c in summary["checks"] if c["name"].startswith("recon-")]
+    assert len(recon) == 3, recon
+    assert all(c["status"] == "passed" for c in recon), recon
+    return ("reference decoders agree with production (1e-4); validator recon "
+            "passes with a broken production dequant (independence)")
 
 
 def _test_odd_dims() -> str:
@@ -11722,6 +11893,7 @@ SELF_TEST_CASES: List[Tuple[str, Callable[[], str]]] = [
             ("mixed-determinism", _test_mixed_determinism),
             ("mixed-metadata-fuzz", _test_mixed_metadata_fuzz),
             ("chunked-validation-matrix", _test_chunked_validation_matrix),
+            ("reference-decoder-consensus", _test_reference_decoder_consensus),
             ("architecture-sync", _test_architecture_sync),
             ("strip-gpu-identity", _test_strip_gpu_identity),
             ("fail-on-low-compression", _test_fail_on_low_compression),
