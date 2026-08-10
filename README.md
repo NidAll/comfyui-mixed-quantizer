@@ -17,6 +17,63 @@ Two modes:
 
 Current version: `1.5.0`.
 
+## Versions and changelog
+
+### 1.5.0
+
+First stable release. The `-experimental` suffix is gone and the modes are
+split into two channels: `--format w4a8` is the stable channel, `--format
+mixed` requires `--experimental`.
+
+Fixes:
+
+* Chunked INT8 validation crashed on W4A4-only temporaries; validation now
+  produces identical results at any chunk size.
+* Runtime certificates are applied before planning, and `runtime_certified`
+  is per format instead of a single blanket flag.
+* Calibration caches are content-addressed (schema v2) and bound to the
+  checkpoint they were built from; a different checkpoint cannot reuse them.
+* Source hashes are validated as a label-to-hash mapping, so a shard rename
+  with identical content is detected.
+* A shard index is authoritative: tensors it does not list are an error
+  unless `--allow-extra-shard-tensors` opts in.
+* Publication is race-safe: a destination created during conversion is never
+  clobbered, and `--overwrite` re-verifies the destination identity.
+
+New behavior:
+
+* Codebook sampling is chunk-invariant: the sample count is canonical
+  (300000 elements) and never derived from `--max-memory`. The same input at
+  32 MiB and 8 GiB budgets produces the same tensor payload.
+* `--seed` controls the sampling indices (default 0 keeps the reference
+  path).
+* `--nonfinite-policy error|keep` gives NaN/Inf weights an explicit policy;
+  calibration rows must be finite.
+* Runtime capabilities are tri-state (known, unsupported, unknown). Missing
+  environment information is never reported as supported.
+* Validation uses independent reference decoders for W4A8, W4A4, and INT8,
+  written from the format spec and sharing no code with the production
+  dequantizers. A `payload-size-accurate` check confirms the serialized
+  payload matches the plan byte for byte.
+* Output metadata carries an `algorithm_identity` block with independent
+  revisions for the quantizer, formats, planner, validator, and calibration.
+
+Self-test suite: 50 checks (was 40).
+
+### 1.4.0-experimental
+
+Merged the mixed-precision branch into main. Added the per-layer planner
+over `convrot_w4a4`, `asym_w4a8_int8`, and `int8_tensorwise`, with quality
+and compression gates, runtime capabilities and certificates, calibration
+activations, and the v2 extension metadata schema. Mixed mode carried the
+`-experimental` suffix on the version.
+
+### 1.3.0
+
+Hardened the W4A8 runtime contract: ConvRot is 256-only, K not divisible by
+256 passes through, golden-vector self-tests pinned the packed and fp8
+payloads. This is the byte-identical behavior that 1.5.0 still preserves.
+
 ## How it works
 
 The converter runs five steps. Nothing is written until the plan passes its
