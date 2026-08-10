@@ -1999,6 +1999,46 @@ def sha256_safetensors_payload(path: str, chunk: int = 1 << 22) -> str:
             h.update(data)
     return h.hexdigest()
 
+def _publish_output(validation_path: str, out_path: str, *,
+                    overwrite: bool,
+                    expected_identity: Optional[Tuple[int, int]]) -> None:
+    """Race-safe publication of the validated candidate.
+
+    Without --overwrite (or when the destination did not exist at conversion
+    start) publication is a no-clobber hard link: if another process created
+    the destination meanwhile, the link fails and nothing is replaced.
+    With --overwrite the destination identity captured before conversion must
+    still match: a concurrent swap, deletion or symlink replacement aborts.
+    """
+    if not overwrite or expected_identity is None:
+        try:
+            os.link(validation_path, out_path)
+        except FileExistsError:
+            raise OutputError(
+                f"destination was created concurrently: {out_path}; refusing "
+                "to replace it (rerun the conversion, or pass --overwrite to "
+                "allow replacement)") from None
+        except OSError as exc:
+            raise OutputError(
+                f"cannot publish without overwrite: {exc}") from None
+        os.unlink(validation_path)
+        return
+    try:
+        st = os.lstat(out_path)
+    except FileNotFoundError:
+        raise OutputError(
+            f"destination disappeared during conversion: {out_path}; "
+            "refusing overwrite") from None
+    if stat.S_ISLNK(st.st_mode):
+        raise OutputError(
+            f"destination became a symlink: {out_path}; refusing overwrite")
+    current = (int(st.st_dev), int(st.st_ino))
+    if current != expected_identity:
+        raise OutputError(
+            f"destination changed concurrently: {out_path}; refusing overwrite")
+    os.replace(validation_path, out_path)
+
+
 def _fsync_parent(path: str) -> None:
     """Best-effort directory fsync after atomic publication (POSIX)."""
     if os.name == "nt":
@@ -10357,6 +10397,53 @@ def _test_resume() -> str:
     return ("option drift/data corruption rejected; partial and post-conversion "
             "interruptions resumed")
 
+def _test_publication_race() -> str:
+    """Publication is race-safe: a destination created during conversion is
+    never clobbered, and --overwrite re-verifies the destination identity."""
+    d = _tmpdir()
+    staged = os.path.join(d, "out.safetensors.staged")
+    out = os.path.join(d, "out.safetensors")
+    with open(staged, "wb") as f:
+        f.write(b"candidate")
+    # 1) destination created concurrently -> no-clobber publication refuses
+    with open(out, "wb") as f:
+        f.write(b"other-process")
+    try:
+        _publish_output(staged, out, overwrite=False, expected_identity=None)
+        raise AssertionError("concurrent destination was clobbered")
+    except OutputError as exc:
+        assert "concurrently" in str(exc), exc
+    assert os.path.exists(staged) and os.path.exists(out)
+    with open(out, "rb") as f:
+        assert f.read() == b"other-process"
+    os.unlink(out)
+    # 2) clean no-clobber publish works and consumes the staged file
+    _publish_output(staged, out, overwrite=False, expected_identity=None)
+    with open(out, "rb") as f:
+        assert f.read() == b"candidate"
+    assert not os.path.exists(staged)
+    # 3) overwrite with a stale identity -> refuse (TOCTOU)
+    with open(out, "wb") as f:
+        f.write(b"candidate2")
+    with open(staged, "wb") as f:
+        f.write(b"candidate3")
+    stale = (1, 999999)
+    try:
+        _publish_output(staged, out, overwrite=True, expected_identity=stale)
+        raise AssertionError("stale overwrite identity accepted")
+    except OutputError as exc:
+        assert "changed" in str(exc) or "concurrently" in str(exc), exc
+    with open(out, "rb") as f:
+        assert f.read() == b"candidate2"
+    # 4) matching identity -> replace
+    lst = os.lstat(out)
+    ident = (int(lst.st_dev), int(lst.st_ino))
+    _publish_output(staged, out, overwrite=True, expected_identity=ident)
+    with open(out, "rb") as f:
+        assert f.read() == b"candidate3"
+    return ("publication race: no-clobber default, overwrite identity re-check")
+
+
 def _test_atomic() -> str:
     d = _tmpdir()
     path = os.path.join(d, "mini.safetensors")
@@ -11340,6 +11427,7 @@ SELF_TEST_CASES: List[Tuple[str, Callable[[], str]]] = [
             ("unsupported-tensors", _test_unsupported),
             ("sensitivity-output-planning", _test_sensitivity_planning),
             ("resume-state-recovery", _test_resume),
+            ("publication-race", _test_publication_race),
             ("atomic-output", _test_atomic),
             ("verify-output", _test_verify_output),
             ("end-to-end-mini-model-w4a8", _test_e2e_mini_model_w4a8),
@@ -11773,6 +11861,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             raise OutputError("output path must not be the same as an input file")
     if os.path.exists(out_path) and not args.overwrite and not args.resume:
         raise OutputError(f"output already exists: {out_path} (use --overwrite)")
+    # Capture the destination identity before any work begins: with
+    # --overwrite the final publication re-verifies that the destination is
+    # still the same object (TOCTOU protection).
+    expected_dest_identity: Optional[Tuple[int, int]] = None
+    if args.overwrite and os.path.lexists(out_path):
+        lst = os.lstat(out_path)
+        if stat.S_ISLNK(lst.st_mode):
+            raise OutputError(
+                f"output path is a symlink: {out_path}; refusing --overwrite")
+        expected_dest_identity = (int(lst.st_dev), int(lst.st_ino))
     tmp_path = out_path + ".tmp"
     staged_path = out_path + ".staged"
     validation_path = out_path + ".validation"
@@ -12121,7 +12219,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
 
     output_sha = sha256_file(validation_path)
-    os.replace(validation_path, out_path)
+    _publish_output(validation_path, out_path,
+                    overwrite=bool(args.overwrite),
+                    expected_identity=expected_dest_identity)
     _fsync_parent(out_path)
     summary["output_sha256"] = output_sha
     output_hash_check = next(
