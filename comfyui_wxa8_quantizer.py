@@ -130,7 +130,7 @@ QUANT_ALGORITHM_REVISION = "lloydmax-codebook-r2"  # canonical sample count; --s
 # changes an algorithm's behavior bumps its own revision here, and the value is
 # embedded in the extension metadata of every output.
 MIXED_PLANNER_REVISION = "mixed-planner-r2"  # per-format runtime_certified; cert applied pre-plan
-VALIDATION_REVISION = "validator-r3"  # source-hash mapping equality (rename-safe)
+VALIDATION_REVISION = "validator-r4"  # payload-size-accurate check (F9)
 CALIBRATION_REVISION = "calibration-r2"  # content-addressed cache (v2 fingerprint)
 
 
@@ -8101,6 +8101,19 @@ class Validator:
             self.check("output-reopen", False, f"safe_open failed: {e}")
             return self.summary()
 
+        # F9: the serialized tensor payload must match the planned inventory
+        # byte-for-byte (file size minus the 8-byte length prefix and header)
+        try:
+            with open(out_path, "rb") as f:
+                hlen = struct.unpack("<Q", f.read(8))[0]
+                actual_payload = size - 8 - hlen
+            expected_payload = sum(e["nbytes"] for e in self.plan.output_entries)
+            self.check("payload-size-accurate",
+                       actual_payload == expected_payload,
+                       f"actual {actual_payload} vs planned {expected_payload} bytes")
+        except Exception as e:
+            self.check("payload-size-accurate", False, f"size check failed: {e}")
+
         expected = {e["name"]: e for e in self.plan.output_entries}
         output_name_set = set(out_names)
         missing = [n for n in expected if n not in output_name_set]
@@ -10733,6 +10746,18 @@ def _test_mixed_planning() -> str:
             assert ddec.format == FORMAT_W4A8, ddec
     # mixed payload must be smaller than w4a8-only (bf16 fallback) payload
     entries, mixed_bytes = build_output_entries(info, decisions, FORMAT_MIXED, None)
+    # F9: one authoritative size estimator - planner candidate bytes must
+    # equal the output-inventory bytes for the same decisions
+    for ddec in decisions:
+        if ddec.kind != DecisionKind.QUANTIZE:
+            continue
+        meta = info.by_name(ddec.name)
+        est = quantized_format_bytes(int(meta.shape[0]), int(meta.shape[1]),
+                                     ddec.format)
+        act = sum(e["nbytes"] for e in entries
+                  if e["name"].startswith(ddec.layer + "."))
+        assert est == act, (ddec.layer, est, act)
+    assert mixed_bytes == sum(e["nbytes"] for e in entries)
     dec_w4a8 = classify_tensors(info, det, FORMAT_W4A8, None, [], [], [],
                                 None, None)
     entries8, bytes8 = build_output_entries(info, dec_w4a8, FORMAT_W4A8, None)
@@ -10924,6 +10949,9 @@ def _test_chunked_validation_matrix() -> str:
                                              input_hashes=input_hashes)
     for label, s in summaries.items():
         assert s["n_failed"] == 0, (label, s)
+    for label, s in summaries.items():
+        names = {c["name"]: c["status"] for c in s["checks"]}
+        assert names.get("payload-size-accurate") == "passed", (label, names)
     recon = {
         label: {c["name"]: c["detail"] for c in s["checks"]
                 if c["name"].startswith("recon-")}
