@@ -3492,6 +3492,10 @@ def quantize_weight_by_format(weight: torch.Tensor, fmt: str, group_size: int,
     keyed by suffix ('' for the packed weight, '_s_rel', '_s_channel',
     '_codebook', optional '_correction')."""
     if fmt == FORMAT_W4A8:
+        if not torch.isfinite(weight).all():
+            raise PolicyError(
+                "non-finite values in weight; pass --nonfinite-policy keep to "
+                "preserve the layer at original precision")
         packed, s_rel, s_ch, corr, cb = quantize_w4a8_weight(
             weight, group_size=group_size, convrot_groupsize=convrot_groupsize,
             symmetric=True, scale_dtype=torch.float8_e4m3fn, codebook=True,
@@ -5311,6 +5315,36 @@ def _calibration_layer_mapping_fingerprint(info: CheckpointInfo) -> str:
     return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
 
 
+def apply_nonfinite_policy(info: CheckpointInfo,
+                           decisions: List[TensorDecision],
+                           policy: str) -> List[str]:
+    """Explicit non-finite weight policy, applied before planning/entries.
+
+    policy="error": any non-finite value in a quantize candidate is a hard
+    error naming the layer. policy="keep": the layer is demoted to
+    passthrough at original precision (recorded in the report). Returns the
+    list of affected tensor names.
+    """
+    affected: List[str] = []
+    with CheckpointReader(info) as reader:
+        for d in decisions:
+            if d.kind != DecisionKind.QUANTIZE:
+                continue
+            t = reader.read_tensor(d.name)
+            if t.dtype in FLOAT_DTYPES and not torch.isfinite(t).all():
+                if policy == "keep":
+                    d.kind = DecisionKind.KEEP
+                    d.reason = "non-finite values; --nonfinite-policy keep " \
+                               "passes the layer through at original precision"
+                    affected.append(d.name)
+                else:
+                    raise InputError(
+                        f"non-finite values in quantizable layer {d.name!r} "
+                        "(NaN/Inf); pass --nonfinite-policy keep to preserve "
+                        "the layer at original precision")
+    return affected
+
+
 def load_calibration(source: str, info: CheckpointInfo, max_samples: Optional[int],
                      cache_path: Optional[str],
                      max_memory: int = 2 * 1024**3) -> CalibrationStats:
@@ -5348,6 +5382,10 @@ def load_calibration(source: str, info: CheckpointInfo, max_samples: Optional[in
                             meta = info.by_name(key)
                             if tensor.ndim == 2 and tensor.shape[0] > 0 and meta is not None \
                                     and tensor.shape[1] == meta.shape[1]:
+                                if not torch.isfinite(tensor).all():
+                                    raise CalibrationError(
+                                        f"{cache_path}: non-finite calibration "
+                                        f"activations for {key}")
                                 tensor = tensor.contiguous()
                                 stats[key] = {"samples": tensor,
                                               "rows": int(tensor.shape[0])}
@@ -5371,6 +5409,10 @@ def load_calibration(source: str, info: CheckpointInfo, max_samples: Optional[in
                     meta = info.by_name(key)
                     if tensor.ndim == 2 and tensor.shape[0] > 0 and meta is not None \
                             and tensor.shape[1] == meta.shape[1]:
+                        if not torch.isfinite(tensor).all():
+                            raise CalibrationError(
+                                f"{cache_path}: non-finite calibration "
+                                f"activations for {key}")
                         tensor = tensor.contiguous()
                         stats[key] = {"samples": tensor,
                                       "rows": int(tensor.shape[0])}
@@ -5476,6 +5518,9 @@ def load_calibration(source: str, info: CheckpointInfo, max_samples: Optional[in
                     f"{f}: activation width for {canonical} is {v.shape[1]}, "
                     f"expected {meta.shape[1]}")
             part = v.detach()[:effective_max_samples].float().cpu()
+            if not torch.isfinite(part).all():
+                raise CalibrationError(
+                    f"{f}: non-finite calibration activations for {canonical}")
             if canonical in tensors:
                 remaining = effective_max_samples - int(tensors[canonical].shape[0])
                 if remaining > 0:
@@ -9243,6 +9288,84 @@ def _test_chunk_invariant_payload() -> str:
             "--seed deterministic (1!=2, 1==1)")
 
 
+def _test_nonfinite_policy() -> str:
+    """Non-finite weights have an explicit policy: hard error by default,
+    --nonfinite-policy keep passes the layer through; calibration rows must
+    be finite."""
+    d = _tmpdir()
+    src = os.path.join(d, "nan.safetensors")
+    torch.manual_seed(3)
+    w = torch.randn(64, 768) * 0.02
+    w[5, 100] = float("nan")
+    w[7, 200] = float("inf")
+    safetensors.torch.save_file({
+        "double_stream_layers.0.img_self_attn.to_q.weight": w,
+        "single_stream_layers.0.feed_forward.linear_2.weight": torch.randn(64, 13568) * 0.02,
+    }, src)
+    info = discover_checkpoint(src)
+    det = detect_architecture(
+        info, shape_lookup=lambda nm: (info.by_name(nm).shape
+                                       if info.by_name(nm) else None))
+    # default: hard error naming the layer
+    dec = classify_tensors(info, det, FORMAT_W4A8, None, [], [], [], None, None)
+    try:
+        apply_nonfinite_policy(info, dec, "error")
+        raise AssertionError("non-finite weight accepted by default")
+    except InputError as exc:
+        assert "non-finite" in str(exc) and "img_self_attn" in str(exc), exc
+    # keep: the layer is demoted to passthrough, the rest stays quantized
+    dec2 = classify_tensors(info, det, FORMAT_W4A8, None, [], [], [], None, None)
+    kept = apply_nonfinite_policy(info, dec2, "keep")
+    assert kept == ["double_stream_layers.0.img_self_attn.to_q.weight"], kept
+    by_name = {dd.name: dd for dd in dec2}
+    assert by_name["double_stream_layers.0.img_self_attn.to_q.weight"].kind == \
+        DecisionKind.KEEP
+    assert by_name["single_stream_layers.0.feed_forward.linear_2.weight"].kind == \
+        DecisionKind.QUANTIZE
+    # the keep-plan converts and validates cleanly end to end
+    out = os.path.join(d, "out_nan.safetensors")
+    args = _selftest_args(out, FORMAT_W4A8, extra={"nonfinite_policy": "keep"})
+    plan = ConversionPlan(fmt=FORMAT_W4A8, detection=det, decisions=dec2,
+                          metadata_quant={}, metadata_ext={}, output_entries=[])
+    entries, total = build_output_entries(info, dec2, FORMAT_W4A8, None)
+    plan.output_entries = entries
+    plan.total_out_bytes = total
+    plan.n_quantized = len(plan.quantized_layers())
+    plan.n_kept = len(dec2) - plan.n_quantized
+    plan.metadata_quant = build_quant_metadata(info, plan)
+    engine = ConversionEngine(info, plan, args, out + ".state.json",
+                              out + ".tmp", out)
+    try:
+        engine.run()
+    finally:
+        engine.close()
+    meta = dict(info.metadata)
+    meta[METADATA_KEY_QUANT] = json_dumps(plan.metadata_quant)
+    meta[METADATA_KEY_EXT] = json_dumps(build_extension_metadata(
+        info, plan, inspect_environment(), args, None, None,
+        hash_checkpoint_files(info), sha256_safetensors_payload(out),
+        {"status": "selftest"}, []))
+    republish_with_metadata(out, out, meta, entries)
+    vplan = plan_from_output(out, det, FORMAT_W4A8, info)
+    validator = Validator(info, vplan, out, args, inspect_environment())
+    with CheckpointReader(info) as reader:
+        summary = validator.run(reader=reader,
+                                input_hashes=hash_checkpoint_files(info))
+    assert summary["n_failed"] == 0, summary
+    # calibration rows must be finite
+    cal_path = os.path.join(d, "nan_cal.npz")
+    bad = torch.randn(5, 768)
+    bad[1, 2] = float("nan")
+    np.savez(cal_path, **{"double_stream_layers.0.img_self_attn.to_q.weight": bad.numpy()})
+    try:
+        load_calibration(cal_path, info, 5, None)
+        raise AssertionError("non-finite calibration rows accepted")
+    except CalibrationError as exc:
+        assert "non-finite" in str(exc), exc
+    return ("nonfinite policy: error names the layer, keep passes through, "
+            "NaN calibration rows rejected")
+
+
 def _test_odd_dims() -> str:
     torch.manual_seed(3)
     # odd N, K=48 (divisible by 16 but not by 32)
@@ -11476,7 +11599,8 @@ def _selftest_args(out: str, fmt: str, resume: bool = False, overwrite: bool = F
         streaming=True, resume=resume, overwrite=overwrite, dry_run=False,
         inspect=False, validate=False, validation_only=False, metadata_only=False,
         report=None, log_level="warning", json_log=None, trust_pickle=False,
-        allow_extra_shard_tensors=False, yes=True, self_test=False, model=None)
+        allow_extra_shard_tensors=False, nonfinite_policy="error",
+        yes=True, self_test=False, model=None)
     if extra:
         for k, v in extra.items():
             setattr(ns, k, v)
@@ -11486,6 +11610,7 @@ def _selftest_args(out: str, fmt: str, resume: bool = False, overwrite: bool = F
 SELF_TEST_CASES: List[Tuple[str, Callable[[], str]]] = [
 
             ("w4-pack-roundtrip", _test_w4_pack_roundtrip),
+            ("nonfinite-policy", _test_nonfinite_policy),
             ("chunk-invariant-payload", _test_chunk_invariant_payload),
             ("odd-dims", _test_odd_dims),
             ("padding-removal", _test_padding_removal),
@@ -11689,6 +11814,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="when a shard index is present, tolerate tensors in "
                         "shards that the index does not list (default: error; "
                         "the index is authoritative)")
+    p.add_argument("--nonfinite-policy", choices=("error", "keep"),
+                   default="error",
+                   help="policy for non-finite (NaN/Inf) values in quantizable "
+                        "layers: error aborts naming the layer, keep passes it "
+                        "through at original precision")
     p.add_argument("--yes", action="store_true", help="assume yes for confirmations")
     p.add_argument("--self-test", action="store_true",
                    help="run the embedded engineering self-tests and exit")
@@ -12000,6 +12130,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     decisions = classify_tensors(info, detection, fmt, args.group_size,
                                  args.include, args.exclude, args.keep_precision,
                                  out_dtype, None)
+    # Explicit non-finite policy before any planning/entries are built
+    nonfinite_kept = apply_nonfinite_policy(info, decisions, args.nonfinite_policy)
+    if nonfinite_kept:
+        warnings.append(
+            f"nonfinite policy keep: {len(nonfinite_kept)} layer(s) with NaN/Inf "
+            "passed through at original precision: " +
+            "; ".join(nonfinite_kept[:3]) +
+            (" ..." if len(nonfinite_kept) > 3 else ""))
 
     effective_device = torch.device("cpu")
     effective_backend = "cpu"

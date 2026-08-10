@@ -162,6 +162,7 @@ measured output error.
 | `--resume`, `--overwrite` | interruption recovery / replace output |
 | `--include`, `--exclude`, `--keep-precision` | force or protect layers by regex |
 | `--architecture NAME` | override detection |
+| `--nonfinite-policy error\|keep` | NaN/Inf in quantizable layers: error (default, names the layer) or keep at original precision |
 | `--trust-pickle` | allow pickle inputs |
 | `--allow-extra-shard-tensors` | tolerate shard tensors the index does not list (default: error; the index is authoritative) |
 | `--sensitivity-threshold F` | legacy w4a8-mode keep-precision threshold |
