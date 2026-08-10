@@ -220,7 +220,7 @@ W4A4 and INT8.
 
 ## Checking the result
 
-* `--self-test`: 41 embedded checks. Golden vectors for W4A8, W4A4, and INT8
+* `--self-test`: 42 embedded checks. Golden vectors for W4A8, W4A4, and INT8
   (embedded reference weight, cross-platform safe), the eligibility matrix,
   mixed planning on real Boogu and Kroma dims, hard gate failures, BF16
   promotion, runtime capability matrix, planner determinism, corrupted

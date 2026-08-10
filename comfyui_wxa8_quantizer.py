@@ -128,7 +128,7 @@ QUANT_ALGORITHM_REVISION = "lloydmax-codebook-r1"
 # changes an algorithm's behavior bumps its own revision here, and the value is
 # embedded in the extension metadata of every output.
 MIXED_PLANNER_REVISION = "mixed-planner-r1"
-VALIDATION_REVISION = "validator-r1"
+VALIDATION_REVISION = "validator-r2"  # chunked INT8 validation fixed
 CALIBRATION_REVISION = "calibration-r1"
 
 
@@ -8383,7 +8383,8 @@ class Validator:
                                             | ((rt[:, 1::2] & 0xF) << 4)
                                         ).to(torch.int8)
                                         pack_ok = pack_ok and bool(torch.equal(repacked, packed))
-                                    del packed, scale, dq, rt, repacked
+                                        del rt, repacked
+                                    del packed, scale, dq
                             m = acc.finish()
                         else:
                             packed = st.get_tensor(d.layer + ".weight")
@@ -10507,6 +10508,101 @@ def _test_mixed_e2e() -> str:
     return ("mixed e2e: heterogeneous checkpoint converted, validated "
             f"(n_failed=0), metadata {sorted(fmts)}, layouts reload + dequant OK")
 
+
+def _test_chunked_validation_matrix() -> str:
+    """Bounded-memory (chunked) validation must behave identically to
+    full-memory validation for INT8, W4A4 and W4A8 layers. Regression for the
+    INT8 chunked path that deleted W4A4-only temporaries (NameError)."""
+    d = _tmpdir()
+    src_path = os.path.join(d, "cvmatrix.safetensors")
+    torch.manual_seed(7)
+    n = 1024
+    sd = {
+        # K=3360: ConvRot-256 victim -> INT8 in mixed mode
+        "double_stream_layers.0.img_self_attn.to_q.weight": torch.randn(n, 3360) * 0.02,
+        # K=13568: W4A8
+        "single_stream_layers.0.feed_forward.linear_2.weight": torch.randn(n, 13568) * 0.02,
+        # K=1152: W4A4 only (K%%256 != 0, K%%64 == 0)
+        "single_stream_layers.1.feed_forward.linear_2.weight": torch.randn(n, 1152) * 0.02,
+    }
+    safetensors.torch.save_file(sd, src_path)
+    info = discover_checkpoint(src_path)
+    det = detect_architecture(
+        info, shape_lookup=lambda nm: (info.by_name(nm).shape
+                                       if info.by_name(nm) else None))
+    assert det.architecture == "boogu", det.architecture
+    dec = classify_tensors(info, det, FORMAT_MIXED, None, [], [], [], None, None)
+    forced: Dict[str, int] = {}
+    for ddec in dec:
+        if ddec.kind != DecisionKind.QUANTIZE:
+            continue
+        k = int(info.by_name(ddec.name).shape[1])
+        if k % 256 == 0:
+            ddec.format = FORMAT_W4A8
+        elif k % 64 == 0:
+            ddec.format = FORMAT_W4A4
+        else:
+            ddec.format = FORMAT_INT8
+        ddec.convrot_groupsize = MixedPlanner.cgs_for(ddec, k, ddec.format)
+        forced[ddec.format] = forced.get(ddec.format, 0) + 1
+    assert forced == {FORMAT_INT8: 1, FORMAT_W4A8: 1, FORMAT_W4A4: 1}, forced
+    out = os.path.join(d, "out_mixed.safetensors")
+    args = _selftest_args(out, FORMAT_MIXED, extra={
+        "validate": False, "profile": "balanced", "format": "mixed"})
+    plan = ConversionPlan(fmt=FORMAT_MIXED, detection=det, decisions=dec,
+                          metadata_quant={}, metadata_ext={}, output_entries=[])
+    entries, total = build_output_entries(info, dec, FORMAT_MIXED, None)
+    plan.output_entries = entries
+    plan.total_out_bytes = total
+    plan.n_quantized = len(plan.quantized_layers())
+    plan.n_kept = len(dec) - plan.n_quantized
+    plan.mixed_plan = {
+        "counts": {fmt: 1 for fmt in (FORMAT_INT8, FORMAT_W4A8, FORMAT_W4A4)},
+        "layer_params": {}, "layer_bytes": {},
+        "kept_params": 0, "kept_bytes": 0,
+        "effective_bpp": 0.9,
+        "original_precision_parameter_fraction": 0.0,
+        "original_precision_output_byte_fraction": 0.0,
+        "global_mean_error": 0.05,
+        "w4a4_linear_dtype": DEFAULT_W4A4_LINEAR_DTYPE,
+    }
+    plan.metadata_quant = build_quant_metadata(info, plan)
+    engine = ConversionEngine(info, plan, args, out + ".state.json",
+                              out + ".tmp", out)
+    try:
+        engine.run()
+    finally:
+        engine.close()
+    meta = dict(info.metadata)
+    meta[METADATA_KEY_QUANT] = json_dumps(plan.metadata_quant)
+    meta[METADATA_KEY_EXT] = json_dumps(build_extension_metadata(
+        info, plan, inspect_environment(), args, None, None,
+        hash_checkpoint_files(info), sha256_safetensors_payload(out),
+        {"status": "selftest"}, []))
+    republish_with_metadata(out, out, meta, entries)
+    vplan = plan_from_output(out, det, FORMAT_MIXED, info)
+    input_hashes = hash_checkpoint_files(info)
+    summaries: Dict[str, Dict[str, Any]] = {}
+    for label, mem in (("full-memory", 2 * 1024**3),
+                       ("chunked-32M", MIN_CHUNK_MEMORY)):
+        vargs = _selftest_args(out, FORMAT_MIXED, extra={
+            "max_memory": mem, "format": "mixed", "validate": True})
+        validator = Validator(info, vplan, out, vargs, inspect_environment())
+        with CheckpointReader(info) as reader:
+            summaries[label] = validator.run(reader=reader,
+                                             input_hashes=input_hashes)
+    for label, s in summaries.items():
+        assert s["n_failed"] == 0, (label, s)
+    recon = {
+        label: {c["name"]: c["detail"] for c in s["checks"]
+                if c["name"].startswith("recon-")}
+        for label, s in summaries.items()}
+    assert recon["full-memory"] == recon["chunked-32M"], \
+        (recon["full-memory"], recon["chunked-32M"])
+    return ("chunked validation matrix: full == chunked recon metrics "
+            f"({len(recon['full-memory'])} layers, INT8+W4A4+W4A8, "
+            "0 failed)")
+
 def _test_mixed_gates_hard_fail() -> str:
     """Quality and compression gates are hard failures: a plan that cannot
     meet them raises instead of publishing."""
@@ -10992,6 +11088,7 @@ SELF_TEST_CASES: List[Tuple[str, Callable[[], str]]] = [
             ("mixed-runtime-metric", _test_mixed_runtime_metric),
             ("mixed-determinism", _test_mixed_determinism),
             ("mixed-metadata-fuzz", _test_mixed_metadata_fuzz),
+            ("chunked-validation-matrix", _test_chunked_validation_matrix),
             ("architecture-sync", _test_architecture_sync),
             ("strip-gpu-identity", _test_strip_gpu_identity),
             ("fail-on-low-compression", _test_fail_on_low_compression),
