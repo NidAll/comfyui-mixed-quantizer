@@ -123,6 +123,25 @@ W4A8_CONVROT_GROUPSIZE = 256
 
 QUANT_ALGORITHM_REVISION = "lloydmax-codebook-r1"
 
+# Algorithm identity (Phase 0): independent revisions per algorithm surface, so
+# a converter version bump is never the only provenance signal. Each fix that
+# changes an algorithm's behavior bumps its own revision here, and the value is
+# embedded in the extension metadata of every output.
+MIXED_PLANNER_REVISION = "mixed-planner-r1"
+VALIDATION_REVISION = "validator-r1"
+CALIBRATION_REVISION = "calibration-r1"
+
+
+def get_algorithm_identity() -> Dict[str, str]:
+    """Machine-readable algorithm identity recorded in every output."""
+    return {
+        "quant_algorithm_rev": QUANT_ALGORITHM_REVISION,
+        "w4a8_format_revision": FORMAT_W4A8_REVISION,
+        "mixed_planner_revision": MIXED_PLANNER_REVISION,
+        "validation_revision": VALIDATION_REVISION,
+        "calibration_revision": CALIBRATION_REVISION,
+    }
+
 FORMAT_W4A8_REVISION = "asym-w4a8-int8-r1"
 
 MAX_SAFETENSORS_HEADER_SIZE = 100_000_000
@@ -7362,6 +7381,7 @@ def build_extension_metadata(info: CheckpointInfo, plan: ConversionPlan,
         "schema": "comfy_wxa8/v2" if is_mixed else "comfy_wxa8/v1",
         "converter": CONVERTER_NAME,
         "converter_version": get_converter_version(),
+        "algorithm_identity": get_algorithm_identity(),
         "format": plan.fmt,
         "format_revision": FORMAT_MIXED_REVISION if is_mixed
                           else FORMAT_W4A8_REVISION,
@@ -9187,6 +9207,36 @@ def _test_metadata() -> str:
         ext["quantization"]["activation_quantization"]
     return f"{len(qm['layers'])} layers recorded; extension schema and provenance valid"
 
+
+def _test_algorithm_identity() -> str:
+    """Algorithm identity (Phase 0): independent revisions for each algorithm
+    surface, embedded in extension metadata."""
+    ident = get_algorithm_identity()
+    for key in ("quant_algorithm_rev", "w4a8_format_revision",
+                "mixed_planner_revision", "validation_revision",
+                "calibration_revision"):
+        assert ident.get(key), f"algorithm identity missing {key}"
+        assert isinstance(ident[key], str) and ident[key]
+    d = _tmpdir()
+    path = os.path.join(d, "mini.safetensors")
+    _make_mini_checkpoint(path)
+    info = discover_checkpoint(path)
+    det = detect_architecture(info, shape_lookup=lambda n: (info.by_name(n).shape
+                                                            if info.by_name(n) else None))
+    dec = classify_tensors(info, det, FORMAT_W4A8, None, [], [], [], None, None)
+    plan = ConversionPlan(fmt=FORMAT_W4A8, detection=det, decisions=dec,
+                          metadata_quant={}, metadata_ext={}, output_entries=[])
+    plan.n_quantized = len(plan.quantized_layers())
+    plan.n_kept = len(plan.decisions) - plan.n_quantized
+    ext = build_extension_metadata(
+        info, plan, inspect_environment(),
+        _selftest_args(os.path.join(d, "out.safetensors"), FORMAT_W4A8),
+        None, None, hash_checkpoint_files(info), "0" * 64, {}, [])
+    assert ext.get("algorithm_identity") == ident, \
+        "extension metadata must embed the authoritative algorithm identity"
+    return "algorithm identity embedded: " + ", ".join(
+        f"{k}={v}" for k, v in ident.items())
+
 def _test_registry() -> str:
     names = family_names()
     assert len(names) == len(set(names))
@@ -10955,6 +11005,7 @@ SELF_TEST_CASES: List[Tuple[str, Callable[[], str]]] = [
             ("atomic-output", _test_atomic),
             ("verify-output", _test_verify_output),
             ("end-to-end-mini-model-w4a8", _test_e2e_mini_model_w4a8),
+            ("algorithm-identity", _test_algorithm_identity),
 ]
 
 def build_arg_parser() -> argparse.ArgumentParser:
