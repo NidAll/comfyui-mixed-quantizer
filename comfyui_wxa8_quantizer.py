@@ -67,7 +67,7 @@ except Exception as _exc:  # pragma: no cover - import guard
 
 CONVERTER_NAME = "comfyui_wxa8_quantizer"
 
-_CONVERTER_VERSION = "1.4.0-experimental"
+_CONVERTER_VERSION = "1.5.0"
 
 
 def get_converter_version() -> str:
@@ -9608,6 +9608,38 @@ def _test_reference_decoder_consensus() -> str:
             "passes with a broken production dequant (independence)")
 
 
+def _test_channel_gating() -> str:
+    """Stable/experimental channels: --format mixed requires --experimental,
+    the stable channel is w4a8, and the release version is 1.5.0."""
+    import subprocess as _sp
+    d = _tmpdir()
+    src_path = os.path.join(d, "boogu_real.safetensors")
+    _make_boogu_real_dims_checkpoint(src_path, n=16, n_fail=2, n_ok=2)
+    out = os.path.join(d, "out.safetensors")
+    base_cmd, base_env = _converter_cmd()
+    # mixed without --experimental -> UsageError, nothing written
+    r = _sp.run(base_cmd + [src_path, "--output", out, "--format", "mixed"],
+                capture_output=True, text=True, timeout=600, env=base_env)
+    assert r.returncode == 1, (r.returncode, r.stdout[-500:], r.stderr[-500:])
+    assert "experimental" in (r.stderr + r.stdout).lower(), (r.stdout[-800:])
+    assert not os.path.exists(out)
+    # mixed with --experimental plans (dry run)
+    r = _sp.run(base_cmd + [src_path, "--output", out, "--format", "mixed",
+                            "--experimental", "--dry-run"],
+                capture_output=True, text=True, timeout=600, env=base_env)
+    assert r.returncode == 0, (r.returncode, r.stdout[-500:], r.stderr[-500:])
+    # the stable channel needs no flag
+    r = _sp.run(base_cmd + [src_path, "--output", out, "--format", "w4a8",
+                            "--dry-run"],
+                capture_output=True, text=True, timeout=600, env=base_env)
+    assert r.returncode == 0, (r.returncode, r.stdout[-500:])
+    # release version
+    r = _sp.run(base_cmd + ["--version"], capture_output=True, text=True,
+                timeout=120, env=base_env)
+    assert "1.5.0" in r.stdout, r.stdout
+    return "channels: mixed behind --experimental, w4a8 stable, version 1.5.0"
+
+
 def _test_odd_dims() -> str:
     torch.manual_seed(3)
     # odd N, K=48 (divisible by 16 but not by 32)
@@ -11852,7 +11884,7 @@ def _selftest_args(out: str, fmt: str, resume: bool = False, overwrite: bool = F
         inspect=False, validate=False, validation_only=False, metadata_only=False,
         report=None, log_level="warning", json_log=None, trust_pickle=False,
         allow_extra_shard_tensors=False, nonfinite_policy="error",
-        yes=True, self_test=False, model=None)
+        experimental=False, yes=True, self_test=False, model=None)
     if extra:
         for k, v in extra.items():
             setattr(ns, k, v)
@@ -11909,6 +11941,7 @@ SELF_TEST_CASES: List[Tuple[str, Callable[[], str]]] = [
             ("atomic-output", _test_atomic),
             ("verify-output", _test_verify_output),
             ("end-to-end-mini-model-w4a8", _test_e2e_mini_model_w4a8),
+            ("channel-gating", _test_channel_gating),
             ("algorithm-identity", _test_algorithm_identity),
 ]
 
@@ -12073,6 +12106,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="policy for non-finite (NaN/Inf) values in quantizable "
                         "layers: error aborts naming the layer, keep passes it "
                         "through at original precision")
+    p.add_argument("--experimental", action="store_true",
+                   help="enable experimental features (currently: --format "
+                        "mixed). The stable channel is --format w4a8.")
     p.add_argument("--yes", action="store_true", help="assume yes for confirmations")
     p.add_argument("--self-test", action="store_true",
                    help="run the embedded engineering self-tests and exit")
@@ -12281,6 +12317,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.format == "w4a8":
         fmt = FORMAT_W4A8
     elif args.format == "mixed":
+        if not args.experimental:
+            raise UsageError(
+                "--format mixed is experimental: pass --experimental to "
+                "enable it (the stable channel is --format w4a8)")
         fmt = FORMAT_MIXED
     else:
         parser.error(f"--format must be w4a8 or mixed, got {args.format!r}")

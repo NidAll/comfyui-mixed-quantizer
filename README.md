@@ -8,15 +8,17 @@ at runtime.
 
 Two modes:
 
-* `--format w4a8` (default): every quantized layer uses `asym_w4a8_int8`
+* `--format w4a8` (default, stable): every quantized layer uses `asym_w4a8_int8`
   (ConvRot 256, group 16, Lloyd-Max codebook). This path is byte-identical to
   v1.3.0, guarded by the golden-vector self-tests.
-* `--format mixed`: a per-layer optimizer over `convrot_w4a4`,
-  `asym_w4a8_int8`, and `int8_tensorwise`. Each layer gets the cheapest format
-  that stays inside a quality gate; layers that cannot meet the gate stay at
-  original precision.
+* `--format mixed` (experimental, requires `--experimental`): a per-layer
+  optimizer over `convrot_w4a4`, `asym_w4a8_int8`, and `int8_tensorwise`.
+  Each layer gets the cheapest format that stays inside a quality gate; layers
+  that cannot meet the gate stay at original precision. Mixed stays behind the
+  experimental flag until its planner/calibration/runtime-probe qualification
+  cycle is complete.
 
-Current version: `1.4.0-experimental`.
+Current version: `1.5.0` (stable channel: `--format w4a8`).
 
 ## How it works
 
@@ -71,11 +73,11 @@ the companion tools that import comfy-kitchen (`tools/runtime_certify.py`,
 ## Quick start
 
 ```bash
-# stable W4A8
+# stable W4A8 (stable channel)
 .venv/bin/python comfyui_wxa8_quantizer.py MODEL.safetensors --output OUT.safetensors --format w4a8 --validate
 
-# mixed, profile picked from the machine (NVIDIA/AMD: balanced, CPU: conservative)
-.venv/bin/python comfyui_wxa8_quantizer.py MODEL.safetensors --output OUT.safetensors --format mixed --profile auto --validate
+# mixed, experimental channel (requires --experimental)
+.venv/bin/python comfyui_wxa8_quantizer.py MODEL.safetensors --output OUT.safetensors --format mixed --profile auto --experimental --validate
 
 # sanity checks and model inspection
 .venv/bin/python comfyui_wxa8_quantizer.py --self-test
@@ -141,7 +143,8 @@ measured output error.
 
 | Option | Meaning |
 | ------ | ------- |
-| `--format w4a8\|mixed` | quantization mode (default w4a8) |
+| `--format w4a8\|mixed` | quantization mode (default w4a8; mixed requires `--experimental`) |
+| `--experimental` | enable experimental features (currently: `--format mixed`) |
 | `--profile auto\|balanced\|conservative\|size-first` | gate and compression profile (mixed) |
 | `--target-runtime auto\|nvidia\|amd\|cpu` | runtime used for format eligibility (mixed) |
 | `--quality-gate F`, `--global-error-gate F` | error gate overrides |
@@ -223,7 +226,7 @@ W4A4 and INT8.
 
 ## Checking the result
 
-* `--self-test`: 46 embedded checks. Golden vectors for W4A8, W4A4, and INT8
+* `--self-test`: 50 embedded checks. Golden vectors for W4A8, W4A4, and INT8
   (embedded reference weight, cross-platform safe), the eligibility matrix,
   mixed planning on real Boogu and Kroma dims, hard gate failures, BF16
   promotion, runtime capability matrix, planner determinism, corrupted

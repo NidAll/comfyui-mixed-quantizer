@@ -3,6 +3,12 @@ Recorded: 2026-08-10, commit be610d9 + clean tree
 Purpose: reference for the remove-experimental plan; every fix must keep
 w4a8 payloads byte-identical and mixed payloads reproducible.
 
+RELEASE NOTE: superseded by 1.5.0 (commit 153c79b): the P0+P1 fixes and
+independent reference decoders landed; payload hashes below remain the
+frozen invariants (w4a8 8e549e67..., mixed caeef3a7...). Self-test count
+is now 50/50, algorithm revisions: lloydmax-codebook-r2, validator-r5,
+mixed-planner-r3, calibration-r2.
+
 converter_version      = 1.4.0-experimental
 self_test_count        = 40/40 (passed)
 torch                  = 2.13.0+cu130
