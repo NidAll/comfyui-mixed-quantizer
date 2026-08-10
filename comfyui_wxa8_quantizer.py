@@ -127,7 +127,7 @@ QUANT_ALGORITHM_REVISION = "lloydmax-codebook-r1"
 # a converter version bump is never the only provenance signal. Each fix that
 # changes an algorithm's behavior bumps its own revision here, and the value is
 # embedded in the extension metadata of every output.
-MIXED_PLANNER_REVISION = "mixed-planner-r1"
+MIXED_PLANNER_REVISION = "mixed-planner-r2"  # per-format runtime_certified; cert applied pre-plan
 VALIDATION_REVISION = "validator-r2"  # chunked INT8 validation fixed
 CALIBRATION_REVISION = "calibration-r1"
 
@@ -6212,7 +6212,8 @@ class MixedPlanner:
                         effective_runtime_path=(
                             mode.path if mode is not None else None),
                         runtime_certified=(
-                            self.runtime_certificate is not None),
+                            self.runtime.capability(fmt).certified
+                            if fmt in MIXED_FORMATS else False),
                         runtime_certain=(
                             mode.certain if mode is not None else None),
                         backend=(self.runtime.target if fmt == FORMAT_W4A4
@@ -10737,6 +10738,71 @@ def _test_mixed_runtime_caps() -> str:
             "fallback + certain A4; cuda SM8x native INT4; Turing "
             "uncertain -> worst-case A4/A8 evaluation")
 
+
+def _test_mixed_cert_seq() -> str:
+    """Runtime certificates must be applied to RuntimeCapabilities BEFORE
+    planning: candidate runtime_certified is per-format, and the planner
+    summary must agree with the certified caps (no post-plan mutation)."""
+    d = _tmpdir()
+    src_path = os.path.join(d, "boogu_cert.safetensors")
+    _make_boogu_real_dims_checkpoint(src_path, n=48, n_fail=2, n_ok=2)
+    info = discover_checkpoint(src_path)
+    det = detect_architecture(
+        info, shape_lookup=lambda nm: (info.by_name(nm).shape
+                                       if info.by_name(nm) else None))
+    dec = classify_tensors(info, det, FORMAT_MIXED, None, [], [], [], None, None)
+    # certificate covering ONLY W4A8 (v1 schema, produced by runtime_certify)
+    cert = RuntimeCertificate(
+        backend="nvidia", gpu="selftest-gpu", cuda_capability=(8, 9),
+        rocm_arch=None,
+        formats={FORMAT_W4A8: {"load": True, "forward": True,
+                               "backend": "cuda"}})
+    caps = runtime_capabilities_for("nvidia")
+    caps = dataclasses.replace(caps, cuda_capability=(8, 9))
+    _check_runtime_certificate(cert, caps, [])
+    cap_map = {FORMAT_W4A4: ("w4a4", caps.w4a4),
+               FORMAT_W4A8: ("w4a8", caps.w4a8),
+               FORMAT_INT8: ("int8", caps.int8)}
+    certed = {
+        field: dataclasses.replace(cap, certified=True)
+        for fmt, (field, cap) in cap_map.items()
+        if fmt in cert.formats}
+    caps = dataclasses.replace(caps, runtime_certified=True, **certed)
+    planner = MixedPlanner("balanced", None, 2 * 1024**3, torch.device("cpu"),
+                           None, runtime=caps, runtime_certificate=cert)
+    summary = planner.plan(info, dec)
+    # per-format certified flags must be format-specific, not "any cert"
+    for layer, cands in planner.candidates.items():
+        for fmt, cand in cands.items():
+            if cand.eligible:
+                expected = (fmt == FORMAT_W4A8)
+                assert cand.runtime_certified is expected, (
+                    layer, fmt, cand.runtime_certified, expected)
+            else:
+                # ineligible candidates have no runtime path and must never
+                # claim certification
+                assert cand.runtime_certified is False, (layer, fmt, cand)
+    rt = summary["runtime"]
+    assert rt["runtime_certified"] is True
+    assert rt["formats"][FORMAT_W4A8]["certified"] is True
+    assert rt["formats"][FORMAT_W4A4]["certified"] is False
+    assert rt["formats"][FORMAT_INT8]["certified"] is False
+    # the summary (which feeds extension metadata) must already reflect the
+    # final certified caps: no mutation after planning is allowed
+    assert planner.runtime is caps
+    assert rt["formats"][FORMAT_W4A8]["status"] == "runtime-certified accelerated"
+    # a certificate missing a SELECTED format must fail closed post-plan
+    sel = sorted({d.format for d in dec
+                  if d.kind == DecisionKind.QUANTIZE
+                  and d.format in MIXED_FORMATS})
+    try:
+        _check_runtime_certificate(cert, caps, sel)
+        raise AssertionError("uncertified selected format accepted")
+    except RuntimeCompatibilityError:
+        pass
+    return ("cert sequencing: per-format runtime_certified, summary == final "
+            "caps, uncertified selected formats fail closed")
+
 def _test_mixed_runtime_metric() -> str:
     """The calibration metric is the real runtime operation (activation
     rotation + activation quantization + quantized GEMM), not a
@@ -11085,6 +11151,7 @@ SELF_TEST_CASES: List[Tuple[str, Callable[[], str]]] = [
             ("mixed-gates-hard-fail", _test_mixed_gates_hard_fail),
             ("mixed-bf16-promotion", _test_mixed_bf16_promotion),
             ("mixed-runtime-caps", _test_mixed_runtime_caps),
+            ("mixed-cert-seq", _test_mixed_cert_seq),
             ("mixed-runtime-metric", _test_mixed_runtime_metric),
             ("mixed-determinism", _test_mixed_determinism),
             ("mixed-metadata-fuzz", _test_mixed_metadata_fuzz),
@@ -11605,6 +11672,21 @@ def main(argv: Optional[List[str]] = None) -> int:
                 f"runtime certificate loaded: backend={certificate.backend}, "
                 f"gpu={certificate.gpu or 'unknown'}, formats="
                 f"{sorted(certificate.formats)}")
+            # Apply the certificate to the capabilities BEFORE planning: the
+            # planner, its summary and the extension metadata must all observe
+            # one final authoritative RuntimeCapabilities (never mutated after
+            # planning). Coverage of the actually selected formats is still
+            # enforced after planning, when the selection is known.
+            _check_runtime_certificate(certificate, runtime_caps, [])
+            cap_map = {FORMAT_W4A4: ("w4a4", runtime_caps.w4a4),
+                       FORMAT_W4A8: ("w4a8", runtime_caps.w4a8),
+                       FORMAT_INT8: ("int8", runtime_caps.int8)}
+            certed = {
+                field: dataclasses.replace(cap, certified=True)
+                for fmt, (field, cap) in cap_map.items()
+                if fmt in certificate.formats}
+            runtime_caps = dataclasses.replace(
+                runtime_caps, runtime_certified=True, **certed)
         mixed_planner = MixedPlanner(
             profile_name, calibration, args.max_memory, effective_device,
             compute_dtype,
@@ -11630,17 +11712,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                 if d.kind == DecisionKind.QUANTIZE
                 and d.format in MIXED_FORMATS})
             _check_runtime_certificate(certificate, runtime_caps, required)
-            # mark only the formats the certificate actually exercised
-            cap_map = {FORMAT_W4A4: ("w4a4", runtime_caps.w4a4),
-                       FORMAT_W4A8: ("w4a8", runtime_caps.w4a8),
-                       FORMAT_INT8: ("int8", runtime_caps.int8)}
-            certed = {
-                field: dataclasses.replace(cap, certified=True)
-                for fmt, (field, cap) in cap_map.items()
-                if fmt in certificate.formats}
-            runtime_caps = dataclasses.replace(
-                runtime_caps, runtime_certified=True, **certed)
-            mixed_planner.runtime = runtime_caps
         if not calibration:
             warnings.append(
                 "mixed planner: no calibration activations, quality gates use "
