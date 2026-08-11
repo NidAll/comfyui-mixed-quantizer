@@ -1,8 +1,15 @@
 
-import torch, safetensors.torch, os, sys
+import torch  # pyright: ignore[reportMissingImports]
+import safetensors.torch  # pyright: ignore[reportMissingImports]
+import os, sys
 OUT = sys.argv[1]
 torch.manual_seed(42)
 def L(n, k, scale=0.02): return torch.randn(n, k) * scale
+# fp16 variant for the giant TE linears: real text-encoder checkpoints ship
+# fp16/fp8, and fp16 keeps the fixtures small enough for the conversion battery
+# while keeping the REAL TE dims (T5-XXL 4096/10240, Qwen2-0.5B 896/4864,
+# Gemma-2-2B 2304/9216).
+def L16(n, k, scale=0.02): return (torch.randn(n, k) * scale).to(torch.float16)
 
 def make_sdxl():
     sd = {}; p = "model.diffusion_model."
@@ -23,6 +30,14 @@ def make_sdxl():
     sd[p+"time_embed.0.weight"] = L(320, 320)
     sd[p+"out.2.weight"] = L(4, 320) * 0.1
     sd["cond_stage_model.transformer.text_model.embeddings.token_embedding.weight"] = L(49408, 768, 0.02)
+    # text-encoder blocks (TE quantization test battery): CLIP-L under
+    # conditioner.embedders.0. (HF naming transformer.text_model...) and
+    # CLIP-G under conditioner.embedders.1.model. (open_clip naming
+    # transformer.resblocks...), both real SDXL naming.
+    _clip_text_blocks(sd, "conditioner.embedders.0.", blocks=1,
+                      hidden=768, ffn=3072, vocab=49408)
+    _clip_oc_text_blocks(sd, "conditioner.embedders.1.model.", blocks=1,
+                         hidden=1280, ffn=5120)
     sd["first_stage_model.encoder.conv_in.weight"] = torch.randn(128, 3, 3, 3) * 0.1
     return sd
 
@@ -36,7 +51,166 @@ def make_sd15():
     sd[p+"input_blocks.1.0.transformer_blocks.0.ff.net.2.weight"] = L(320, 2560, 0.01)
     sd[p+"time_embed.0.weight"] = L(320, 320)
     sd[p+"out.2.weight"] = L(4, 320) * 0.1
+    # text-encoder (cond_stage_model) CLIP-L block, real SD1.5 naming:
+    # cond_stage_model.transformer.text_model... + cond_stage_model.text_projection
+    _clip_text_blocks(sd, "cond_stage_model.", blocks=1,
+                      hidden=768, ffn=3072, vocab=49408)
     return sd
+
+# ---------------------------------------------------------------------------
+# Text-encoder fixture builders (TE quantization test battery).
+#
+# Naming follows the ComfyUI-native TE conventions from the TE quantization
+# plan: T5-style `encoder.blocks.N.layer.M.{SelfAttention,DenseReluDense}`, CLIP
+# style `transformer.text_model.encoder.layers.N.self_attn.*` (+ mlp fc1/fc2),
+# and llama-style `model.layers.N.self_attn.*` / `model.layers.N.mlp.*`. Keys
+# that must stay passthrough are included deliberately: token/positional
+# embeddings, final_layer_norm, text_projection, T5 shared.weight,
+# encoder.relative_attention_bias, T5 decoder.*, llama embed_tokens / model.norm
+# / lm_head.
+# ---------------------------------------------------------------------------
+
+def _t5_encoder_block(sd, prefix, b, hidden, ffn):
+    # ComfyUI/HF T5 files use SINGULAR `encoder.block.N.` (verified against
+    # comfy/text_encoders/t5.py and real t5xxl files; ComfyUI detects T5 via
+    # encoder.block.23.layer.1.DenseReluDense.wi_1.weight).
+    pre = f"{prefix}encoder.block.{b}.layer."
+    for proj in ("q", "k", "v"):
+        sd[pre + f"0.SelfAttention.{proj}.weight"] = L16(hidden, hidden)
+    sd[pre + "0.SelfAttention.o.weight"] = L16(hidden, hidden)
+    sd[pre + "1.DenseReluDense.wi_0.weight"] = L16(ffn, hidden)
+    sd[pre + "1.DenseReluDense.wi_1.weight"] = L16(ffn, hidden)
+    sd[pre + "1.DenseReluDense.wo.weight"] = L16(hidden, ffn)
+    sd[pre + "0.layer_norm.weight"] = torch.randn(hidden) * 0.1
+    sd[pre + "1.layer_norm.weight"] = torch.randn(hidden) * 0.1
+
+
+def _t5_decoder_block(sd, prefix, b, hidden, ffn):
+    """T5 decoder block: kept to prove decoder.* stays passthrough."""
+    pre = f"{prefix}decoder.block.{b}.layer."
+    for proj in ("q", "k", "v"):
+        sd[pre + f"0.SelfAttention.{proj}.weight"] = L16(hidden, hidden)
+    sd[pre + "0.SelfAttention.o.weight"] = L16(hidden, hidden)
+    for proj in ("q", "k", "v"):
+        sd[pre + f"1.EncDecAttention.{proj}.weight"] = L16(hidden, hidden)
+    sd[pre + "1.EncDecAttention.o.weight"] = L16(hidden, hidden)
+    sd[pre + "2.DenseReluDense.wi_0.weight"] = L16(ffn, hidden)
+    sd[pre + "2.DenseReluDense.wo.weight"] = L16(hidden, ffn)
+    sd[pre + "0.layer_norm.weight"] = torch.randn(hidden) * 0.1
+    sd[pre + "1.layer_norm.weight"] = torch.randn(hidden) * 0.1
+    sd[pre + "2.layer_norm.weight"] = torch.randn(hidden) * 0.1
+
+
+def _t5_te_blocks(sd, prefix="", blocks=1, hidden=4096, ffn=10240, vocab=2048,
+                  with_decoder=True):
+    for b in range(blocks):
+        _t5_encoder_block(sd, prefix, b, hidden, ffn)
+    if with_decoder:
+        _t5_decoder_block(sd, prefix, 0, hidden, ffn)
+    sd[prefix + "shared.weight"] = L16(vocab, hidden)
+    sd[prefix + "encoder.final_layer_norm.weight"] = torch.randn(hidden) * 0.1
+    sd[prefix + "encoder.relative_attention_bias.weight"] = torch.randn(32, 64) * 0.1
+
+
+def _clip_text_block(sd, prefix, b, hidden, ffn):
+    pre = f"{prefix}transformer.text_model.encoder.layers.{b}."
+    for proj in ("q_proj", "k_proj", "v_proj"):
+        sd[pre + f"self_attn.{proj}.weight"] = L(hidden, hidden)
+    sd[pre + "self_attn.out_proj.weight"] = L(hidden, hidden)
+    sd[pre + "mlp.fc1.weight"] = L(ffn, hidden)
+    sd[pre + "mlp.fc2.weight"] = L(hidden, ffn)
+    sd[pre + "layer_norm1.weight"] = torch.randn(hidden) * 0.1
+    sd[pre + "layer_norm2.weight"] = torch.randn(hidden) * 0.1
+
+
+def _clip_text_blocks(sd, prefix, blocks=1, hidden=768, ffn=3072, vocab=49408,
+                      max_pos=77, with_projection=True):
+    for b in range(blocks):
+        _clip_text_block(sd, prefix, b, hidden, ffn)
+    sd[prefix + "transformer.text_model.embeddings.token_embedding.weight"] = \
+        L16(vocab, hidden)
+    sd[prefix + "transformer.text_model.embeddings.position_embedding.weight"] = \
+        L(max_pos, hidden)
+    sd[prefix + "transformer.text_model.final_layer_norm.weight"] = torch.randn(hidden) * 0.1
+    if with_projection:
+        sd[prefix + "text_projection.weight"] = L(hidden, hidden)
+
+
+def _clip_oc_text_block(sd, prefix, b, hidden, ffn):
+    """open_clip-style block (CLIP-G in SDXL): transformer.resblocks.N.
+    naming with mlp.c_fc/c_proj, verified against sd_xl_base_1.0 keys
+    (conditioner.embedders.1.model.transformer.resblocks...)."""
+    pre = f"{prefix}transformer.resblocks.{b}."
+    for proj in ("q_proj", "k_proj", "v_proj"):
+        sd[pre + f"attn.{proj}.weight"] = L(hidden, hidden)
+    sd[pre + "attn.out_proj.weight"] = L(hidden, hidden)
+    sd[pre + "mlp.c_fc.weight"] = L(ffn, hidden)
+    sd[pre + "mlp.c_proj.weight"] = L(hidden, ffn)
+    sd[pre + "ln_1.weight"] = torch.randn(hidden) * 0.1
+    sd[pre + "ln_2.weight"] = torch.randn(hidden) * 0.1
+
+
+def _clip_oc_text_blocks(sd, prefix, blocks=1, hidden=1280, ffn=5120,
+                         with_projection=True):
+    for b in range(blocks):
+        _clip_oc_text_block(sd, prefix, b, hidden, ffn)
+    sd[prefix + "transformer.final_layernorm.weight"] = torch.randn(hidden) * 0.1
+    sd[prefix + "transformer.positional_embedding.weight"] = L(77, hidden)
+    if with_projection:
+        sd[prefix + "text_projection.weight"] = L(hidden, hidden)
+
+
+def _llama_te_block(sd, prefix, b, hidden, ffn):
+    pre = f"{prefix}model.layers.{b}."
+    for proj in ("q_proj", "k_proj", "v_proj"):
+        sd[pre + f"self_attn.{proj}.weight"] = L(hidden, hidden)
+    sd[pre + "self_attn.o_proj.weight"] = L(hidden, hidden)
+    sd[pre + "mlp.gate_proj.weight"] = L(ffn, hidden)
+    sd[pre + "mlp.up_proj.weight"] = L(ffn, hidden)
+    sd[pre + "mlp.down_proj.weight"] = L(hidden, ffn)
+    sd[pre + "input_layernorm.weight"] = torch.randn(hidden) * 0.1
+    sd[pre + "post_attention_layernorm.weight"] = torch.randn(hidden) * 0.1
+
+
+def _llama_te_blocks(sd, prefix="", blocks=1, hidden=896, ffn=4864, vocab=8192,
+                     with_lm_head=True):
+    for b in range(blocks):
+        _llama_te_block(sd, prefix, b, hidden, ffn)
+    sd[prefix + "model.embed_tokens.weight"] = L16(vocab, hidden)
+    sd[prefix + "model.norm.weight"] = torch.randn(hidden) * 0.1
+    if with_lm_head:
+        sd[prefix + "lm_head.weight"] = L16(vocab, hidden)
+
+
+def make_t5xxl_te():
+    """Standalone T5-XXL text-encoder fixture (real dims 4096/10240)."""
+    sd = {}
+    _t5_te_blocks(sd, "", blocks=1, hidden=4096, ffn=10240, vocab=2048)
+    return sd
+
+
+def make_clip_l_te():
+    """Standalone CLIP-L text-encoder fixture (real dims 768/3072)."""
+    sd = {}
+    _clip_text_blocks(sd, "", blocks=1, hidden=768, ffn=3072, vocab=49408)
+    return sd
+
+
+def make_llama_qwen05b_te():
+    """Standalone Qwen2-0.5B-style TE fixture (hidden 896, ffn 4864).
+    K=896 is W4A8-ineligible (896 % 256 != 0), exercising the INT8/W4A4
+    fallback path for TE weights."""
+    sd = {}
+    _llama_te_blocks(sd, "", blocks=1, hidden=896, ffn=4864, vocab=8192)
+    return sd
+
+
+def make_llama_gemma2b_te():
+    """Standalone Gemma-2-2B-style TE fixture (hidden 2304, ffn 9216)."""
+    sd = {}
+    _llama_te_blocks(sd, "", blocks=1, hidden=2304, ffn=9216, vocab=8192)
+    return sd
+
 
 def make_flux():
     sd = {}; p = "model.diffusion_model."
@@ -55,6 +229,12 @@ def make_flux():
     sd[p+"vector_in.in_layer.weight"] = L(768, 256, 0.05)
     sd[p+"guidance_in.in_layer.weight"] = L(768, 256, 0.05)
     sd[p+"final_layer.linear.weight"] = L(768, 768, 0.01)
+    # text-encoder blocks (TE quantization test battery): one T5-XXL encoder
+    # block + one decoder block under t5xxl. (decoder.* must stay passthrough)
+    # and one CLIP-L block under clip_l. (clip_l.transformer.text_model...)
+    _t5_te_blocks(sd, "t5xxl.", blocks=1, hidden=4096, ffn=10240, vocab=2048)
+    _clip_text_blocks(sd, "clip_l.", blocks=1, hidden=768,
+                      ffn=3072, vocab=49408)
     return sd
 
 def make_wan():
@@ -370,6 +550,8 @@ makers = {
     "minimax_h3": make_minimax_h3, "hydit": make_hydit, "mmdit_sd3": make_mmdit_sd3,
     "zimage": make_zimage, "boogu": make_boogu, "boogu_real": make_boogu_real,
     "omnigen2": make_omnigen2,
+    "t5xxl": make_t5xxl_te, "clip_l": make_clip_l_te,
+    "llama_qwen05b": make_llama_qwen05b_te, "llama_gemma2b": make_llama_gemma2b_te,
 }
 key = os.path.basename(OUT).split("_fixture")[0]
 sd = makers[key]()

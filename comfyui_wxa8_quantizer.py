@@ -6,9 +6,9 @@ Standalone single-file build of the converter (main branch). The modular
 package source (src/comfyui_wxa8_quantizer/) and its generator
 (tools/build_single_file.py) live on the refactor/modular-package branch;
 on main this file is the source of truth and is edited directly. Keep the
-two artifacts in sync: same CLI, same outputs, same 40/40 self-test suite.
+two artifacts in sync: same CLI, same outputs, same embedded self-test suite.
 
-Converts supported generative-model checkpoints (safetensors / sharded
+Converts supported generative-model and text-encoder checkpoints (safetensors / sharded
 safetensors / HF-style model directories / optionally torch pickles with
 --trust-pickle) into a ComfyUI-compatible quantized checkpoint. The default
 mode produces W4A8 ("asym_w4a8_int8"). The experimental mixed mode
@@ -67,7 +67,7 @@ except Exception as _exc:  # pragma: no cover - import guard
 
 CONVERTER_NAME = "comfyui_wxa8_quantizer"
 
-_CONVERTER_VERSION = "1.5.0"
+_CONVERTER_VERSION = "1.6.0"
 
 
 def get_converter_version() -> str:
@@ -113,6 +113,27 @@ INT8_SCALE_MAX = 127
 
 CODEBOOK_SAMPLE_COUNT = 300000  # canonical Lloyd-Max sample size (chunk-invariant)
 
+# Current comfy-kitchen uses a frozen Lloyd-Max table for the overwhelmingly
+# common Gaussian-after-ConvRot case and only fits a per-tensor table for
+# genuinely heavy-tailed layers.  Keeping the three modes explicit gives users
+# a fast default, a zero-fit fixed mode, and a byte-compatible legacy fit mode.
+CODEBOOK_MODES = ("auto", "fixed", "fit")
+
+FIXED_W4A8_CODEBOOK = (
+    -0.980602, -0.794529, -0.638165, -0.500986,
+    -0.377321, -0.263187, -0.155210, -0.050720,
+    0.052541, 0.156985, 0.265284, 0.379533,
+    0.502636, 0.638953, 0.794876, 0.980671,
+)
+
+W4A8_GATE_KURTOSIS = -0.1
+
+CODEBOOK_DECISION_SAMPLE_COUNT = 1 << 22
+
+CODEBOOK_KURTOSIS_SAMPLE_COUNT = 1 << 19
+
+W4A8_ALS_ITERS = 2
+
 W4A4_MAX_REL_L2 = 0.20
 
 INT8_MAX_REL_L2 = 0.05
@@ -123,7 +144,7 @@ FORMAT_MIXED_REVISION = "mixed-r1"
 
 W4A8_CONVROT_GROUPSIZE = 256
 
-QUANT_ALGORITHM_REVISION = "lloydmax-codebook-r2"  # canonical sample count; --seed controls sampling
+QUANT_ALGORITHM_REVISION = "adaptive-codebook-searchsorted-r3"
 
 # Algorithm identity (Phase 0): independent revisions per algorithm surface, so
 # a converter version bump is never the only provenance signal. Each fix that
@@ -132,6 +153,17 @@ QUANT_ALGORITHM_REVISION = "lloydmax-codebook-r2"  # canonical sample count; --s
 MIXED_PLANNER_REVISION = "mixed-planner-r3"  # three-state runtime caps (unknown != True)
 VALIDATION_REVISION = "validator-r5"  # independent reference decoders in recon checks
 CALIBRATION_REVISION = "calibration-r2"  # content-addressed cache (v2 fingerprint)
+
+COMPONENT_AUTO = "auto"
+
+COMPONENT_DIFFUSION = "diffusion"
+
+COMPONENT_TEXT_ENCODER = "text_encoder"
+
+COMPONENT_ALL = "all"
+
+COMPONENT_CHOICES = (COMPONENT_AUTO, COMPONENT_DIFFUSION,
+                     COMPONENT_TEXT_ENCODER, COMPONENT_ALL)
 
 
 def get_algorithm_identity() -> Dict[str, str]:
@@ -1933,7 +1965,8 @@ def _test_golden_vectors() -> str:
     d_cb = 0.0
     for name, g in golden.items():
         p, s_rel, s_ch, corr, cb = quantize_w4a8_weight(
-            g["weight"], group_size=g["gs"], convrot_groupsize=g["cgs"])
+            g["weight"], group_size=g["gs"], convrot_groupsize=g["cgs"],
+            codebook_mode="fit")
         assert torch.equal(p, g["packed"]), f"{name}: packed mismatch vs reference"
         assert torch.equal(s_rel.view(torch.uint8), g["s_rel_u8"]), f"{name}: s_rel mismatch vs reference"
         d_ch = max(d_ch, float((s_ch - g["s_channel"]).abs().max()))
@@ -3143,20 +3176,22 @@ def rotate_int8_convrot_weight(weight: torch.Tensor, group_size: int) -> torch.T
     return rotate_weight(weight, h, group_size)
 
 def validate_w4_shape(k: int, group_size: int, convrot_groupsize: int) -> None:
+    if k <= 0:
+        raise PolicyError(f"K must be positive, got {k}")
+    if group_size < 4:
+        raise PolicyError(f"group_size must be >= 4, got {group_size}")
+    if convrot_groupsize < 4 or not _is_power_of_four(convrot_groupsize):
+        raise PolicyError(
+            f"convrot_groupsize must be a power of 4, got {convrot_groupsize}")
     if k % 16 != 0:
         raise PolicyError(f"K={k} must be divisible by 16 for 4-bit packing")
     if k % group_size != 0:
         raise PolicyError(f"K={k} must be divisible by group_size={group_size}")
     if k % convrot_groupsize != 0:
         raise PolicyError(f"K={k} must be divisible by convrot_groupsize={convrot_groupsize}")
-    if group_size < 4:
-        raise PolicyError(f"group_size must be >= 4, got {group_size}")
     if (16 % group_size != 0) and (group_size % 16 != 0):
         raise PolicyError(
             f"group_size must divide 16 or be a multiple of 16, got {group_size}")
-    if convrot_groupsize < 4 or not _is_power_of_four(convrot_groupsize):
-        raise PolicyError(
-            f"convrot_groupsize must be a power of 4, got {convrot_groupsize}")
 
 def w4_weight_is_quantizable(shape: Sequence[int], dtype: torch.dtype,
                              group_size: int, convrot_groupsize: int) -> Tuple[bool, str]:
@@ -3164,6 +3199,8 @@ def w4_weight_is_quantizable(shape: Sequence[int], dtype: torch.dtype,
         return False, f"not 2D (shape {tuple(shape)})"
     if dtype not in FLOAT_DTYPES:
         return False, f"not a float dtype ({dtype})"
+    if int(shape[0]) <= 0:
+        return False, f"dimensions must be positive, got {tuple(shape)}"
     k = int(shape[1])
     try:
         validate_w4_shape(k, group_size, convrot_groupsize)
@@ -3180,6 +3217,12 @@ def fit_codebook(normalized: torch.Tensor, levels: int = 16, iterations: int = 2
     like the reference implementation. The sample count is canonical (never
     derived from the memory budget), so chunked and in-memory paths agree.
     """
+    if levels < 2:
+        raise PolicyError(f"codebook levels must be >= 2, got {levels}")
+    if iterations < 0:
+        raise PolicyError(f"codebook iterations cannot be negative, got {iterations}")
+    if sample_size <= 0:
+        raise PolicyError(f"codebook sample_size must be positive, got {sample_size}")
     samples = normalized.flatten()
     if samples.numel() > sample_size:
         generator = torch.Generator(device=samples.device).manual_seed(seed)
@@ -3187,9 +3230,13 @@ def fit_codebook(normalized: torch.Tensor, levels: int = 16, iterations: int = 2
                                 device=samples.device, generator=generator)
         samples = samples[indices]
     samples = samples.float()
+    if samples.numel() == 0:
+        raise PolicyError("cannot fit a W4A8 codebook from an empty tensor")
+    if not bool(torch.isfinite(samples).all()):
+        raise PolicyError("cannot quantize a weight containing NaN or Inf")
     codebook = torch.quantile(samples, torch.linspace(0, 1, levels, device=samples.device))
     for _ in range(iterations):
-        assignments = (samples.unsqueeze(-1) - codebook).abs().argmin(-1)
+        assignments = assign_codes(samples, codebook).to(torch.long)
         updated = codebook.clone()
         for index in range(levels):
             selected = assignments == index
@@ -3198,33 +3245,110 @@ def fit_codebook(normalized: torch.Tensor, levels: int = 16, iterations: int = 2
         codebook = updated
     return codebook.contiguous()
 
+
+def _fixed_w4a8_codebook(device: Any = "cpu") -> torch.Tensor:
+    return torch.tensor(FIXED_W4A8_CODEBOOK, device=device,
+                        dtype=torch.float32)
+
+
+def _codebook_decision_sample(normalized: torch.Tensor) -> torch.Tensor:
+    """Return deterministic, evenly spaced rows for adaptive codebook choice.
+
+    Sampling complete rows makes the choice invariant to the conversion memory
+    budget: the in-memory and bounded readers can select exactly the same rows
+    without scanning and rotating the entire tensor a second time.
+    """
+    if normalized.ndim != 3:
+        raise PolicyError(
+            f"normalized W4A8 weights must be 3D, got {tuple(normalized.shape)}")
+    n = int(normalized.shape[0])
+    k = int(normalized.shape[1]) * int(normalized.shape[2])
+    if n == 0 or k == 0:
+        raise PolicyError("cannot choose a W4A8 codebook from an empty tensor")
+    max_rows = max(1, CODEBOOK_DECISION_SAMPLE_COUNT // max(k, 1))
+    if n <= max_rows:
+        return normalized
+    indices = torch.linspace(0, n - 1, max_rows,
+                             device=normalized.device).long()
+    return normalized.index_select(0, indices)
+
+
+def choose_w4a8_codebook(normalized: torch.Tensor, mode: str = "auto",
+                          seed: int = 0) -> torch.Tensor:
+    """Choose the fixed fast table or a fitted table for one rotated weight."""
+    if mode not in CODEBOOK_MODES:
+        raise PolicyError(
+            f"unknown W4A8 codebook mode {mode!r}; expected one of {CODEBOOK_MODES}")
+    if mode == "fixed":
+        return _fixed_w4a8_codebook(normalized.device)
+    if mode == "fit":
+        return fit_codebook(normalized, levels=16, iterations=25, seed=seed)
+
+    decision_rows = _codebook_decision_sample(normalized)
+    sample = decision_rows.detach().flatten()
+    if sample.numel() > CODEBOOK_KURTOSIS_SAMPLE_COUNT:
+        generator = torch.Generator(device=sample.device).manual_seed(seed)
+        indices = torch.randint(
+            0, sample.numel(), (CODEBOOK_KURTOSIS_SAMPLE_COUNT,),
+            device=sample.device, generator=generator)
+        sample = sample[indices]
+    sample = sample.float()
+    if not bool(torch.isfinite(sample).all()):
+        raise PolicyError("cannot quantize a weight containing NaN or Inf")
+    mean = sample.mean()
+    std = sample.std()
+    if not bool(torch.isfinite(std)) or float(std) <= 1e-9:
+        return _fixed_w4a8_codebook(normalized.device)
+    excess_kurtosis = (((sample - mean) / (std + 1e-9)).pow(4).mean()
+                       - 3.0)
+    if float(excess_kurtosis) <= W4A8_GATE_KURTOSIS:
+        return _fixed_w4a8_codebook(normalized.device)
+    return fit_codebook(decision_rows, levels=16, iterations=25, seed=seed)
+
+
 def assign_codes(normalized: torch.Tensor, codebook: torch.Tensor) -> torch.Tensor:
-    """Nearest codebook index per element (int32)."""
-    best = (normalized - codebook[0]).abs()
-    indices = torch.zeros_like(normalized, dtype=torch.int32)
-    for index in range(1, codebook.numel()):
-        distance = (normalized - codebook[index]).abs()
-        closer = distance < best
-        best = torch.where(closer, distance, best)
-        indices = torch.where(closer, index, indices)
-    return indices
+    """Nearest codebook index via binary search (ties choose the lower code).
+
+    Lloyd-Max codebooks are monotonic, so only the two values neighboring the
+    insertion point can be closest.  This is bit-equivalent to the old
+    sixteen-pass scan and substantially reduces allocations and comparisons.
+    """
+    if codebook.ndim != 1 or codebook.numel() < 2:
+        raise PolicyError("W4A8 codebook must be a 1D tensor with at least 2 levels")
+    if not bool((codebook[1:] >= codebook[:-1]).all()):
+        raise PolicyError("W4A8 codebook levels must be monotonic")
+    last = codebook.numel() - 1
+    values = normalized.contiguous()
+    pos = torch.searchsorted(codebook, values)
+    lo = (pos - 1).clamp(0, last)
+    hi = pos.clamp(0, last)
+    distance_lo = (values - codebook[lo]).abs_()
+    distance_hi = (values - codebook[hi]).abs_()
+    return torch.where(distance_hi < distance_lo, hi, lo).to(torch.int32)
 
 def assign_grid(weight: torch.Tensor, levels: torch.Tensor, s_channel: torch.Tensor) -> torch.Tensor:
-    """Nearest decoded int8 level per grouped weight (port of _assign_grid)."""
-    target = weight / s_channel.view(-1, 1, 1)
-    best = (target - levels[..., 0:1].expand_as(weight)).abs()
-    indices = torch.zeros_like(weight, dtype=torch.int32)
-    for index in range(1, 16):
-        distance = (target - levels[..., index:index + 1].expand_as(weight)).abs()
-        closer = distance < best
-        best = torch.where(closer, distance, best)
-        indices = torch.where(closer, index, indices)
-    return indices
+    """Nearest decoded int8 level per group using batched binary search."""
+    n, groups, group_size = weight.shape
+    if levels.shape != (n, groups, 16):
+        raise PolicyError(
+            f"W4A8 level grid shape {tuple(levels.shape)} != {(n, groups, 16)}")
+    level_rows = levels.reshape(n * groups, 16).contiguous()
+    targets = (weight / s_channel.view(-1, 1, 1)).reshape(
+        n * groups, group_size).contiguous()
+    last = 15
+    pos = torch.searchsorted(level_rows, targets)
+    lo = (pos - 1).clamp(0, last)
+    hi = pos.clamp(0, last)
+    distance_lo = targets.sub(torch.gather(level_rows, 1, lo)).abs_()
+    distance_hi = targets.sub(torch.gather(level_rows, 1, hi)).abs_()
+    return torch.where(distance_hi < distance_lo, hi, lo).to(
+        torch.int32).reshape(n, groups, group_size)
 
 def quantize_w4a8_weight(weight: torch.Tensor, group_size: int = 16,
                          convrot_groupsize: int = 256, symmetric: bool = True,
                          scale_dtype: torch.dtype = torch.float8_e4m3fn,
                          codebook: bool = True, seed: int = 0,
+                         codebook_mode: str = "auto",
                          ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
                                     Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Quantize a floating 2D weight into W4A8 storage.
@@ -3235,14 +3359,20 @@ def quantize_w4a8_weight(weight: torch.Tensor, group_size: int = 16,
     """
     if scale_dtype not in (torch.float32, torch.float8_e4m3fn):
         raise PolicyError(f"scale_dtype must be float32 or float8_e4m3fn, got {scale_dtype}")
+    if weight.ndim != 2:
+        raise PolicyError(f"W4A8 weight must be 2D, got {tuple(weight.shape)}")
+    if weight.shape[0] <= 0 or weight.shape[1] <= 0:
+        raise PolicyError(
+            f"W4A8 weight dimensions must be positive, got {tuple(weight.shape)}")
     validate_w4_shape(int(weight.shape[1]), group_size, convrot_groupsize)
     rotated = rotate_int8_convrot_weight(weight, convrot_groupsize)
     return _quantize_rotated_w4a8(rotated, group_size, symmetric, scale_dtype,
-                                  codebook, seed=seed)
+                                  codebook, seed=seed,
+                                  codebook_mode=codebook_mode)
 
 def _quantize_rotated_w4a8(weight: torch.Tensor, group_size: int, symmetric: bool,
                            scale_dtype: torch.dtype, codebook: bool,
-                           seed: int = 0,
+                           seed: int = 0, codebook_mode: str = "auto",
                            ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
                                       Optional[torch.Tensor], Optional[torch.Tensor]]:
     original_dtype = weight.dtype
@@ -3254,10 +3384,14 @@ def _quantize_rotated_w4a8(weight: torch.Tensor, group_size: int, symmetric: boo
     correction: Optional[torch.Tensor] = None
     if symmetric and codebook:
         group_scale = grouped_weight.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
+        if not bool(torch.isfinite(group_scale).all()):
+            raise PolicyError("cannot quantize a weight containing NaN or Inf")
         normalized = grouped_weight / group_scale
-        codebook_tensor = fit_codebook(normalized, levels=16, seed=seed)
+        codebook_tensor = choose_w4a8_codebook(
+            normalized, mode=codebook_mode, seed=seed)
         quantized = assign_codes(normalized, codebook_tensor)
-        for _ in range(3):
+        als_iterations = 3 if codebook_mode == "fit" else W4A8_ALS_ITERS
+        for _ in range(als_iterations):
             qc = codebook_tensor[quantized]
             group_scale = (
                 (grouped_weight * qc).sum(-1, keepdim=True)
@@ -3268,12 +3402,16 @@ def _quantize_rotated_w4a8(weight: torch.Tensor, group_size: int, symmetric: boo
         shifted_weight = codebook_tensor[quantized] * group_scale
     elif symmetric:
         group_scale = (grouped_weight.abs().amax(dim=-1, keepdim=True) / 7.0).clamp(min=1e-8)
+        if not bool(torch.isfinite(group_scale).all()):
+            raise PolicyError("cannot quantize a weight containing NaN or Inf")
         signed = (grouped_weight / group_scale).round().clamp(-8, 7).to(torch.int32)
         unsigned = (signed + 8).view(n, k)
         shifted_weight = signed * group_scale
     else:
         minimum = grouped_weight.amin(dim=-1, keepdim=True)
         group_scale = ((grouped_weight.amax(dim=-1, keepdim=True) - minimum) / 15.0).clamp(min=1e-8)
+        if not bool(torch.isfinite(group_scale).all()):
+            raise PolicyError("cannot quantize a weight containing NaN or Inf")
         unsigned = (
             ((grouped_weight - minimum) / group_scale).round().clamp(0, 15)
             .to(torch.int32).view(n, k)
@@ -3333,7 +3471,13 @@ def quantize_int8_tensorwise_weight(
     Works for any K (no divisibility requirement), which is why it is the
     universal fallback tier in mixed mode.
     """
+    if weight.ndim != 2:
+        raise PolicyError(f"INT8 weight must be 2D, got {tuple(weight.shape)}")
+    if weight.shape[0] <= 0 or weight.shape[1] <= 0:
+        raise PolicyError(f"INT8 weight dimensions must be positive, got {tuple(weight.shape)}")
     abs_max = weight.abs().amax(dim=-1, keepdim=True)
+    if not bool(torch.isfinite(abs_max).all()):
+        raise PolicyError("cannot quantize a weight containing NaN or Inf")
     scale = (abs_max.float() / float(INT8_SCALE_MAX)).clamp(min=1e-30)
     q = (weight / scale).round().clamp_(-128.0, 127.0).to(torch.int8)
     # scale is stored [N, 1] so both the eager dequant (q.float() * scale) and
@@ -3353,9 +3497,19 @@ def quantize_w4a4_weight(weight: torch.Tensor,
     `quantize_convrot_w4a4_weight`: regular-Hadamard weight rotation, rowwise
     symmetric signed int4 with absmax scale = max/7, emission range [-7, 7],
     packed int4 low=even nibble. Returns (packed int8 [N, K/2], scale fp32 [N])."""
+    if weight.ndim != 2:
+        raise PolicyError(f"W4A4 weight must be 2D, got {tuple(weight.shape)}")
+    if weight.shape[0] <= 0 or weight.shape[1] <= 0:
+        raise PolicyError(f"W4A4 weight dimensions must be positive, got {tuple(weight.shape)}")
+    ok, why = w4a4_weight_is_quantizable(
+        weight.shape, weight.dtype, convrot_groupsize)
+    if not ok:
+        raise PolicyError(f"invalid W4A4 weight: {why}")
     h = build_hadamard(convrot_groupsize, device=weight.device, dtype=weight.dtype)
     rot = rotate_weight(weight, h, convrot_groupsize)
     abs_max = rot.abs().amax(dim=-1, keepdim=True).clamp(min=1e-10)
+    if not bool(torch.isfinite(abs_max).all()):
+        raise PolicyError("cannot quantize a weight containing NaN or Inf")
     scale = abs_max / float(W4A4_EMISSION_MAX)
     q = (rot / scale).round().clamp_(-float(W4A4_EMISSION_MAX),
                                      float(W4A4_EMISSION_MAX)).to(torch.int8)
@@ -3462,6 +3616,8 @@ def w4a4_weight_is_quantizable(shape: Sequence[int], dtype: torch.dtype,
     if dtype not in FLOAT_DTYPES:
         return False, f"dtype {dtype} not float"
     k = int(shape[1])
+    if int(shape[0]) <= 0 or k <= 0:
+        return False, f"dimensions must be positive, got {tuple(shape)}"
     if k % W4A4_QUANT_GROUP_SIZE != 0:
         return False, f"K={k} not divisible by quant_group_size {W4A4_QUANT_GROUP_SIZE}"
     if convrot_groupsize is None:
@@ -3469,6 +3625,8 @@ def w4a4_weight_is_quantizable(shape: Sequence[int], dtype: torch.dtype,
             convrot_groupsize = _pick_w4a4_convrot_group(k)
         except PolicyError:
             return False, f"K={k} has no supported ConvRot group"
+    if convrot_groupsize <= 0:
+        return False, f"convrot_groupsize must be positive, got {convrot_groupsize}"
     if k % convrot_groupsize != 0:
         return False, f"K={k} not divisible by convrot_groupsize {convrot_groupsize}"
     return True, ""
@@ -3479,6 +3637,8 @@ def int8_weight_is_quantizable(shape: Sequence[int], dtype: torch.dtype
         return False, "not 2D"
     if dtype not in FLOAT_DTYPES:
         return False, f"dtype {dtype} not float"
+    if int(shape[0]) <= 0 or int(shape[1]) <= 0:
+        return False, f"dimensions must be positive, got {tuple(shape)}"
     return True, ""
 
 def quantized_format_bytes(n: int, k: int, fmt: str) -> int:
@@ -3562,19 +3722,17 @@ def decode_w4a8_runtime_weight(packed: torch.Tensor, s_rel: torch.Tensor,
 
 def quantize_weight_by_format(weight: torch.Tensor, fmt: str, group_size: int,
                               convrot_groupsize: int,
-                              seed: int = 0) -> Dict[str, torch.Tensor]:
+                              seed: int = 0,
+                              codebook_mode: str = "auto",
+                              ) -> Dict[str, torch.Tensor]:
     """Quantize with the W4A8 layout; returns the per-layer output tensors
     keyed by suffix ('' for the packed weight, '_s_rel', '_s_channel',
     '_codebook', optional '_correction')."""
     if fmt == FORMAT_W4A8:
-        if not torch.isfinite(weight).all():
-            raise PolicyError(
-                "non-finite values in weight; pass --nonfinite-policy keep to "
-                "preserve the layer at original precision")
         packed, s_rel, s_ch, corr, cb = quantize_w4a8_weight(
             weight, group_size=group_size, convrot_groupsize=convrot_groupsize,
             symmetric=True, scale_dtype=torch.float8_e4m3fn, codebook=True,
-            seed=seed)
+            seed=seed, codebook_mode=codebook_mode)
         out = {"": packed, "_s_rel": s_rel, "_s_channel": s_ch, "_codebook": cb}
         if corr is not None:
             out["_correction"] = corr
@@ -3619,15 +3777,19 @@ class FamilyPolicy:
     min_cosine: float = 0.95
     runtime_status: str = "experimental"
     notes: str = ""
+    component: str = COMPONENT_DIFFUSION
 
     def quantize_re(self) -> re.Pattern:
-        return flatten_regex(self.quantize)
+        return (flatten_regex(self.quantize) if self.quantize
+                else re.compile(r"(?!x)x"))
 
     def keep_re(self) -> re.Pattern:
-        return flatten_regex(self.keep)
+        return (flatten_regex(self.keep) if self.keep
+                else re.compile(r"(?!x)x"))
 
     def exclude_re(self) -> re.Pattern:
-        return flatten_regex(self.exclude)
+        return (flatten_regex(self.exclude) if self.exclude
+                else re.compile(r"(?!x)x"))
 
     def to_dict(self) -> Dict[str, Any]:
         d = dataclasses.asdict(self)
@@ -4325,6 +4487,107 @@ for _fam, _cls in (("rt_detr_v4", ("RT_DETR_v4",)),
               "be consumable. Conversion refused unless --architecture forces it.",
     ))
 
+# Text encoders use the same generic ComfyUI ``comfy_quant`` layer metadata as
+# diffusion models, but their naming and safety exclusions are different.  In
+# particular, the diffusion policy intentionally excludes every ``encoder`` /
+# ``decoder`` subtree, so text models need explicit, narrow linear-layer rules.
+TEXT_ENCODER_EXCLUDE = (
+    r"(^|\.)(embeddings?|embed_tokens|token_embedding|word_embeddings|"
+    r"position_embeddings|token_type_embeddings|shared)(\.|$)",
+    r"(^|\.)(norm|layer_norm|layernorm|rms_norm|final_layer_norm|"
+    r"input_layernorm|post_attention_layernorm|ln_final|ln_\d+|"
+    r"q_norm|k_norm)\.(weight|bias)$",
+    r"(^|\.)(lm_head|output_head|classifier|score|pooler|text_projection|"
+    r"projection_head|language_model_head)(\.|$)",
+    r"(^|\.)(visual|vision_model|vision_tower|image_encoder|audio|"
+    r"multi_modal_projector|multimodal_projector)(\.|$)",
+)
+
+TEXT_LLM_QUANTIZE = (
+    r"(^|\.)(model(\.language_model)?|language_model\.model|transformer)?\."
+    r"?layers\.\d+\.self_attn\.(q_proj|k_proj|v_proj|o_proj|out_proj)\.weight$",
+    r"(^|\.)(model(\.language_model)?|language_model\.model|transformer)?\."
+    r"?layers\.\d+\.linear_attn\."
+    r"(in_proj_qkv|in_proj_z|in_proj_b|in_proj_a|out_proj)\.weight$",
+    r"(^|\.)(model(\.language_model)?|language_model\.model|transformer)?\."
+    r"?layers\.\d+\.mlp\."
+    r"(gate_proj|up_proj|down_proj|fc1|fc2|w1|w2|w3)\.weight$",
+)
+
+TEXT_T5_QUANTIZE = (
+    r"(^|\.)(encoder|decoder)\.block\.\d+\.layer\.\d+\."
+    r"(SelfAttention|EncDecAttention)\.(q|k|v|o)\.weight$",
+    r"(^|\.)(encoder|decoder)\.block\.\d+\.layer\.\d+\."
+    r"DenseReluDense\.(wi|wi_0|wi_1|wo)\.weight$",
+)
+
+TEXT_CLIP_QUANTIZE = (
+    r"(^|\.)text_model\.encoder\.layers\.\d+\.self_attn\."
+    r"(q_proj|k_proj|v_proj|out_proj)\.weight$",
+    r"(^|\.)text_model\.encoder\.layers\.\d+\.mlp\.(fc1|fc2)\.weight$",
+)
+
+TEXT_BERT_QUANTIZE = (
+    r"(^|\.)encoder\.layer\.\d+\.attention\.self\."
+    r"(query|key|value)\.weight$",
+    r"(^|\.)encoder\.layer\.\d+\.attention\.output\.dense\.weight$",
+    r"(^|\.)encoder\.layer\.\d+\.(intermediate|output)\.dense\.weight$",
+)
+
+_register(FamilyPolicy(
+    family="text_encoder_llm",
+    comfyui_classes=("QwenTextEncoder", "LlamaTextEncoder", "GemmaTextEncoder"),
+    detect_primary=("layers.0.self_attn.q_proj.weight",),
+    detect_hints=("layers.0.mlp.gate_proj.weight",
+                  "layers.0.self_attn.o_proj.weight"),
+    quantize=TEXT_LLM_QUANTIZE,
+    exclude=TEXT_ENCODER_EXCLUDE,
+    runtime_status="verified",
+    notes="Decoder-only transformer text encoders (Qwen/Llama/Gemma/Mistral naming).",
+    component=COMPONENT_TEXT_ENCODER,
+))
+
+_register(FamilyPolicy(
+    family="text_encoder_t5",
+    comfyui_classes=("T5", "T5XXL", "UMT5"),
+    detect_primary=("encoder.block.0.layer.0.SelfAttention.q.weight",),
+    detect_hints=("encoder.block.0.layer.1.DenseReluDense.wi.weight",
+                  "encoder.block.0.layer.1.DenseReluDense.wi_0.weight"),
+    quantize=TEXT_T5_QUANTIZE,
+    exclude=TEXT_ENCODER_EXCLUDE,
+    runtime_status="verified",
+    notes="T5/UMT5 encoder and encoder-decoder text models.",
+    component=COMPONENT_TEXT_ENCODER,
+))
+
+_register(FamilyPolicy(
+    family="text_encoder_clip",
+    comfyui_classes=("CLIPTextModel", "CLIPTextModelWithProjection"),
+    detect_primary=("text_model.encoder.layers.0.self_attn.q_proj.weight",),
+    detect_hints=("text_model.encoder.layers.0.mlp.fc1.weight",),
+    quantize=TEXT_CLIP_QUANTIZE,
+    exclude=TEXT_ENCODER_EXCLUDE,
+    runtime_status="verified",
+    notes="Hugging Face CLIP text towers with split attention projections.",
+    component=COMPONENT_TEXT_ENCODER,
+))
+
+_register(FamilyPolicy(
+    family="text_encoder_bert",
+    comfyui_classes=("BertModel", "JinaBertModel"),
+    detect_primary=("encoder.layer.0.attention.self.query.weight",),
+    detect_hints=("encoder.layer.0.intermediate.dense.weight",),
+    quantize=TEXT_BERT_QUANTIZE,
+    exclude=TEXT_ENCODER_EXCLUDE,
+    runtime_status="experimental",
+    notes="BERT/Jina-style encoder text models.",
+    component=COMPONENT_TEXT_ENCODER,
+))
+
+TEXT_ENCODER_FAMILIES = tuple(
+    family for family in REGISTRY_ORDER
+    if REGISTRY[family].component == COMPONENT_TEXT_ENCODER)
+
 def family_names() -> List[str]:
     return list(REGISTRY_ORDER)
 
@@ -4367,6 +4630,7 @@ class DetectionResult:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "architecture": self.architecture,
+            "component": self.policy.component,
             "confidence": self.confidence,
             "unet_prefix": self.unet_prefix,
             "evidence": self.evidence,
@@ -4400,7 +4664,9 @@ def detect_architecture(info: CheckpointInfo, override: Optional[str] = None,
         policy = get_family(override)
         return DetectionResult(
             architecture=policy.family, confidence="high",
-            policy=policy, unet_prefix=prefix,
+            policy=policy,
+            unet_prefix=("" if policy.component == COMPONENT_TEXT_ENCODER
+                         else prefix),
             evidence=[f"user override --architecture {override}"],
             warnings=["architecture supplied by the user; detection was not used"])
     if shape_lookup is None:
@@ -4695,6 +4961,8 @@ def detect_architecture(info: CheckpointInfo, override: Optional[str] = None,
             "Pass --architecture NAME after inspecting the checkpoint; refusing "
             "to guess.")
     policy = REGISTRY[fam]
+    if policy.component == COMPONENT_TEXT_ENCODER:
+        prefix = ""
     if len(ev) >= 2:
         confidence = "high"
     elif len(ev) == 1 and len(hints) >= 1:
@@ -5158,6 +5426,7 @@ class TensorDecision:
     linear_dtype: Optional[str] = None   # W4A4 execution variant (per decision)
     out_dtype: Optional[torch.dtype] = None   # passthrough cast target (if any)
     quantized: bool = False        # True once actually quantized
+    component: str = "other"      # diffusion | text_encoder | other
 
 @dataclass
 class ConversionPlan:
@@ -5183,105 +5452,164 @@ def classify_tensors(info: CheckpointInfo, detection: DetectionResult,
                      fmt: str, group_size: Optional[int], include: Sequence[str],
                      exclude: Sequence[str], keep_precision: Sequence[str],
                      output_dtype: Optional[torch.dtype],
-                     min_numel: Optional[int]) -> List[TensorDecision]:
-    """Decide, for every input tensor, whether it is quantized or passed through."""
-# SPDX-License-Identifier: Apache-2.0
-    policy = detection.policy
-    prefix = detection.unet_prefix
-    # effective prefix: if the detected prefix does not actually prefix any key
-    # (e.g. prefix-less models like MiniMax H3 where ComfyUI falls back to
-    # "model."), classify against the full keys
-    if not any(k.startswith(prefix) for k in info.key_set()):
-        prefix = ""
-    if group_size is None:
-        group_size = policy.group_size
-    if min_numel is None:
-        min_numel = policy.min_weight_numel
+                     min_numel: Optional[int],
+                     components: str = COMPONENT_AUTO) -> List[TensorDecision]:
+    """Classify diffusion and text-encoder linears without crossing components.
 
-    include_re = flatten_regex(list(include)) if include else None
-    exclude_re = flatten_regex(list(exclude)) if exclude else None
-    keep_re_user = flatten_regex(list(keep_precision)) if keep_precision else None
-    q_re = policy.quantize_re()
-    k_re = policy.keep_re()
-    x_re = policy.exclude_re()
+    ``auto`` preserves the historical behavior for diffusion checkpoints and
+    automatically switches to text-encoder rules for standalone CLIP/T5/LLM/
+    BERT checkpoints. ``all`` additionally finds recognized text towers outside
+    an explicitly prefixed diffusion model.
+    """
+# SPDX-License-Identifier: Apache-2.0
+    if components not in COMPONENT_CHOICES:
+        raise PolicyError(
+            f"unknown component selection {components!r}; "
+            f"expected one of {COMPONENT_CHOICES}")
+    primary = detection.policy
+    if components == COMPONENT_AUTO:
+        selected_components = {primary.component}
+    elif components == COMPONENT_ALL:
+        selected_components = {COMPONENT_DIFFUSION, COMPONENT_TEXT_ENCODER}
+    else:
+        selected_components = {components}
+
+    prefix = detection.unet_prefix
+    if prefix and not any(k.startswith(prefix) for k in info.key_set()):
+        prefix = ""
+    primary_is_text = primary.component == COMPONENT_TEXT_ENCODER
+
+    try:
+        include_re = flatten_regex(list(include)) if include else None
+        exclude_re = flatten_regex(list(exclude)) if exclude else None
+        keep_re_user = (flatten_regex(list(keep_precision))
+                        if keep_precision else None)
+    except re.error as exc:
+        raise PolicyError(f"invalid user regular expression: {exc}") from exc
+
+    text_matchers = [
+        (REGISTRY[family], REGISTRY[family].quantize_re())
+        for family in TEXT_ENCODER_FAMILIES
+    ]
 
     decisions: List[TensorDecision] = []
     for meta in info.tensors:
         name = meta.name
-        if not name.startswith(prefix):
-            decisions.append(TensorDecision(name, DecisionKind.KEEP,
-                                            "outside the diffusion-model prefix; passthrough"))
-            continue
-        rel = name[len(prefix):] if name.startswith(prefix) else name
-        if not rel.endswith(".weight"):
-            decisions.append(TensorDecision(name, DecisionKind.KEEP,
-                                            "not a weight tensor (bias/norm/buffer); passthrough"))
-            continue
-        # layer = FULL state-dict key minus ".weight" (includes the unet prefix),
-        # matching the names ComfyUI uses in _quantization_metadata / comfy_quant
-        layer = name[:-len(".weight")]
+        rel = name
+        policy: Optional[FamilyPolicy] = None
+        component = "other"
 
-        # user-level filters first
+        if primary_is_text:
+            if COMPONENT_TEXT_ENCODER in selected_components:
+                policy = primary
+                component = COMPONENT_TEXT_ENCODER
+        else:
+            in_diffusion_scope = (name.startswith(prefix) if prefix else True)
+            if (COMPONENT_DIFFUSION in selected_components
+                    and in_diffusion_scope):
+                policy = primary
+                component = COMPONENT_DIFFUSION
+                rel = name[len(prefix):] if prefix else name
+            elif COMPONENT_TEXT_ENCODER in selected_components:
+                # In ``all`` mode the diffusion prefix always wins. Text rules
+                # are only considered elsewhere in the state dict. With an
+                # explicit text-only selection they may inspect the full file.
+                for text_policy, text_q_re in text_matchers:
+                    if text_q_re.search(name):
+                        policy = text_policy
+                        component = COMPONENT_TEXT_ENCODER
+                        rel = name
+                        break
+
+        if policy is None:
+            reason = ("component not selected; passthrough"
+                      if primary.component not in selected_components
+                      else "outside a recognized selected component; passthrough")
+            decisions.append(TensorDecision(
+                name, DecisionKind.KEEP, reason, component=component))
+            continue
+        if not rel.endswith(".weight"):
+            decisions.append(TensorDecision(
+                name, DecisionKind.KEEP,
+                "not a weight tensor (bias/norm/buffer); passthrough",
+                component=component))
+            continue
+
+        layer = name[:-len(".weight")]
         if exclude_re is not None and exclude_re.search(name):
-            decisions.append(TensorDecision(name, DecisionKind.KEEP,
-                                            "matched --exclude pattern; passthrough"))
+            decisions.append(TensorDecision(
+                name, DecisionKind.KEEP,
+                "matched --exclude pattern; passthrough", component=component))
             continue
         if keep_re_user is not None and keep_re_user.search(name):
-            decisions.append(TensorDecision(name, DecisionKind.KEEP_PRECISION,
-                                            "matched --keep-precision pattern; passthrough"))
+            decisions.append(TensorDecision(
+                name, DecisionKind.KEEP_PRECISION,
+                "matched --keep-precision pattern; passthrough",
+                component=component))
             continue
 
-        # policy exclusions (norms / embeddings / positionals / heads / embedders)
+        q_re = policy.quantize_re()
+        k_re = policy.keep_re()
+        x_re = policy.exclude_re()
         if x_re.search(rel):
-            decisions.append(TensorDecision(name, DecisionKind.KEEP,
-                                            "policy exclude (universal); passthrough"))
+            decisions.append(TensorDecision(
+                name, DecisionKind.KEEP,
+                f"policy exclude for {policy.family}; passthrough",
+                component=component))
             continue
         if k_re.search(rel):
-            decisions.append(TensorDecision(name, DecisionKind.KEEP_PRECISION,
-                                            f"policy keep for {policy.family}; passthrough"))
+            decisions.append(TensorDecision(
+                name, DecisionKind.KEEP_PRECISION,
+                f"policy keep for {policy.family}; passthrough",
+                component=component))
             continue
 
-        # quantize patterns are written against full keys (including ".weight")
         candidate = bool(q_re.search(rel)) if policy.quantize else True
-        user_forced = include_re is not None and include_re.search(name)
+        user_forced = bool(include_re is not None and include_re.search(name))
         if user_forced:
             candidate = True
         if not candidate:
-            decisions.append(TensorDecision(name, DecisionKind.KEEP,
-                                            f"not in {policy.family} quantize set; passthrough"))
+            decisions.append(TensorDecision(
+                name, DecisionKind.KEEP,
+                f"not in {policy.family} quantize set; passthrough",
+                component=component))
             continue
 
-        # shape / dtype gates. W4A8 ConvRot is always 256-wide: the
-        # comfy-kitchen 0.2.27 CUDA fused kernels throw unless
-        # convrot_groupsize == 256, so in w4a8 mode layers whose K is not
-        # divisible by 256 pass through. Mixed mode instead keeps every 2D
-        # float linear as a candidate and lets the planner pick per-layer
-        # formats (W4A4 when K % 64 == 0, W4A8 when K % 256 == 0, INT8 for
-        # any K), so dimension-incompatible layers stay quantizable.
+        effective_group_size = (group_size if group_size is not None
+                                else policy.group_size)
+        effective_min_numel = (min_numel if min_numel is not None
+                               else policy.min_weight_numel)
         if fmt == FORMAT_W4A8:
-            ok, why = w4_weight_is_quantizable(meta.shape, meta.dtype, group_size,
-                                               W4A8_CONVROT_GROUPSIZE)
+            ok, why = w4_weight_is_quantizable(
+                meta.shape, meta.dtype, effective_group_size,
+                W4A8_CONVROT_GROUPSIZE)
             if not ok:
-                decisions.append(TensorDecision(name, DecisionKind.KEEP,
-                                                f"not quantizable: {why}; passthrough"))
+                decisions.append(TensorDecision(
+                    name, DecisionKind.KEEP,
+                    f"not quantizable: {why}; passthrough",
+                    component=component))
                 continue
         elif fmt == FORMAT_MIXED:
             if len(meta.shape) != 2 or meta.dtype not in FLOAT_DTYPES:
-                decisions.append(TensorDecision(name, DecisionKind.KEEP,
-                                                "not a 2D float weight; passthrough"))
+                decisions.append(TensorDecision(
+                    name, DecisionKind.KEEP,
+                    "not a 2D float weight; passthrough", component=component))
                 continue
         else:
             raise PolicyError(f"unknown quantization format {fmt!r}")
-        if meta.nbytes < min_numel * meta.dtype.itemsize:
-            decisions.append(TensorDecision(name, DecisionKind.KEEP,
-                                            f"small tensor (<{min_numel} elements); passthrough"))
+        if meta.nbytes < effective_min_numel * meta.dtype.itemsize:
+            decisions.append(TensorDecision(
+                name, DecisionKind.KEEP,
+                f"small tensor (<{effective_min_numel} elements); passthrough",
+                component=component))
             continue
         decisions.append(TensorDecision(
             name, DecisionKind.QUANTIZE,
-            "user-forced via --include" if user_forced else "policy candidate",
-            layer=layer, group_size=group_size,
+            "user-forced via --include" if user_forced else
+            f"{policy.family} policy candidate",
+            layer=layer, group_size=effective_group_size,
             convrot_groupsize=W4A8_CONVROT_GROUPSIZE,
-            format=fmt))
+            format=fmt, component=component))
 
     return decisions
 
@@ -5887,7 +6215,7 @@ def _chunk_rows_for_budget(k: int, n: int, max_mem: int) -> int:
     if max_mem < MIN_CHUNK_MEMORY:
         raise PolicyError(
             f"--max-memory must be at least {human_bytes(MIN_CHUNK_MEMORY)} for "
-            "Lloyd-Max W4A8 quantization")
+            "bounded W4A8 quantization")
     row_work = k * QUANT_WORK_BYTES_PER_ELEMENT
     if row_work > max_mem:
         raise PolicyError(
@@ -5903,15 +6231,23 @@ def _codebook_sample_size(total_elements: int) -> int:
 def _quantize_rotated_w4a8_with_codebook(weight: torch.Tensor, group_size: int,
                                          codebook: torch.Tensor,
                                          scale_dtype: torch.dtype = torch.float8_e4m3fn,
+                                         als_iterations: int = W4A8_ALS_ITERS,
                                          ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """W4A8 quantization of a rotated weight chunk with a PRE-FIT codebook."""
 # SPDX-License-Identifier: Apache-2.0
+    if weight.ndim != 2:
+        raise PolicyError(
+            f"rotated W4A8 weight must be 2D, got {tuple(weight.shape)}")
+    if als_iterations < 0:
+        raise PolicyError("W4A8 ALS iteration count cannot be negative")
     n, k = weight.shape
     groups = k // group_size
     grouped = weight.float().view(n, groups, group_size)
     group_scale = grouped.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
+    if not bool(torch.isfinite(group_scale).all()):
+        raise PolicyError("cannot quantize a weight containing NaN or Inf")
     quantized = assign_codes(grouped / group_scale, codebook)
-    for _ in range(3):
+    for _ in range(als_iterations):
         qc = codebook[quantized]
         group_scale = ((grouped * qc).sum(-1, keepdim=True)
                        / (qc * qc).sum(-1, keepdim=True).clamp(min=1e-8)).clamp(min=1e-8)
@@ -5931,53 +6267,105 @@ def _gather_codebook_samples(reader: CheckpointReader, name: str, k: int,
                              sample_size: int, chunk_rows: int,
                              device: Any = "cpu",
                              compute_dtype: Optional[torch.dtype] = None,
-                             seed: int = 0) -> torch.Tensor:
-    """Deterministic subsample of normalized rotated weights for codebook fitting.
+                             seed: int = 0,
+                             codebook_mode: str = "auto") -> torch.Tensor:
+    """Choose a codebook without exceeding the row-chunk memory budget.
 
-    Draws `sample_size` flattened indices with the seeded generator, then
-    gathers those elements chunk by chunk.  Used only when a tensor does
-    not fit in the memory budget; identical distribution to the reference path.
+    ``fixed`` performs no source read. ``auto`` rotates only the same evenly
+    spaced rows inspected by the in-memory adaptive gate. ``fit`` preserves
+    the legacy seeded flattened sample, but uses sorted slice boundaries rather
+    than rescanning the entire index vector for every row chunk.
     """
+    if codebook_mode not in CODEBOOK_MODES:
+        raise PolicyError(
+            f"unknown W4A8 codebook mode {codebook_mode!r}; "
+            f"expected one of {CODEBOOK_MODES}")
+    if codebook_mode == "fixed":
+        return _fixed_w4a8_codebook("cpu")
     meta = reader.info.by_name(name)
+    if meta is None:
+        raise PolicyError(f"codebook sampling references missing tensor {name!r}")
     n = int(meta.shape[0])
     total = n * k
-    if total > sample_size:
+    if codebook_mode == "auto":
+        max_rows = max(1, CODEBOOK_DECISION_SAMPLE_COUNT // max(k, 1))
+        if n <= max_rows:
+            idx = torch.arange(n, device="cpu")
+        else:
+            idx = torch.linspace(0, n - 1, max_rows, device="cpu").long()
+        order = None
+        flat_indices = False
+    elif total > sample_size:
         gen = torch.Generator(device="cpu").manual_seed(seed)
         idx = torch.randint(0, total, (sample_size,), device="cpu", generator=gen)
+        order = torch.argsort(idx, stable=True)
+        idx = idx[order]
+        flat_indices = True
     else:
         idx = torch.arange(total, device="cpu")
+        order = None
+        flat_indices = True
     work_dtype = compute_dtype or torch.float32
     h = build_hadamard(convrot_groupsize, device="cpu", dtype=work_dtype)
     h_t = h.T
-    samples = torch.empty(idx.numel(), dtype=torch.float32)
+    sample_parts: List[torch.Tensor] = []
+    sorted_samples = (torch.empty(idx.numel(), dtype=torch.float32)
+                      if flat_indices else None)
     n_conv_groups = k // convrot_groupsize
     n_quant_groups = k // group_size
     for r0 in range(0, n, chunk_rows):
         r1 = min(n, r0 + chunk_rows)
-        chunk = reader.read_tensor(name)[r0:r1].to(work_dtype)   # [rows, k]
+        start = r0 * k if flat_indices else r0
+        end = r1 * k if flat_indices else r1
+        lo = int(torch.searchsorted(
+            idx, torch.tensor(start, dtype=idx.dtype), right=False).item())
+        hi = int(torch.searchsorted(
+            idx, torch.tensor(end, dtype=idx.dtype), right=False).item())
+        if lo == hi:
+            continue
+        if flat_indices:
+            chunk = reader.read_tensor(name)[r0:r1].to(work_dtype)
+        else:
+            local_rows = (idx[lo:hi] - r0).to(torch.long)
+            chunk = reader.read_tensor(name)[r0:r1].index_select(
+                0, local_rows).to(work_dtype)
         rot = torch.matmul(
-            chunk.view(r1 - r0, n_conv_groups, convrot_groupsize), h_t
-        ).reshape(r1 - r0, k)
+            chunk.view(chunk.shape[0], n_conv_groups, convrot_groupsize), h_t
+        ).reshape(chunk.shape[0], k)
         # per-group normalization (identical to the in-memory reference path)
-        grouped = rot.float().view(r1 - r0, n_quant_groups, group_size)
+        grouped = rot.float().view(chunk.shape[0], n_quant_groups, group_size)
         gs = grouped.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
-        normalized = (grouped / gs).reshape(r1 - r0, k)
-        start = r0 * k
-        end = r1 * k
-        mask = (idx >= start) & (idx < end)
-        if mask.any():
-            local = idx[mask] - start
-            samples[mask] = normalized.flatten()[local]
-    if samples.numel() == 0:
+        if not bool(torch.isfinite(gs).all()):
+            raise PolicyError(
+                f"cannot quantize {name!r}: weight contains NaN or Inf")
+        normalized = grouped / gs
+        if flat_indices:
+            local = idx[lo:hi] - start
+            sorted_samples[lo:hi] = normalized.reshape(-1)[local]
+        else:
+            sample_parts.append(normalized)
+    if flat_indices:
+        if sorted_samples is None or sorted_samples.numel() == 0:
+            raise PolicyError("codebook sampling produced no elements")
+        if order is not None:
+            samples = torch.empty_like(sorted_samples)
+            samples[order] = sorted_samples
+        else:
+            samples = sorted_samples
+        return fit_codebook(samples, levels=16, iterations=25,
+                            sample_size=sample_size, seed=seed).contiguous()
+    if not sample_parts:
         raise PolicyError("codebook sampling produced no elements")
-    return fit_codebook(samples, levels=16, iterations=25,
-                        sample_size=sample_size).contiguous()
+    normalized_rows = torch.cat(sample_parts, dim=0)
+    return choose_w4a8_codebook(
+        normalized_rows, mode="auto", seed=seed).cpu().contiguous()
 
 def quantize_tensor_bounded(reader: CheckpointReader, name: str, fmt: str,
                             group_size: int, convrot_groupsize: int,
                             max_mem: int, device: Any,
                             compute_dtype: Optional[torch.dtype] = None,
                             seed: int = 0,
+                            codebook_mode: str = "auto",
                             ) -> Dict[str, torch.Tensor]:
     """Quantize one tensor with a bounded working set (chunked when needed).
 
@@ -5996,8 +6384,17 @@ def quantize_tensor_bounded(reader: CheckpointReader, name: str, fmt: str,
         if device.type == "cuda":
             w = w.to(device)
         try:
-            out = quantize_weight_by_format(w, fmt, group_size,
-                                            convrot_groupsize, seed=seed)
+            try:
+                out = quantize_weight_by_format(w, fmt, group_size,
+                                                convrot_groupsize, seed=seed,
+                                                codebook_mode=codebook_mode)
+            except PolicyError as exc:
+                if "NaN or Inf" in str(exc) or "non-finite" in str(exc):
+                    raise InputError(
+                        f"non-finite values in quantizable layer {name!r} "
+                        "(NaN/Inf); pass --nonfinite-policy keep to preserve "
+                        "the layer at original precision") from exc
+                raise
         finally:
             del w
         if device.type != "cpu":
@@ -6018,8 +6415,17 @@ def quantize_tensor_bounded(reader: CheckpointReader, name: str, fmt: str,
                 chunk = chunk.to(compute_dtype)
             if device.type == "cuda":
                 chunk = chunk.to(device)
-            part = quantize_weight_by_format(chunk, fmt, group_size,
-                                             convrot_groupsize, seed=seed)
+            try:
+                part = quantize_weight_by_format(
+                    chunk, fmt, group_size, convrot_groupsize, seed=seed,
+                    codebook_mode=codebook_mode)
+            except PolicyError as exc:
+                if "NaN or Inf" in str(exc) or "non-finite" in str(exc):
+                    raise InputError(
+                        f"non-finite values in quantizable layer {name!r} "
+                        "(NaN/Inf); pass --nonfinite-policy keep to preserve "
+                        "the layer at original precision") from exc
+                raise
             for s in parts:
                 t = part[s]
                 parts[s].append(t.cpu() if device.type != "cpu" else t)
@@ -6029,7 +6435,7 @@ def quantize_tensor_bounded(reader: CheckpointReader, name: str, fmt: str,
     codebook = _gather_codebook_samples(reader, name, k, group_size,
                                         convrot_groupsize, sample_size, chunk_rows,
                                         device="cpu", compute_dtype=compute_dtype,
-                                        seed=seed)
+                                        seed=seed, codebook_mode=codebook_mode)
     # per-chunk processing
     packed_parts: List[torch.Tensor] = []
     s_rel_parts: List[torch.Tensor] = []
@@ -6043,7 +6449,8 @@ def quantize_tensor_bounded(reader: CheckpointReader, name: str, fmt: str,
             chunk = chunk.to(device)
         rot = rotate_int8_convrot_weight(chunk, convrot_groupsize)
         p, s_rel, s_ch, _ = _quantize_rotated_w4a8_with_codebook(
-            rot, group_size, codebook.to(device=rot.device))
+            rot, group_size, codebook.to(device=rot.device),
+            als_iterations=(3 if codebook_mode == "fit" else W4A8_ALS_ITERS))
         packed_parts.append(p.cpu() if device.type != "cpu" else p)
         s_rel_parts.append(s_rel.cpu() if device.type != "cpu" else s_rel)
         s_ch_parts.append(s_ch.cpu() if device.type != "cpu" else s_ch)
@@ -6056,15 +6463,26 @@ def quantize_tensor_bounded(reader: CheckpointReader, name: str, fmt: str,
 def _quantize_row_chunk(reader: CheckpointReader, name: str, r0: int, r1: int,
                         group_size: int, convrot_groupsize: int,
                         codebook: torch.Tensor, device: torch.device,
-                        compute_dtype: Optional[torch.dtype]) -> Dict[str, torch.Tensor]:
+                        compute_dtype: Optional[torch.dtype],
+                        als_iterations: int = W4A8_ALS_ITERS,
+                        ) -> Dict[str, torch.Tensor]:
     chunk = reader.read_tensor(name)[r0:r1]
     if compute_dtype is not None and chunk.dtype not in FP8_DTYPES:
         chunk = chunk.to(compute_dtype)
     if device.type == "cuda":
         chunk = chunk.to(device)
     rotated = rotate_int8_convrot_weight(chunk, convrot_groupsize)
-    packed, s_rel, s_ch, cb = _quantize_rotated_w4a8_with_codebook(
-        rotated, group_size, codebook.to(device=rotated.device))
+    try:
+        packed, s_rel, s_ch, cb = _quantize_rotated_w4a8_with_codebook(
+            rotated, group_size, codebook.to(device=rotated.device),
+            als_iterations=als_iterations)
+    except PolicyError as exc:
+        if "NaN or Inf" in str(exc) or "non-finite" in str(exc):
+            raise InputError(
+                f"non-finite values in quantizable layer {name!r} (NaN/Inf); "
+                "pass --nonfinite-policy keep to preserve the layer at "
+                "original precision") from exc
+        raise
     out = {
         "": packed.cpu(),
         "_s_rel": s_rel.cpu(),
@@ -6130,7 +6548,8 @@ def apply_sensitivity_prepass(info: CheckpointInfo,
                               analyzer: SensitivityAnalyzer,
                               max_mem: int, device: torch.device,
                               compute_dtype: Optional[torch.dtype],
-                              seed: int = 0) -> None:
+                              seed: int = 0,
+                              codebook_mode: str = "auto") -> None:
     """Freeze sensitivity decisions before the safetensors inventory is built."""
     with CheckpointReader(info) as reader:
         for decision in decisions:
@@ -6149,7 +6568,8 @@ def apply_sensitivity_prepass(info: CheckpointInfo,
                 quantized = quantize_tensor_bounded(
                     reader, decision.name, FORMAT_W4A8, decision.group_size,
                     decision.convrot_groupsize, max_mem, device,
-                    compute_dtype=compute_dtype, seed=seed)
+                    compute_dtype=compute_dtype, seed=seed,
+                    codebook_mode=codebook_mode)
                 dequant = dequantize_weight_by_format(
                     quantized, FORMAT_W4A8, decision.group_size,
                     decision.convrot_groupsize, torch.float32)
@@ -6163,13 +6583,16 @@ def apply_sensitivity_prepass(info: CheckpointInfo,
                 codebook = _gather_codebook_samples(
                     reader, decision.name, k, decision.group_size,
                     decision.convrot_groupsize, sample_size, chunk_rows,
-                    compute_dtype=compute_dtype, seed=seed)
+                    compute_dtype=compute_dtype, seed=seed,
+                    codebook_mode=codebook_mode)
                 accumulator = _MetricAccumulator(decision.name)
                 for r0 in range(0, n, chunk_rows):
                     r1 = min(n, r0 + chunk_rows)
                     quantized = _quantize_row_chunk(
                         reader, decision.name, r0, r1, decision.group_size,
-                        decision.convrot_groupsize, codebook, device, compute_dtype)
+                        decision.convrot_groupsize, codebook, device, compute_dtype,
+                        als_iterations=(3 if codebook_mode == "fit"
+                                        else W4A8_ALS_ITERS))
                     dequant = dequantize_weight_by_format(
                         quantized, FORMAT_W4A8, decision.group_size,
                         decision.convrot_groupsize, torch.float32)
@@ -6241,7 +6664,8 @@ class MixedPlanner:
                  max_bf16_fraction: Optional[float] = None,
                  linear_dtype: str = DEFAULT_W4A4_LINEAR_DTYPE,
                  runtime_certificate: Optional["RuntimeCertificate"] = None,
-                 seed: int = 0):
+                 seed: int = 0,
+                 codebook_mode: str = "auto"):
         if profile_name not in MIXED_PROFILE_DEFAULTS:
             raise PolicyError(f"unknown mixed profile {profile_name!r}")
         self.profile = MIXED_PROFILE_DEFAULTS[profile_name]
@@ -6255,6 +6679,11 @@ class MixedPlanner:
         self.linear_dtype = linear_dtype
         self.runtime_certificate = runtime_certificate
         self.seed = seed
+        if codebook_mode not in CODEBOOK_MODES:
+            raise PolicyError(
+                f"unknown W4A8 codebook mode {codebook_mode!r}; "
+                f"expected one of {CODEBOOK_MODES}")
+        self.codebook_mode = codebook_mode
         self.layer_gate = (layer_gate if layer_gate is not None
                            else self.profile.layer_gate)
         self.global_gate = (global_gate if global_gate is not None
@@ -6349,7 +6778,9 @@ class MixedPlanner:
             if self.device.type == "cuda":
                 w = w.to(self.device)
             try:
-                q = quantize_weight_by_format(w, fmt, d.group_size, cgs)
+                q = quantize_weight_by_format(
+                    w, fmt, d.group_size, cgs, seed=self.seed,
+                    codebook_mode=self.codebook_mode)
                 dq = dequantize_weight_by_format(q, fmt, d.group_size, cgs,
                                                  torch.float32)
                 metrics = compute_weight_metrics(w.float().cpu(), dq.cpu())
@@ -6409,16 +6840,22 @@ class MixedPlanner:
             sample_size = _codebook_sample_size(n * k)
             codebook = _gather_codebook_samples(
                 reader, d.name, k, d.group_size, cgs, sample_size, chunk_rows,
-                compute_dtype=self.compute_dtype, seed=self.seed)
+                compute_dtype=self.compute_dtype, seed=self.seed,
+                codebook_mode=self.codebook_mode)
             for r0 in range(0, n, chunk_rows):
                 r1 = min(n, r0 + chunk_rows)
                 q = _quantize_row_chunk(reader, d.name, r0, r1, d.group_size,
                                         cgs, codebook, self.device,
-                                        self.compute_dtype)
+                                        self.compute_dtype,
+                                        als_iterations=(
+                                            3 if self.codebook_mode == "fit"
+                                            else W4A8_ALS_ITERS))
                 dq = dequantize_weight_by_format(q, FORMAT_W4A8, d.group_size,
                                                  cgs, torch.float32)
                 orig_chunk = reader.read_tensor(d.name)[r0:r1]
-                acc.update(orig_chunk, dq, activations)
+                # Runtime output error is accumulated separately below; avoid
+                # duplicating its two large matrix multiplications here.
+                acc.update(orig_chunk, dq, None)
                 if out_acc is not None:
                     y_q = _simulate_quantized_chunk(
                         orig_chunk, q, fmt, d.group_size, cgs, act_q,
@@ -6434,10 +6871,12 @@ class MixedPlanner:
                     chunk = chunk.to(self.compute_dtype)
                 if self.device.type == "cuda":
                     chunk = chunk.to(self.device)
-                q = quantize_weight_by_format(chunk, fmt, d.group_size, cgs)
+                q = quantize_weight_by_format(
+                    chunk, fmt, d.group_size, cgs, seed=self.seed,
+                    codebook_mode=self.codebook_mode)
                 dq = dequantize_weight_by_format(q, fmt, d.group_size, cgs,
                                                  torch.float32)
-                acc.update(chunk.cpu().float(), dq.cpu(), activations)
+                acc.update(chunk.cpu().float(), dq.cpu(), None)
                 if out_acc is not None:
                     y_q = _simulate_quantized_chunk(
                         chunk.cpu(), {k: v.cpu() for k, v in q.items()}, fmt,
@@ -6495,7 +6934,16 @@ class MixedPlanner:
                             mode.certain if mode is not None else None),
                         backend=(self.runtime.target if fmt == FORMAT_W4A4
                                  else None))
-                    metrics = self._evaluate_format(reader, d, fmt)
+                    try:
+                        metrics = self._evaluate_format(reader, d, fmt)
+                    except PolicyError as exc:
+                        if "NaN or Inf" in str(exc) or "non-finite" in str(exc):
+                            raise InputError(
+                                f"non-finite values in quantizable layer "
+                                f"{d.name!r} (NaN/Inf); pass "
+                                "--nonfinite-policy keep to preserve the layer "
+                                "at original precision") from exc
+                        raise
                     cand.weight_rel_l2 = metrics.rel_l2
                     cand.act_rel_l2 = metrics.act_rel_l2
                     cands[fmt] = cand
@@ -6537,6 +6985,7 @@ class MixedPlanner:
             "selected": selected, "kept": kept, "promotions": promoted,
             "runtime_backend": self.runtime.target,
             "w4a4_linear_dtype": self.linear_dtype,
+            "w4a8_codebook_mode": self.codebook_mode,
         })
         return self.summary
 
@@ -6923,6 +7372,8 @@ def _plan_hash(info: CheckpointInfo, plan: ConversionPlan, args: Any,
         "algorithm_revision": QUANT_ALGORITHM_REVISION,
         "architecture": plan.detection.architecture,
         "prefix": plan.detection.unet_prefix,
+        "components": getattr(args, "components", COMPONENT_AUTO),
+        "codebook_mode": getattr(args, "codebook_mode", "auto"),
         "group_size": getattr(args, "group_size", None),
         "compute_dtype": getattr(args, "compute_dtype", "auto"),
         "output_dtype": getattr(args, "output_dtype", "auto"),
@@ -6961,6 +7412,7 @@ def _plan_hash(info: CheckpointInfo, plan: ConversionPlan, args: Any,
             "group_size": d.group_size,
             "convrot_groupsize": d.convrot_groupsize,
             "format": d.format,
+            "component": d.component,
             "out_dtype": torch_dtype_name(d.out_dtype) if d.out_dtype else None,
         } for d in plan.decisions],
         "entries": [{
@@ -7280,7 +7732,9 @@ class ConversionEngine:
                         self.reader, d.name, d.format, d.group_size,
                         d.convrot_groupsize, max_mem, device,
                         compute_dtype=compute_dtype,
-                        seed=getattr(self.args, "seed", 0))
+                        seed=getattr(self.args, "seed", 0),
+                        codebook_mode=getattr(
+                            self.args, "codebook_mode", "auto"))
                     self._write_quantized(d, quant_tensors, entries_by_name)
                     del quant_tensors
             else:
@@ -7350,7 +7804,8 @@ class ConversionEngine:
         codebook = _gather_codebook_samples(
             self.reader, d.name, k, d.group_size, d.convrot_groupsize,
             sample_size, chunk_rows, compute_dtype=compute_dtype,
-            seed=getattr(self.args, "seed", 0))
+            seed=getattr(self.args, "seed", 0),
+            codebook_mode=getattr(self.args, "codebook_mode", "auto"))
         suffix_map = {"": ".weight", "_s_rel": ".weight_s_rel",
                       "_s_channel": ".weight_s_channel"}
         hashers = {suffix: hashlib.sha256() for suffix in suffix_map}
@@ -7363,7 +7818,10 @@ class ConversionEngine:
             r1 = min(n, r0 + chunk_rows)
             part = _quantize_row_chunk(
                 self.reader, d.name, r0, r1, d.group_size,
-                d.convrot_groupsize, codebook, device, compute_dtype)
+                d.convrot_groupsize, codebook, device, compute_dtype,
+                als_iterations=(
+                    3 if getattr(self.args, "codebook_mode", "auto") == "fit"
+                    else W4A8_ALS_ITERS))
             for suffix, output_suffix in suffix_map.items():
                 name = d.layer + output_suffix
                 data = tensor_to_bytes(part[suffix])
@@ -7407,9 +7865,19 @@ class ConversionEngine:
                 chunk = chunk.to(compute_dtype)
             if device.type == "cuda":
                 chunk = chunk.to(device)
-            part = quantize_weight_by_format(chunk, d.format, d.group_size,
-                                             d.convrot_groupsize,
-                                             seed=getattr(self.args, "seed", 0))
+            try:
+                part = quantize_weight_by_format(
+                    chunk, d.format, d.group_size, d.convrot_groupsize,
+                    seed=getattr(self.args, "seed", 0),
+                    codebook_mode=getattr(
+                        self.args, "codebook_mode", "auto"))
+            except PolicyError as exc:
+                if "NaN or Inf" in str(exc) or "non-finite" in str(exc):
+                    raise InputError(
+                        f"non-finite values in quantizable layer {d.name!r} "
+                        "(NaN/Inf); pass --nonfinite-policy keep to preserve "
+                        "the layer at original precision") from exc
+                raise
             for suffix in suffixes:
                 name = d.layer + output_suffixes[suffix]
                 data = tensor_to_bytes(part[suffix].cpu() if device.type != "cpu"
@@ -7561,7 +8029,8 @@ def build_extension_metadata(info: CheckpointInfo, plan: ConversionPlan,
             FORMAT_W4A8: {
                 "weight_bits": 4, "activation_bits": 8,
                 "weight_quantization": "per-group 16-entry symmetric "
-                                       "Lloyd-Max codebook",
+                                       "adaptive fixed/fitted codebook",
+                "codebook_mode": getattr(args, "codebook_mode", "auto"),
                 "scale_dtype": "fp8_e4m3fn",
                 "packing": "int4-nibble-lsb",
                 "convrot": True, "convrot_groupsize": 256,
@@ -7640,7 +8109,9 @@ def build_extension_metadata(info: CheckpointInfo, plan: ConversionPlan,
         quant_block = {
             "weight_bits": 4,
             "activation_bits": 8,
-            "weight_quantization": "per-group 16-entry symmetric Lloyd-Max codebook",
+            "weight_quantization": "per-group 16-entry symmetric adaptive "
+                                   "fixed/fitted codebook",
+            "codebook_mode": getattr(args, "codebook_mode", "auto"),
             "activation_quantization": "runtime dynamic symmetric int8 per input row after ConvRot",
             "activation_scale": "fp32 amax(row)/127, clamped to at least 1e-30",
             "activation_rounding": "nearest integer, clamped to [-128,127]",
@@ -7667,6 +8138,8 @@ def build_extension_metadata(info: CheckpointInfo, plan: ConversionPlan,
         "format_revision": FORMAT_MIXED_REVISION if is_mixed
                           else FORMAT_W4A8_REVISION,
         "architecture": d.architecture,
+        "detected_component": d.policy.component,
+        "selected_components": getattr(args, "components", COMPONENT_AUTO),
         "detection_confidence": d.confidence,
         "unet_prefix": d.unet_prefix,
         "architecture_dims": _architecture_dims_fingerprint(info, d),
@@ -7693,6 +8166,7 @@ def build_extension_metadata(info: CheckpointInfo, plan: ConversionPlan,
             "torch_version": env.torch_version,
             "deterministic_on_same_backend": True,
             "codebook_subsample_seed": 0,
+            "codebook_mode": getattr(args, "codebook_mode", "auto"),
         },
         "compatibility": {
             "comfy_kitchen": {
@@ -7729,6 +8203,18 @@ def build_extension_metadata(info: CheckpointInfo, plan: ConversionPlan,
                                 "It cannot be embedded in the file it hashes.",
         },
         "policy_summary": {
+            "component_counts": {
+                component: sum(1 for item in plan.decisions
+                               if item.component == component)
+                for component in (COMPONENT_DIFFUSION,
+                                  COMPONENT_TEXT_ENCODER, "other")
+            },
+            "quantized_component_counts": {
+                component: sum(1 for item in plan.quantized_layers()
+                               if item.component == component)
+                for component in (COMPONENT_DIFFUSION,
+                                  COMPONENT_TEXT_ENCODER)
+            },
             "decision_counts": {
                 kind.value: sum(1 for item in plan.decisions if item.kind == kind)
                 for kind in DecisionKind
@@ -7793,10 +8279,18 @@ def compression_stats(info: CheckpointInfo, plan: ConversionPlan,
         if decision is not None and decision.kind == DecisionKind.QUANTIZE:
             add("user_forced" if "user-forced" in reason else "quantized", meta, decision)
             continue
-        if not meta.name.startswith(prefix):
+        recognized_component = bool(
+            decision is not None and decision.component in
+            (COMPONENT_DIFFUSION, COMPONENT_TEXT_ENCODER))
+        if prefix and not meta.name.startswith(prefix) and not recognized_component:
             add("outside_prefix", meta, decision)
             continue
-        in_qset = bool(q_re.search(rel)) if policy.quantize else True
+        if decision is not None and decision.component == COMPONENT_TEXT_ENCODER:
+            in_qset = ("not in" not in reason
+                       and "policy keep" not in reason
+                       and "policy exclude" not in reason)
+        else:
+            in_qset = bool(q_re.search(rel)) if policy.quantize else True
         if "matched --exclude" in reason or "matched --keep-precision" in reason:
             add("user_excluded", meta, decision)
         elif "convrot_groupsize" in reason:
@@ -7904,6 +8398,9 @@ def render_text_report(report: Dict[str, Any]) -> str:
     a("=" * 78)
     a(f"format            : {report.get('format')} ({report.get('format_revision')})")
     a(f"architecture      : {report.get('architecture')} (confidence {report.get('detection_confidence')})")
+    a(f"components        : {report.get('components')} "
+      f"(detected {report.get('detected_component')})")
+    a(f"W4A8 codebook     : {report.get('codebook_mode')}")
     a(f"unet prefix       : {report.get('unet_prefix')}")
     a(f"input             : {report.get('input_kind')} ({', '.join(report.get('input_files', []))})")
     a(f"output            : {report.get('output_path')} ({human_bytes(report.get('output_bytes', 0))})")
@@ -8075,6 +8572,9 @@ def build_report(info: CheckpointInfo, plan: ConversionPlan, env: EnvironmentInf
             FORMAT_MIXED_REVISION if plan.fmt == FORMAT_MIXED
             else FORMAT_W4A8_REVISION),
         "architecture": result.architecture, "detection_confidence": result.confidence,
+        "detected_component": result.policy.component,
+        "components": getattr(args, "components", COMPONENT_AUTO),
+        "codebook_mode": getattr(args, "codebook_mode", "auto"),
         "unet_prefix": result.unet_prefix,
         "detection_evidence": result.evidence, "detection_hints": result.hints,
         "competing": result.competing,
@@ -8089,6 +8589,7 @@ def build_report(info: CheckpointInfo, plan: ConversionPlan, env: EnvironmentInf
         "tensor_decisions": [
             {"name": item.name, "decision": item.kind.value,
              "reason": item.reason, "layer": item.layer,
+             "component": item.component, "format": item.format,
              "group_size": item.group_size if item.kind == DecisionKind.QUANTIZE else None,
              "convrot_groupsize": item.convrot_groupsize
              if item.kind == DecisionKind.QUANTIZE else None}
@@ -8827,12 +9328,14 @@ class Validator:
                     reader, d0.name, d0.format, d0.group_size,
                     d0.convrot_groupsize, max_mem, torch.device("cpu"),
                     compute_dtype=compute_dtype,
-                    seed=getattr(args, "seed", 0))
+                    seed=getattr(args, "seed", 0),
+                    codebook_mode=getattr(args, "codebook_mode", "auto"))
                 out2 = quantize_tensor_bounded(
                     reader, d0.name, d0.format, d0.group_size,
                     d0.convrot_groupsize, max_mem, torch.device("cpu"),
                     compute_dtype=compute_dtype,
-                    seed=getattr(args, "seed", 0))
+                    seed=getattr(args, "seed", 0),
+                    codebook_mode=getattr(args, "codebook_mode", "auto"))
                 det = all(torch.equal(out1[k], out2[k]) for k in out1)
                 self.check("deterministic-conversion", det, "two runs byte-identical")
                 if conv_device == "cpu" and d0.name not in getattr(self.plan, "chunked_layers", set()):
@@ -9224,7 +9727,8 @@ def verify_output(output_path: str) -> Dict[str, Any]:
             if lfmt == FORMAT_W4A8:
                 s_rel = by_name[f"{layer}.weight_s_rel"][:r0]
                 s_ch = by_name[f"{layer}.weight_s_channel"][:r0]
-                cb = by_name[f"{layer}.weight_codebook"][:r0] if f"{layer}.weight_codebook" in by_name else None
+                cb = (by_name[f"{layer}.weight_codebook"]
+                      if f"{layer}.weight_codebook" in by_name else None)
                 out = dequantize_w4a8_weight(
                     packed, s_rel, s_ch, codebook=cb, group_size=int(conf.get("group_size", 16)),
                     convrot_groupsize=int(conf.get("convrot_groupsize", 256)),
@@ -9344,7 +9848,8 @@ def _test_w4_pack_roundtrip() -> str:
         assert torch.equal(rt, codes), f"K={k} mismatch"
     return "K=16..256 round trips"
 
-def _run_w4a8_payload(src: str, out: str, max_mem: int, seed: int = 0) -> str:
+def _run_w4a8_payload(src: str, out: str, max_mem: int, seed: int = 0,
+                      codebook_mode: str = "auto") -> str:
     """Convert a w4a8 checkpoint at a given memory budget and return the
     tensor payload hash (stable across metadata rewrites)."""
     info = discover_checkpoint(src)
@@ -9353,7 +9858,8 @@ def _run_w4a8_payload(src: str, out: str, max_mem: int, seed: int = 0) -> str:
                                        if info.by_name(nm) else None))
     dec = classify_tensors(info, det, FORMAT_W4A8, None, [], [], [], None, None)
     args = _selftest_args(out, FORMAT_W4A8, extra={
-        "max_memory": max_mem, "seed": seed})
+        "max_memory": max_mem, "seed": seed,
+        "codebook_mode": codebook_mode})
     plan = ConversionPlan(fmt=FORMAT_W4A8, detection=det, decisions=dec,
                           metadata_quant={}, metadata_ext={}, output_entries=[])
     entries, total = build_output_entries(info, dec, FORMAT_W4A8, None)
@@ -9384,13 +9890,15 @@ def _test_chunk_invariant_payload() -> str:
         hashes[label] = _run_w4a8_payload(
             src, os.path.join(d, f"out_{label}.safetensors"), mem)
     assert hashes["32M"] == hashes["64M"] == hashes["8G"], hashes
-    # --seed controls sampling: same seed reproduces, different seed changes
+    # Legacy fit mode exposes the sampling seed: same seed reproduces,
+    # different seeds change fitted tables. The fast auto/fixed path can be
+    # seed-independent for ordinary Gaussian layers by design.
     s1a = _run_w4a8_payload(src, os.path.join(d, "out_s1a.safetensors"),
-                            64 * 1024**2, seed=1)
+                            64 * 1024**2, seed=1, codebook_mode="fit")
     s1b = _run_w4a8_payload(src, os.path.join(d, "out_s1b.safetensors"),
-                            64 * 1024**2, seed=1)
+                            64 * 1024**2, seed=1, codebook_mode="fit")
     s2 = _run_w4a8_payload(src, os.path.join(d, "out_s2.safetensors"),
-                           64 * 1024**2, seed=2)
+                           64 * 1024**2, seed=2, codebook_mode="fit")
     assert s1a == s1b, (s1a, s1b)
     assert s1a != s2, (s1a, s2)
     return (f"chunk-invariant payload (32M==64M==8G, {hashes['64M'][:8]}...); "
@@ -9610,7 +10118,7 @@ def _test_reference_decoder_consensus() -> str:
 
 def _test_channel_gating() -> str:
     """Stable/experimental channels: --format mixed requires --experimental,
-    the stable channel is w4a8, and the release version is 1.5.0."""
+    the stable channel is w4a8, and the release version is 1.6.0."""
     import subprocess as _sp
     d = _tmpdir()
     src_path = os.path.join(d, "boogu_real.safetensors")
@@ -9636,8 +10144,8 @@ def _test_channel_gating() -> str:
     # release version
     r = _sp.run(base_cmd + ["--version"], capture_output=True, text=True,
                 timeout=120, env=base_env)
-    assert "1.5.0" in r.stdout, r.stdout
-    return "channels: mixed behind --experimental, w4a8 stable, version 1.5.0"
+    assert "1.6.0" in r.stdout, r.stdout
+    return "channels: mixed behind --experimental, w4a8 stable, version 1.6.0"
 
 
 def _test_odd_dims() -> str:
@@ -9894,6 +10402,103 @@ def _ckpt(keys_shapes: Sequence[Tuple[str, Tuple[int, ...]]]) -> CheckpointInfo:
                           "", 0, int(np.prod(shape)) * 4)
                for name, shape in keys_shapes]
     return CheckpointInfo(kind="safetensors", files=[], metadata={}, tensors=tensors)
+
+def _test_fast_codebook_assignment() -> str:
+    """Binary-search assignment must retain the old lower-index tie rule."""
+    torch.manual_seed(1701)
+    codebook = torch.sort(torch.randn(16))[0]
+    values = torch.randn(7, 5, 13)
+    expected = (values.unsqueeze(-1) - codebook).abs().argmin(-1).to(torch.int32)
+    actual = assign_codes(values, codebook)
+    assert torch.equal(actual, expected)
+    # Explicit midpoints exercise exact ties, including the outer intervals.
+    midpoints = (codebook[:-1] + codebook[1:]) / 2
+    assert torch.equal(assign_codes(midpoints, codebook),
+                       torch.arange(15, dtype=torch.int32))
+
+    levels = torch.sort(torch.randn(3, 4, 16), dim=-1)[0]
+    weight = torch.randn(3, 4, 9)
+    scales = torch.rand(3).add_(0.1)
+    targets = weight / scales.view(-1, 1, 1)
+    expected_grid = (targets.unsqueeze(-1) - levels.unsqueeze(-2)).abs() \
+        .argmin(-1).to(torch.int32)
+    assert torch.equal(assign_grid(weight, levels, scales), expected_grid)
+    return "searchsorted code and grid assignment match the 16-way reference"
+
+def _test_text_encoder_quantization() -> str:
+    """Standalone text towers classify safely in W4A8 and mixed modes."""
+    qwen = _ckpt([
+        ("model.layers.0.self_attn.q_proj.weight", (512, 256)),
+        ("model.layers.0.self_attn.o_proj.weight", (256, 512)),
+        ("model.layers.0.mlp.gate_proj.weight", (1024, 256)),
+        ("model.layers.0.mlp.down_proj.weight", (256, 1024)),
+        ("model.layers.0.input_layernorm.weight", (256,)),
+        ("model.embed_tokens.weight", (4096, 256)),
+        ("visual.model.layers.0.self_attn.q_proj.weight", (512, 256)),
+    ])
+    qwen_det = detect_architecture(qwen)
+    assert qwen_det.architecture == "text_encoder_llm"
+    assert qwen_det.policy.component == COMPONENT_TEXT_ENCODER
+    qwen_decisions = classify_tensors(
+        qwen, qwen_det, FORMAT_W4A8, None, [], [], [], None, None)
+    quantized = {d.name for d in qwen_decisions
+                 if d.kind == DecisionKind.QUANTIZE}
+    assert "model.layers.0.self_attn.q_proj.weight" in quantized
+    assert "model.layers.0.mlp.down_proj.weight" in quantized
+    assert "model.embed_tokens.weight" not in quantized
+    assert "visual.model.layers.0.self_attn.q_proj.weight" not in quantized
+    assert all(d.component == COMPONENT_TEXT_ENCODER
+               for d in qwen_decisions)
+
+    combined = _ckpt([
+        ("model.diffusion_model.double_blocks.0.img_attn.norm.key_norm.weight", (256,)),
+        ("model.diffusion_model.double_blocks.0.img_attn.qkv.weight", (768, 256)),
+        ("model.diffusion_model.double_blocks.0.img_attn.proj.weight", (256, 256)),
+        ("model.diffusion_model.double_blocks.0.txt_attn.qkv.weight", (768, 256)),
+        ("model.diffusion_model.double_blocks.0.txt_attn.proj.weight", (256, 256)),
+        ("model.diffusion_model.double_blocks.0.img_mlp.w1.weight", (1024, 256)),
+        ("model.diffusion_model.double_blocks.0.img_mlp.w2.weight", (256, 1024)),
+        ("text_encoder.model.layers.0.self_attn.q_proj.weight", (512, 256)),
+        ("text_encoder.model.layers.0.mlp.gate_proj.weight", (1024, 256)),
+    ])
+    combined_det = detect_architecture(combined)
+    assert combined_det.architecture == "flux"
+    auto_decisions = classify_tensors(
+        combined, combined_det, FORMAT_W4A8, None, [], [], [], None, None)
+    all_decisions = classify_tensors(
+        combined, combined_det, FORMAT_W4A8, None, [], [], [], None, None,
+        components=COMPONENT_ALL)
+    embedded_name = "text_encoder.model.layers.0.self_attn.q_proj.weight"
+    assert next(d for d in auto_decisions if d.name == embedded_name).kind \
+        != DecisionKind.QUANTIZE
+    embedded = next(d for d in all_decisions if d.name == embedded_name)
+    assert embedded.kind == DecisionKind.QUANTIZE
+    assert embedded.component == COMPONENT_TEXT_ENCODER
+
+    fixtures = [
+        ("text_encoder_t5", [
+            ("encoder.block.0.layer.0.SelfAttention.q.weight", (384, 192)),
+            ("encoder.block.0.layer.1.DenseReluDense.wi.weight", (768, 192)),
+        ]),
+        ("text_encoder_clip", [
+            ("text_model.encoder.layers.0.self_attn.q_proj.weight", (192, 192)),
+            ("text_model.encoder.layers.0.mlp.fc1.weight", (768, 192)),
+        ]),
+        ("text_encoder_bert", [
+            ("encoder.layer.0.attention.self.query.weight", (192, 192)),
+            ("encoder.layer.0.intermediate.dense.weight", (768, 192)),
+        ]),
+    ]
+    for expected_family, keys in fixtures:
+        info = _ckpt(keys)
+        det = detect_architecture(info)
+        assert det.architecture == expected_family
+        decisions = classify_tensors(
+            info, det, FORMAT_MIXED, None, [], [], [], None, None)
+        assert any(d.kind == DecisionKind.QUANTIZE for d in decisions)
+        assert all(d.component == COMPONENT_TEXT_ENCODER for d in decisions)
+    return ("Qwen and embedded text towers classify in W4A8; T5/CLIP/BERT "
+            "classify in mixed mode")
 
 def _classify_real(keys_shapes: Sequence[Tuple[str, Tuple[int, ...]]]):
     info = _ckpt(keys_shapes)
@@ -11876,6 +12481,7 @@ def _selftest_args(out: str, fmt: str, resume: bool = False, overwrite: bool = F
     ns = argparse.Namespace(
         output=out, format="w4a8",
         architecture="auto", device="cpu", compute_dtype="auto", output_dtype="auto",
+        components=COMPONENT_AUTO, codebook_mode="auto",
         group_size=None, calibration_source=None, calibration_samples=None,
         calibration_cache=None, seed=0, include=[], exclude=[], keep_precision=[], min_numel_override=None,
         sensitivity_threshold=None, error_threshold=0.35, max_memory=2 * 1024**3,
@@ -11931,6 +12537,8 @@ SELF_TEST_CASES: List[Tuple[str, Callable[[], str]]] = [
             ("fail-on-low-compression", _test_fail_on_low_compression),
             ("architecture-detection-safety", _test_detection_safety),
             ("golden-vectors-vs-reference", _test_golden_vectors),
+            ("fast-codebook-assignment", _test_fast_codebook_assignment),
+            ("text-encoder-quantization", _test_text_encoder_quantization),
             ("malformed-checkpoints", _test_malformed),
             ("checkpoint-input-variants", _test_checkpoint_variants),
             ("shard-hash-identity", _test_shard_hash_identity),
@@ -11949,9 +12557,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="comfyui_wxa8_quantizer.py",
         description=(
-            "Standalone W4A8 checkpoint converter for ComfyUI-compatible generative "
-            "models. See the module docstring for the verified format specification "
-            "and exact source revisions."),
+            "Standalone W4A8/mixed checkpoint converter for ComfyUI-compatible "
+            "diffusion models and text encoders. See the module docstring for "
+            "the verified format specification and exact source revisions."),
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--version", action="version",
                    version=f"%(prog)s {get_converter_version()}")
@@ -11965,6 +12573,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="quantization format: w4a8 (single-format reference "
                         "path) or mixed (experimental per-layer optimizer "
                         "over convrot_w4a4 / asym_w4a8_int8 / int8_tensorwise)")
+    p.add_argument("--components",
+                   type=lambda value: value.strip().lower().replace("-", "_"),
+                   choices=list(COMPONENT_CHOICES),
+                   default=COMPONENT_AUTO,
+                   help="components to quantize: auto selects the detected "
+                        "standalone diffusion model or text encoder; all also "
+                        "recognizes embedded text towers outside a prefixed "
+                        "diffusion model")
+    p.add_argument("--codebook-mode", choices=list(CODEBOOK_MODES),
+                   default="auto",
+                   help="W4A8 codebook strategy: auto uses the fast fixed "
+                        "Gaussian table and fits only heavy-tailed layers; "
+                        "fixed never fits; fit preserves the slower legacy "
+                        "per-layer Lloyd-Max path")
     p.add_argument("--profile", choices=list(MIXED_PROFILES), default="auto",
                    help="mixed-mode profile: auto detects the runtime (GPU -> "
                         "balanced, CPU -> conservative); balanced, conservative "
@@ -12169,11 +12791,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     env = inspect_environment()
 
     if args.list_architectures:
-        print(f"{'family':18s} {'runtime':12s} classes")
+        print(f"{'family':20s} {'component':14s} {'runtime':12s} classes")
         print("-" * 100)
         for name in family_names():
             pol = get_family(name)
-            print(f"{name:18s} {pol.runtime_status:12s} {', '.join(pol.comfyui_classes)}")
+            print(f"{name:20s} {pol.component:14s} {pol.runtime_status:12s} "
+                  f"{', '.join(pol.comfyui_classes)}")
         print()
         print("W4A8 = reference 'asym_w4a8_int8' format (comfy-kitchen PR #90, "
               "ComfyUI PR #15308).")
@@ -12214,9 +12837,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.calibration_samples is not None and args.calibration_samples <= 0:
         raise UsageError("--calibration-samples must be positive")
     for option, value in (("--sensitivity-threshold", args.sensitivity_threshold),
-                          ("--error-threshold", args.error_threshold)):
+                          ("--error-threshold", args.error_threshold),
+                          ("--quality-gate", args.quality_gate),
+                          ("--global-error-gate", args.global_error_gate)):
         if value is not None and (not math.isfinite(value) or value < 0):
             raise UsageError(f"{option} must be a finite non-negative number")
+    if (args.max_linear_bytes_per_param is not None
+            and (not math.isfinite(args.max_linear_bytes_per_param)
+                 or args.max_linear_bytes_per_param <= 0)):
+        raise UsageError(
+            "--max-linear-bytes-per-param must be a finite positive number")
+    for option, value in (
+            ("--max-original-byte-fraction", args.max_bf16_fraction),
+            ("--min-quantized-byte-fraction",
+             args.min_quantized_byte_fraction)):
+        if value is not None and (not math.isfinite(value)
+                                  or not 0.0 <= value <= 1.0):
+            raise UsageError(f"{option} must be a finite number in [0, 1]")
     info = discover_checkpoint(args.model, trust_pickle=args.trust_pickle,
                                allow_extra_shard_tensors=
                                args.allow_extra_shard_tensors)
@@ -12265,6 +12902,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"config.json     : {'present' if info.config else 'absent'}")
         print(f"quantized input : {info.is_quantized_input}")
         print(f"detected arch   : {detection.architecture} (confidence {detection.confidence})")
+        print(f"component       : {detection.policy.component}")
         print(f"unet prefix     : {detection.unet_prefix!r}")
         print("evidence        : " + "; ".join(detection.evidence or ["-"]))
         print("hints           : " + "; ".join(detection.hints or ["-"]))
@@ -12423,9 +13061,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     out_dtype = {"auto": None, "fp16": torch.float16, "bf16": torch.bfloat16}[args.output_dtype]
     decisions = classify_tensors(info, detection, fmt, args.group_size,
                                  args.include, args.exclude, args.keep_precision,
-                                 out_dtype, None)
-    # Explicit non-finite policy before any planning/entries are built
-    nonfinite_kept = apply_nonfinite_policy(info, decisions, args.nonfinite_policy)
+                                 out_dtype, None, components=args.components)
+    # ``keep`` must scan before inventory planning because it changes tensor
+    # layouts. A W4A8 sensitivity prepass also benefits from early rejection.
+    # The common error-only conversion path relies on the quantizers' fused
+    # amax/finite checks, avoiding a redundant full read of every large layer.
+    early_nonfinite_check = (
+        args.nonfinite_policy == "keep"
+        or (fmt == FORMAT_W4A8
+            and (args.sensitivity_threshold is not None
+                 or args.error_threshold is not None
+                 or args.calibration_source is not None))
+    )
+    nonfinite_kept = (apply_nonfinite_policy(
+        info, decisions, args.nonfinite_policy) if early_nonfinite_check else [])
     if nonfinite_kept:
         warnings.append(
             f"nonfinite policy keep: {len(nonfinite_kept)} layer(s) with NaN/Inf "
@@ -12508,7 +13157,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             max_bf16_fraction=args.max_bf16_fraction,
             linear_dtype=args.w4a4_linear_dtype,
             runtime_certificate=certificate,
-            seed=args.seed)
+            seed=args.seed,
+            codebook_mode=args.codebook_mode)
         if args.require_runtime_certificate and certificate is None:
             raise RuntimeCompatibilityError(
                 "--require-runtime-certificate needs --runtime-certificate "
@@ -12552,7 +13202,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             calibration)
         apply_sensitivity_prepass(info, decisions, sensitivity, args.max_memory,
                                   effective_device, compute_dtype,
-                                  seed=args.seed)
+                                  seed=args.seed,
+                                  codebook_mode=args.codebook_mode)
         kept_by_sensitivity = sum(1 for m in sensitivity.results.values() if m.kept)
         if kept_by_sensitivity:
             warnings.append(
@@ -12583,14 +13234,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     if plan.n_quantized == 0:
         raise PolicyError(
             "no tensors selected for quantization under the "
-            f"{detection.architecture!r} policy after sensitivity analysis "
-            "(adjust thresholds or use --include to force layers)")
+            f"{detection.architecture!r} policy with --components "
+            f"{args.components!r} after safety/quality gates "
+            "(check --components, adjust thresholds, or use --include to "
+            "force eligible layers)")
 
     quant_rows = []
     for d in plan.quantized_layers():
         m = info.by_name(d.name)
         quant_rows.append(
-            f"{d.layer}: {tuple(m.shape)} gs={d.group_size} "
+            f"{d.layer}: {tuple(m.shape)} component={d.component} gs={d.group_size} "
             f"cgs={d.convrot_groupsize} fmt={d.format}")
 
     comp_stats = compression_stats(info, plan, detection)

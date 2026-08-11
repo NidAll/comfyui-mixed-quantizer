@@ -13,6 +13,11 @@ Formats and dimensions exercised (the awkward real-model K values):
     W4A8:            K 256, 768, 1024, 3072, 4096
     INT8:            K 2520, 3360, 4096
 
+Plus the text-encoder (TE) dimension set added for the TE quantization
+support: T5-XXL (4096/10240), Qwen2-0.5B (896/4864), Gemma-2-2B
+(2304/9216). K=896 is deliberately absent from the W4A8 list because
+896 % 256 != 0 makes W4A8 ineligible (the INT8/W4A4 fallback rows cover it).
+
 The W4A4 A8 (linear_dtype=int8) execution mode is CUDA-only in comfy-kitchen
 (the eager backend always executes A4); its simulator agreement is checked in
 testdata/cuda_smoke.py against the CUDA kernels instead.
@@ -47,9 +52,10 @@ def main() -> int:
     args = ap.parse_args()
 
     try:
-        import comfy_kitchen
-        import torch
-        from comfy_kitchen.backends.eager.w4a8_int8 import w4a8_int8_linear
+        import comfy_kitchen  # pyright: ignore[reportMissingImports]
+        import torch  # pyright: ignore[reportMissingImports]
+        from comfy_kitchen.backends.eager.w4a8_int8 import (  # pyright: ignore[reportMissingImports]
+            w4a8_int8_linear)
     except ImportError as e:  # pragma: no cover
         print(f"SKIPPED: comfy-kitchen not installed ({e}); "
               "run with the optional requirements")
@@ -58,6 +64,7 @@ def main() -> int:
     comfy_kitchen.use_backend("eager")
     spec = importlib.util.spec_from_file_location(
         "wxa8_eq", os.path.join(REPO, "comfyui_wxa8_quantizer.py"))
+    assert spec is not None and spec.loader is not None  # pyright: ignore[reportOptionalMemberAccess]
     m = importlib.util.module_from_spec(spec)
     sys.modules["wxa8_eq"] = m
     spec.loader.exec_module(m)
@@ -66,9 +73,15 @@ def main() -> int:
         return float((y1 - y2).norm() / y2.norm().clamp(min=1e-8))
 
     w4a4_cases = [(320, 64), (640, 64), (1152, 16), (1408, 64), (1920, 64),
-                  (3072, 256), (4096, 256)]
-    w4a8_cases = [256, 768, 1024, 3072, 4096]
-    int8_cases = [2520, 3360, 4096]
+                  (3072, 256), (4096, 256),
+                  # TE dims (k, convrot_groupsize)
+                  (10240, 256), (896, 64), (4864, 256), (2304, 256), (9216, 256)]
+    w4a8_cases = [256, 768, 1024, 3072, 4096,
+                  # TE dims (all K%256==0; 896 is correctly absent)
+                  10240, 2304, 9216, 4864]
+    int8_cases = [2520, 3360, 4096,
+                  # TE dims (K=896 exercises the W4A8-ineligible fallback)
+                  896, 4864, 2304, 9216, 10240]
     worst = {"w4a4": 0.0, "w4a8": 0.0, "int8": 0.0}
 
     for seed in range(args.seeds):

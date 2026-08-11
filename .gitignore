@@ -6,6 +6,15 @@ __pycache__/
 # agent guidance (machine-local runbook, not part of the published repo)
 AGENTS.md
 
+# machine-local optimization plan (not part of the published repo)
+OPTIMIZATION_PLAN.md
+
+# machine-local v1.6 implementation writeup (Windows copy, not published)
+comfyui_wxa8_quantizer_v1.6_implementation.md
+
+# Windows zone identifiers (never publish)
+*.Zone.Identifier
+
 # research checkouts (reference material only, not part of the project)
 research/
 
