@@ -23,6 +23,17 @@ Usage (on the target machine, ComfyUI >= v0.31.0, real checkpoints):
         --timesteps 50,500,900 \
         --threshold 0.05
 
+Text-encoder mode (quantized TE embedding quality vs the original TE):
+
+    PYTHONPATH=<comfyui-src> python testdata/model_quality.py \
+        --te --source original_t5xxl.safetensors \
+        --model converted_t5xxl.safetensors --te-clip-type sd3 \
+        --te-threshold 0.05
+
+Both modes load through the real ComfyUI path; the TE mode encodes fixed
+prompts with both TEs and compares the embedding tensors (cosine + relative
+L2) that the CLIP loader exposes (pooled_output / hidden_states).
+
 Exit codes: 0 = all timesteps inside the threshold, 1 = any timestep exceeds
 it, 2 = could not run (missing ComfyUI/checkpoints).
 
@@ -42,8 +53,9 @@ FORMATS = ("convrot_w4a4", "asym_w4a8_int8", "int8_tensorwise")
 
 
 def load_model(path: str, metadata: dict):
-    from comfy.utils import load_torch_file, convert_old_quants
-    from comfy import model_detection
+    from comfy.utils import (  # pyright: ignore[reportMissingImports]
+        load_torch_file, convert_old_quants)
+    from comfy import model_detection  # pyright: ignore[reportMissingImports]
     ckpt = load_torch_file(path)
     ckpt, _ = convert_old_quants(ckpt, metadata=metadata)
     prefix = next((k[:k.index(".") + 1] for k in ckpt
@@ -71,14 +83,27 @@ def main() -> int:
     ap.add_argument("--context-shape", default="1,77,4096")
     ap.add_argument("--context-len", type=int, default=77)
     ap.add_argument("--json", default=None, metavar="PATH")
+    ap.add_argument("--te", action="store_true",
+                    help="text-encoder mode: compare TE embeddings of the "
+                         "original vs converted TE checkpoints")
+    ap.add_argument("--te-clip-type", default="sd1",
+                    help="CLIPType for the TE files (sd1, sd2, sdxl, sd3, "
+                         "flux, wan, hunyuan_video, krea, ...); default sd1")
+    ap.add_argument("--te-threshold", type=float, default=0.05,
+                    help="max allowed relative L2 of the TE embeddings")
+    ap.add_argument("--te-prompts",
+                    default="a red cat sitting on a mat,a blue sky over a calm "
+                            "ocean,a bustling city street at night,an astronaut "
+                            "on the moon,a bowl of fresh fruit on a wooden table",
+                    help="comma-separated prompts for the TE comparison")
     args = ap.parse_args()
 
-    import torch
+    import torch  # pyright: ignore[reportMissingImports]
 
     dev = torch.device(args.device)
     try:
-        import comfy  # noqa: F401
-        from safetensors import safe_open
+        import comfy  # pyright: ignore[reportMissingImports]  # noqa: F401
+        from safetensors import safe_open  # pyright: ignore[reportMissingImports]
     except ImportError as e:  # pragma: no cover
         print(f"FAIL: ComfyUI/safetensors not importable ({e})")
         return 2
@@ -89,12 +114,15 @@ def main() -> int:
             print(f"FAIL: checkpoint not found: {p}")
             return 2
 
+    if args.te:
+        return run_te_quality(args)
+
     with safe_open(args.model, framework="pt", device="cpu") as f:
         meta = dict(f.metadata() or {})
     try:
         qm = json.loads(meta.get("_quantization_metadata", "{}"))
         layer_formats = {
-            layer: conf.get("format")
+            str(layer): str(conf.get("format"))
             for layer, conf in (qm.get("layers") or {}).items()
             if isinstance(conf, dict) and conf.get("format") in FORMATS
         }
@@ -130,13 +158,11 @@ def main() -> int:
             return 2
         ref_flat = y_ref.float().reshape(y_ref.shape[0], -1)
         q_flat = y_q.float().reshape(y_q.shape[0], -1)
-        rel_l2 = float((q_flat - ref_flat).norm(dim=1)
-                       / ref_flat.norm(dim=1).clamp(min=1e-8))
-        rel_l2 = float(rel_l2.mean())
-        cos = float((q_flat * ref_flat).sum(dim=1) /
-                    (q_flat.norm(dim=1) * ref_flat.norm(dim=1))
-                    .clamp(min=1e-12))
-        cos = float(cos.mean())
+        rel_l2 = float(((q_flat - ref_flat).norm(dim=1)
+                        / ref_flat.norm(dim=1).clamp(min=1e-8)).mean())
+        cos = float(((q_flat * ref_flat).sum(dim=1) /
+                     (q_flat.norm(dim=1) * ref_flat.norm(dim=1))
+                     .clamp(min=1e-12)).mean())
         snr = (300.0 if rel_l2 < 1e-15 else
                10.0 * float(torch.log10(torch.tensor(1.0 / max(rel_l2, 1e-15)))))
         max_err = float(((q_flat - ref_flat).abs().max(dim=1).values
@@ -165,6 +191,91 @@ def main() -> int:
             json.dump(summary, f, indent=2)
     print(f"model quality: worst relL2 {worst:.4f} vs threshold "
           f"{args.threshold} -> {'PASS' if ok else 'FAIL'}")
+    return 0 if ok else 1
+
+
+def run_te_quality(args) -> int:
+    """Text-encoder quality mode: encode fixed prompts with the original and
+    the converted TE and compare the embedding tensors the CLIP loader
+    exposes (pooled_output / hidden_states / lg_hidden_states)."""
+    import torch  # pyright: ignore[reportMissingImports]
+    dev = torch.device(args.device)
+    try:
+        from comfy.sd import load_clip, CLIPType  # pyright: ignore[reportMissingImports]
+    except ImportError as e:  # pragma: no cover
+        print(f"FAIL: ComfyUI not importable ({e})")
+        return 2
+
+    clip_type_name = args.te_clip_type
+    member = {"sd1": "STABLE_DIFFUSION", "sd2": "STABLE_DIFFUSION_2",
+              "sdxl": "SDXL", "sd3": "SD3", "flux": "FLUX",
+              "wan": "WAN", "hunyuan_video": "HUNYUAN_VIDEO",
+              "krea": "KREA"}.get(clip_type_name)
+    if member is None or not hasattr(CLIPType, member):  # pragma: no cover
+        print(f"FAIL: unknown/unsupported --te-clip-type {clip_type_name!r}")
+        return 2
+    clip_type = getattr(CLIPType, member)
+
+    ref_clip = load_clip(ckpt_paths=[args.source], embedding_directory=None,
+                         clip_type=clip_type)
+    q_clip = load_clip(ckpt_paths=[args.model], embedding_directory=None,
+                       clip_type=clip_type)
+    for m in (ref_clip, q_clip):
+        m.load_device = dev
+    prompts = [p.strip() for p in args.te_prompts.split(",") if p.strip()]
+
+    def embed(clip, prompt):
+        tokens = clip.tokenize([prompt])
+        cond = clip.encode_tokens(tokens)
+        out = {}
+        for entry in cond:
+            d = entry[1] if isinstance(entry, (list, tuple)) else entry
+            if isinstance(d, dict):
+                out.update({k: v for k, v in d.items()
+                            if hasattr(v, "shape") and v is not None})
+        return out
+
+    results = {}
+    worst = 0.0
+    worst_cos = 1.0
+    for prompt in prompts:
+        ref_out = embed(ref_clip, prompt)
+        q_out = embed(q_clip, prompt)
+        common = [k for k in ref_out if k in q_out
+                  and ref_out[k].shape == q_out[k].shape]
+        if not common:  # pragma: no cover
+            print(f"FAIL: no comparable embeddings for prompt {prompt!r}; "
+                  f"ref keys {sorted(ref_out)} vs q keys {sorted(q_out)}")
+            return 2
+        for key in common:
+            a = ref_out[key].float().reshape(1, -1)
+            b = q_out[key].float().reshape(1, -1)
+            rel_l2 = float(((b - a).norm(dim=1) /
+                            a.norm(dim=1).clamp(min=1e-8)).mean())
+            cos = float(((b * a).sum(dim=1) /
+                         (b.norm(dim=1) * a.norm(dim=1))
+                         .clamp(min=1e-12)).mean())
+            worst = max(worst, rel_l2)
+            worst_cos = min(worst_cos, cos)
+            results.setdefault(key, []).append(
+                {"prompt": prompt, "rel_l2": rel_l2, "cosine": cos})
+    ok = worst <= args.te_threshold
+    summary = {
+        "level": "te-model-verified" if ok else "te-model-failed",
+        "mode": "text_encoder",
+        "clip_type": clip_type_name,
+        "prompts": prompts,
+        "worst_rel_l2": worst,
+        "worst_cosine": worst_cos,
+        "threshold": args.te_threshold,
+        "ok": ok,
+        "per_key": {k: v for k, v in results.items()},
+    }
+    if args.json:
+        with open(args.json, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
+    print(f"TE quality: worst relL2 {worst:.4f} cosine {worst_cos:.6f} vs "
+          f"threshold {args.te_threshold} -> {'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1
 
 

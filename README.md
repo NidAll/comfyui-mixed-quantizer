@@ -8,18 +8,58 @@ reference behavior; no ComfyUI or comfy-kitchen code is imported at runtime.
 Two modes:
 
 * `--format w4a8` (default, stable channel): every quantized layer uses
-  `asym_w4a8_int8` (ConvRot 256, group 16, Lloyd-Max codebook). This path is
-  byte-identical to v1.3.0, guarded by golden-vector self-tests.
+  `asym_w4a8_int8` (ConvRot 256, group 16). The 16-entry codebook is adaptive
+  by default (`--codebook-mode auto`): ordinary Gaussian-after-ConvRot layers
+  use a fast fixed table, genuinely heavy-tailed layers get a fitted
+  Lloyd-Max table. `--codebook-mode fit` restores the legacy per-layer
+  fitting path, which with `--seed 0` stays byte-identical to v1.3.0/1.5.0
+  (pinned by golden-vector self-tests).
 * `--format mixed` (experimental channel, requires `--experimental`): a
   per-layer optimizer over `convrot_w4a4`, `asym_w4a8_int8`, and
   `int8_tensorwise`. Each layer gets the cheapest format that stays inside a
   quality gate; layers that cannot meet the gate stay at original precision.
 
-Current version: `1.5.0`.
+Current version: `1.6.0`.
 
 ## Versions and changelog
 
-### 1.5.0
+### 1.6.0
+
+Adaptive W4A8 codebooks and text-encoder quantization.
+
+* `--codebook-mode auto|fixed|fit` (default auto). Auto samples deterministic
+  evenly spaced rows (2^22 elements) and measures excess kurtosis; layers
+  with kurtosis at or below -0.1 use the fixed Gaussian table, the rest get a
+  25-iteration fitted Lloyd-Max table. `fixed` never fits, `fit` keeps the
+  legacy per-layer path. Auto and fixed run two ALS group-scale refinement
+  passes, fit keeps three for the reference path. Code assignment is a binary
+  search over the monotonic codebook instead of a 16-way scan, with the old
+  lower-index tie rule preserved.
+* Text encoders: `--components auto|diffusion|text-encoder|all` selects the
+  quantization scope. Auto keeps historical behavior: a diffusion checkpoint
+  quantizes only its detected diffusion component, a standalone detected text
+  encoder quantizes its text rules. `all` additionally recognizes embedded
+  text towers outside an explicit diffusion prefix. Four text policies cover
+  the text encoders used by the 35 diffusion families: LLM-style
+  (Qwen/Llama/Gemma/Mistral), T5/UMT5, Hugging Face CLIP, and BERT/Jina
+  (experimental).
+* TE weights join the same planner, gates, metadata, and validator as
+  diffusion weights. Embeddings, normalization parameters, heads, text
+  projections, and vision/audio towers are never quantized (the ComfyUI TE
+  loader supports only fp8/int8 embeddings, so a W4A8/W4A4 record on one
+  would fail at load time). Legacy fused OpenCLIP `in_proj_weight`
+  parameters are not selected.
+* In W4A8 mode a TE linear is quantized only when its width is ConvRot-256
+  compatible (K % 256 == 0); mixed mode covers any width through the INT8
+  fallback.
+* The `comfy_wxa8` extension metadata records the detected component,
+  selected components, and codebook mode; `algorithm_identity` bumps
+  `quant_algorithm_rev` to adaptive-codebook-searchsorted-r3.
+* With `--components auto` the decision scope is unchanged from 1.5.0, and
+  with `--codebook-mode fit --seed 0` the W4A8 payload stays on the
+  byte-identical reference path.
+
+Self-test suite: 52 checks (was 50).
 
 First stable release. The `-experimental` suffix is gone and the modes are
 split into two channels: `--format w4a8` is the stable channel, `--format
@@ -80,13 +120,17 @@ The converter runs five steps. Nothing is written until the plan passes its
 gates.
 
 1. **Inspect.** The safetensors header (names, shapes, dtypes) is read and the
-   architecture is matched against an embedded registry of 43 policy families
-   covering all 99 ComfyUI model classes at the research revision. Unknown
+   architecture is matched against an embedded registry of 39 policy families
+   (35 diffusion + 4 text encoder) covering all ComfyUI model classes at the
+   research revision. Unknown
    architectures fail closed unless `--architecture` is given.
-2. **Decide.** Each family policy defines which 2D float linear weights are
-   quantizable and which stay at original precision (patch embedders, time and
-   text embedders, output heads, norms). In w4a8 mode the only further rule is
-   the shape gate (K % 256 == 0). In mixed mode every candidate is quantized
+2. **Decide.** `--components` fixes the scope (detected diffusion model,
+   standalone text encoder, or embedded text towers). Each family policy
+   defines which 2D float linear weights in that scope are quantizable and
+   which stay at original precision (patch embedders, time and text embedders,
+   output heads, norms, embeddings). In w4a8 mode the further rules are the
+   shape gate (K % 256 == 0) and the adaptive codebook (`auto`/`fixed`/`fit`).
+   In mixed mode every candidate is quantized
    and dequantized with each eligible format, the error is measured, and the
    cheapest format under the profile's per-layer gate is selected.
 3. **Meet the gates.** A parameter-weighted global error gate runs over the
@@ -131,8 +175,23 @@ the companion tools that import comfy-kitchen (`tools/runtime_certify.py`,
 ## Quick start
 
 ```bash
-# stable W4A8
+# stable W4A8 (adaptive codebook: fixed table for ordinary layers, fitted for heavy-tailed ones)
 .venv/bin/python comfyui_wxa8_quantizer.py MODEL.safetensors --output OUT.safetensors --format w4a8 --validate
+
+# fastest W4A8 (no codebook fitting at all)
+.venv/bin/python comfyui_wxa8_quantizer.py MODEL.safetensors --output OUT.safetensors --format w4a8 --codebook-mode fixed --validate
+
+# legacy fitted codebooks (reference path, byte-identical to 1.5.0 with seed 0)
+.venv/bin/python comfyui_wxa8_quantizer.py MODEL.safetensors --output OUT.safetensors --format w4a8 --codebook-mode fit --seed 0 --validate
+
+# standalone text encoder, W4A8 (auto detects the text component)
+.venv/bin/python comfyui_wxa8_quantizer.py t5xxl.safetensors --output t5xxl_w4a8.safetensors --format w4a8 --validate
+
+# standalone text encoder, mixed (INT8 covers widths W4A8 cannot)
+.venv/bin/python comfyui_wxa8_quantizer.py t5xxl.safetensors --output t5xxl_mixed.safetensors --format mixed --experimental --profile balanced --target-runtime nvidia --validate
+
+# combined checkpoint with an embedded text tower
+.venv/bin/python comfyui_wxa8_quantizer.py combined.safetensors --output combined_w4a8.safetensors --format w4a8 --components all --validate
 
 # mixed, experimental channel (requires --experimental)
 .venv/bin/python comfyui_wxa8_quantizer.py MODEL.safetensors --output OUT.safetensors --format mixed --profile auto --experimental --validate
@@ -147,8 +206,9 @@ the companion tools that import comfy-kitchen (`tools/runtime_certify.py`,
 .venv/bin/python comfyui_wxa8_quantizer.py --verify-output OUT.safetensors
 ```
 
-`--inspect` prints the detected architecture, the policy that applies, and the
-tensor list. Run it before converting a model you have not seen before.
+`--inspect` prints the detected architecture, component, prefix, and evidence,
+plus the tensor list. Run it before converting a model you have not seen
+before.
 
 ## Why mixed precision
 
@@ -201,9 +261,11 @@ measured output error.
 
 | Option | Meaning |
 | ------ | ------- |
+| `--components auto\|diffusion\|text-encoder\|all` | what to quantize: auto = detected primary component only (default); text-encoder = text rules only; all = diffusion plus embedded text towers outside a prefixed diffusion model |
+| `--codebook-mode auto\|fixed\|fit` | W4A8 codebook strategy: auto (default) = fixed table, fitted only for heavy-tailed layers; fixed = never fit; fit = legacy per-layer Lloyd-Max |
 | `--format w4a8\|mixed` | quantization mode (default w4a8; mixed requires `--experimental`) |
 | `--experimental` | enable experimental features (currently: `--format mixed`) |
-| `--profile auto\|balanced\|conservative\|size-first` | gate and compression profile (mixed) |
+| `--profile auto\|balanced\|conservative\|size-first` | gate and compression profile (mixed); auto picks balanced for an accelerator target, conservative for CPU |
 | `--target-runtime auto\|nvidia\|amd\|cpu` | runtime used for format eligibility (mixed) |
 | `--quality-gate F`, `--global-error-gate F` | error gate overrides |
 | `--max-linear-bytes-per-param F`, `--max-bf16-fraction F` | hard compression targets |
@@ -212,7 +274,7 @@ measured output error.
 | `--w4a4-linear-dtype int4\|int8` | W4A4 execution variant (default int8) |
 | `--disable-w4a4`, `--disable-w4a8`, `--disable-int8` | drop a format from the candidate set |
 | `--runtime-certificate PATH`, `--require-runtime-certificate` | observed-behavior override / hard certification |
-| `--seed N` | seed for codebook sampling (default 0; 0 keeps the reference path) |
+| `--seed N` | seed for fitted-codebook and kurtosis sampling (default 0; auto-mode row selection is evenly spaced and seed-independent, fixed mode never samples) |
 | `--nonfinite-policy error\|keep` | NaN/Inf in quantizable layers: error (default, names the layer) or keep at original precision |
 | `--allow-extra-shard-tensors` | tolerate shard tensors the index does not list (default: error; the index is authoritative) |
 | `--strip-gpu-identity` | omit GPU name, capability, ROCm from metadata |
@@ -228,11 +290,13 @@ measured output error.
 | `--trust-pickle` | allow pickle inputs |
 | `--sensitivity-threshold F` | legacy w4a8-mode keep-precision threshold |
 
-The codebook sample count is canonical (300000 elements, never derived from
-the memory budget), so `--max-memory` changes how much is processed at once,
-not the math. A conversion run at 32 MiB and one run at 8 GiB produce the
-same tensor payload. `--seed` controls the sampling indices; seed 0 is the
-reference path.
+The fitted-codebook sample count is canonical (300000 elements, never derived
+from the memory budget), so `--max-memory` changes how much is processed at
+once, not the math. A conversion run at 32 MiB and one run at 8 GiB produce
+the same tensor payload. Auto mode is chunk-invariant too: its decision rows
+are evenly spaced, so the codebook choice does not depend on the chunk
+budget. `--seed` controls the fitted-codebook and kurtosis sampling indices;
+seed 0 is the reference path.
 
 ## Output format and metadata
 
@@ -290,12 +354,83 @@ atomic publish.
 
 ## Architecture support
 
-The embedded registry holds 43 policy families covering all 99 ComfyUI model
-classes at the research revision. Each family defines its quantize set and its
+The embedded registry holds 39 policy families (35 diffusion + 4 text
+encoder) covering all ComfyUI model classes at the research revision. Each
+family defines its quantize set and its
 protected layers. Mixed mode does not change detection or protection; it only
 changes what happens to a layer once it is a policy candidate. Instead of
 passing through when K fails the W4A8 shape rule, the layer is evaluated for
 W4A4 and INT8.
+
+## Text encoder quantization
+
+`--components` extends the same machinery to text encoders. TE weights are
+2D linears like any other, and the three formats, the planner gates, the
+validator, and the metadata all apply directly.
+
+| Selection | Behavior |
+| --------- | -------- |
+| `auto` (default) | quantizes only the detected primary component: the diffusion scope for a diffusion checkpoint, the text rules for a standalone supported text encoder. Historical diffusion behavior is unchanged |
+| `diffusion` | quantizes only the detected diffusion-model scope |
+| `text-encoder` (or `text_encoder`) | applies the recognized text-transformer rules and leaves other components untouched |
+| `all` | quantizes the detected diffusion scope plus recognized text towers outside an explicit diffusion prefix |
+
+For combined checkpoints the diffusion prefix always wins, so a text pattern
+never reclassifies a diffusion layer. Embedded text discovery in `all` mode
+is intentionally limited to keys outside the detected diffusion prefix;
+review `--inspect` before converting a combined file you have not seen.
+
+Four policies cover the text encoders used by the 35 diffusion families:
+
+| Policy | Status | Recognized linear layers |
+| ------ | ------ | ------------------------ |
+| `text_encoder_llm` | verified | decoder self-attention `q_proj`/`k_proj`/`v_proj`/`o_proj`/`out_proj`, linear-attention projections, MLP `gate_proj`/`up_proj`/`down_proj`/`fc1`/`fc2`/`w1`/`w2`/`w3` |
+| `text_encoder_t5` | verified | encoder/decoder `SelfAttention` and `EncDecAttention` `q`/`k`/`v`/`o`, `DenseReluDense` `wi`/`wi_0`/`wi_1`/`wo` |
+| `text_encoder_clip` | verified | Hugging Face CLIP `text_model.encoder.layers.N.self_attn.{q,k,v,out}_proj`, `mlp.{fc1,fc2}` |
+| `text_encoder_bert` | experimental | BERT/Jina `attention.self.{query,key,value}`, `attention.output.dense`, `{intermediate,output}.dense` |
+
+Safety exclusions are narrow (text policies do not reuse the diffusion
+universal exclusion, which excludes whole `encoder`/`decoder` subtrees):
+
+* Token, word, position, type, and shared embeddings.
+* LayerNorm, RMSNorm, input/post-attention and final normalization, and
+  Q/K normalization parameters.
+* LM heads, classifiers, score heads, poolers, text projections, and
+  projection heads.
+* Vision towers, image encoders, audio submodels, and multimodal
+  projectors.
+* Biases, buffers, non-weight entries, non-2D tensors, non-floating tensors,
+  and small tensors below the policy threshold.
+
+`--include` can force an eligible linear into the candidate set but never
+bypasses component selection, policy exclusions, dtype checks, shape checks,
+or the minimum-size check. Embedding tables in particular stay at original
+precision because the ComfyUI TE loader supports only fp8/int8 embeddings; a
+W4A8/W4A4 record on one would fail at load time.
+
+Format eligibility: in W4A8 mode a TE linear is quantized only when its width
+is ConvRot-256 compatible (K % 256 == 0); incompatible layers pass through.
+Mixed mode keeps every selected non-empty 2D float TE linear as a candidate
+and falls back to INT8 for any width, so it gives broader TE coverage.
+Legacy OpenCLIP checkpoints with fused parameters such as
+`transformer.resblocks.*.attn.in_proj_weight` are not selected: the native
+quant metadata binds configuration to module names derived from keys ending
+in `.weight`, and an unattached fused parameter cannot be safely associated
+with a runtime linear module.
+
+Real checkpoints: the diffusion file is usually DiT-only (Flux, SD3.5, WAN,
+HunyuanVideo, Boogu, Kroma) and the TE ships separately, so converting the TE
+file is the common case. SD1.5/SD2.x/SDXL full checkpoints embed their TEs.
+The user-facing TE files for the biggest families: `t5xxl_fp8_e4m3fn.safetensors`
+(Flux/SD3), `umt5_xxl_fp8_e4m3fn_scaled.safetensors` (WAN),
+`llava_llama3_fp8_scaled.safetensors` (HunyuanVideo), `qwen3vl_4b_*` (Krea2 /
+Kroma v0.2), `qwen3vl_8b_*` (Boogu), `qwen_2.5_vl_7b_*` (QwenImage,
+HunyuanImage 2.1). fp16-to-W4A8 is about a 4x saving on the TE alone; CLIP-L
+(246 MB) saves little and is not worth converting.
+
+Loader requirements: ComfyUI >= v0.31.0 loads quantized TE files natively
+(`load_clip` runs the same `comfy_quant` conversion as diffusion models); the
+v0.30.0 loader patch covers the linear path too.
 
 ## Sharded inputs and publication safety
 
@@ -317,14 +452,19 @@ staged file intact.
 
 ## Checking the result
 
-* `--self-test`: 50 embedded checks. Golden vectors for W4A8, W4A4, and INT8
+* `--self-test`: 52 embedded checks. Golden vectors for W4A8, W4A4, and INT8
   (embedded reference weight, cross-platform safe), the eligibility matrix,
-  mixed planning on real Boogu and Kroma dims, hard gate failures, BF16
-  promotion, runtime capability matrix, planner determinism, corrupted
-  metadata rejection for all three formats, chunk-invariant payloads,
-  chunked vs full validation equality, reference-decoder consensus, source-free
-  `--verify-output`, shard-hash identity, publication races, channel gating,
-  and architecture sync.
+  mixed planning on real Boogu and Kroma dims, binary-search code assignment
+  versus the original 16-way nearest-level reference (including exact
+  midpoint ties), standalone and embedded text-encoder classification
+  (Qwen-style W4A8; T5/CLIP/BERT in mixed mode; `--components all` selects
+  an embedded tower beside a prefixed Flux model; embeddings, norms, and
+  vision-tower linears are never quantized), hard
+  gate failures, BF16 promotion, runtime capability matrix, planner
+  determinism, corrupted metadata rejection for all three formats,
+  chunk-invariant payloads, chunked vs full validation equality,
+  reference-decoder consensus, source-free `--verify-output`, shard-hash
+  identity, publication races, channel gating, and architecture sync.
 * `--validate`: reopens the output and checks inventory, shapes, dtypes,
   per-format metadata and runtime contract, scales, packing round trips,
   reconstruction error bounds (W4A8 policy bound, W4A4 0.20, INT8 0.05) via
@@ -367,6 +507,22 @@ locally before merging or releasing.
 
 * Mixed mode is experimental. Without calibration the quality gates are
   weight-based; runtime-output gates need `--calibration-source`.
+* Pure W4A8 still requires ConvRot-256-compatible widths (K % 256 == 0).
+  Incompatible layers remain at original precision; mixed mode allows an
+  INT8 fallback.
+* Embedded text discovery is conservative. In `all` mode, text towers are
+  discovered outside an explicit diffusion prefix; a prefixless combined
+  checkpoint may need a separate text-encoder conversion.
+* Only recognized naming conventions are selected. Custom model wrappers may
+  need a new family policy or carefully reviewed `--include` patterns.
+* Legacy fused OpenCLIP attention parameters are not quantized; use split
+  projection weights.
+* The BERT/Jina text policy is experimental; validate model quality and
+  runtime loading before distribution.
+* Auto codebook selection is a heuristic. `fixed` and `fit` exist for
+  controlled comparisons.
+* Text embeddings and output heads intentionally remain unquantized. This is
+  a safety/quality choice, not a coverage bug.
 * On the eager backend W4A4 always runs the int4 activation path, which is
   noisier than the CUDA int8 path. The planner simulates the variant you
   selected, so a CPU conversion is evaluated on the int4 path.
